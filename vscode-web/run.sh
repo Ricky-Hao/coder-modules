@@ -25,7 +25,7 @@ run_vscode_web() {
   "$${VSCODE_CLI}" serve-web $${EXTENSION_ARG} $${SERVER_BASE_PATH_ARG} --port "${PORT}" --host 127.0.0.1 --accept-server-license-terms --without-connection-token > "${LOG_PATH}" 2>&1 &
 }
 
-# Check if the settings file exists...
+# Create the machine settings file if missing.
 if [ ! -f ~/.vscode-server/data/Machine/settings.json ]; then
   echo "⚙️ Creating settings file..."
   mkdir -p ~/.vscode-server/data/Machine
@@ -48,7 +48,7 @@ case "$${ARCH}" in
     ;;
 esac
 
-# Check if a specific VS Code Web commit ID was provided
+# Resolve commit id (pin if COMMIT_ID is provided, else latest stable).
 if [ -n "${COMMIT_ID}" ]; then
   HASH="${COMMIT_ID}"
 else
@@ -64,77 +64,51 @@ if [ $? -ne 0 ]; then
 fi
 printf "$${BOLD}VS Code Web CLI has been installed.\n"
 
-VSCODE_WEB=~/.vscode/cli/serve-web/$${HASH}/bin/code-server
-
-# ---------------------------------------------------------------------------
-# Pre-download the inner vscode-server-web for the SAME commit, so that
-# `code serve-web` does NOT silently fetch a different (latest) version
-# from update.code.visualstudio.com.
-#
-# Background: when COMMIT_ID is pinned, only the outer `code` CLI honors it.
-# `code serve-web` independently calls the update API at runtime and would
-# download whatever stable is current — e.g. 1.119.0, which has a hyper
-# 0.14 -> 1.x migration bug that breaks WebSocket upgrades and leaves the
-# workbench stuck at "Time limit reached".
-# Refs: microsoft/vscode#315003, microsoft/vscode#315448
-# ---------------------------------------------------------------------------
-if [ -n "${COMMIT_ID}" ]; then
-  SERVER_DIR=~/.vscode/cli/serve-web/$${HASH}
-
-  # Clean up any wrong-hash directories that an earlier (broken) run cached.
-  if [ -d ~/.vscode/cli/serve-web ]; then
-    for d in ~/.vscode/cli/serve-web/*/; do
-      [ -d "$${d}" ] || continue
-      name=$(basename "$${d}")
-      if [ "$${name}" != "$${HASH}" ]; then
-        echo "🧹 Removing stale serve-web cache: $${name}"
-        rm -rf "$${d}"
-      fi
-    done
-    rm -f ~/.vscode/cli/serve-web/lru.json
-  fi
-
-  if [ ! -f "$${VSCODE_WEB}" ]; then
-    printf "$${BOLD}Pre-downloading vscode-server-linux-$${ARCH}-web for $${HASH}...\n"
-    mkdir -p "$${SERVER_DIR}"
-    SERVER_URL="https://update.code.visualstudio.com/commit:$${HASH}/server-linux-$${ARCH}-web/stable"
-    if curl -fsSL "$${SERVER_URL}" | tar -xz -C "$${SERVER_DIR}" --strip-components=1; then
-      printf '{"entries":[{"name":"%s","lastUsed":%s}]}\n' "$${HASH}" "$(date +%s)000" \
-        > ~/.vscode/cli/serve-web/lru.json
-      printf "$${BOLD}✅ vscode-server-web pre-downloaded to $${SERVER_DIR}\n"
-    else
-      echo "⚠️  Failed to pre-download vscode-server-web; falling back to runtime download."
-    fi
-  else
-    echo "🥳 vscode-server-web already present at $${VSCODE_WEB}"
-  fi
-fi
-
 install_extension() {
-  # code serve-web auto downloads code-server via the health-check trigger
-  # (or it's already there from the pre-download above).
-  echo "Waiting for code-server at $${VSCODE_WEB}..."
-
-  # Bound the wait so a misconfigured pin doesn't loop forever.
+  # Wait for `code serve-web` to actually accept HTTP connections — this means
+  # the inner code-server has been downloaded by the CLI and is fully started.
+  # Probing the listening port is a stronger signal than checking for the
+  # presence of a file in ~/.vscode/cli/serve-web/<hash>/bin/code-server,
+  # because the binary exists briefly before the server is ready.
+  #
+  # Side benefit: `code serve-web` lazy-downloads the inner server only after
+  # the first health-check hit, so this curl loop is what actually triggers
+  # the download — no need for a separate kick.
+  echo "⏳ Waiting for code serve-web to listen on 127.0.0.1:${PORT}..."
   WAITED=0
-  WAIT_LIMIT=300
-  while true; do
-    if [ -f "$${VSCODE_WEB}" ]; then
-      echo "$${VSCODE_WEB} exists."
-      break
-    fi
+  WAIT_LIMIT=600
+  until curl -fsS -o /dev/null -m 2 "http://127.0.0.1:${PORT}/"; do
     if [ "$${WAITED}" -ge "$${WAIT_LIMIT}" ]; then
-      echo "❌ Timed out waiting for $${VSCODE_WEB} after $${WAIT_LIMIT}s."
+      echo "❌ Timed out after $${WAIT_LIMIT}s waiting for code-server."
       echo "   Tail of ${LOG_PATH}:"
       tail -n 50 "${LOG_PATH}" 2>/dev/null || true
       echo "   Contents of ~/.vscode/cli/serve-web:"
       ls -la ~/.vscode/cli/serve-web/ 2>/dev/null || true
       return 1
     fi
-    echo "Wait for $${VSCODE_WEB}. ($${WAITED}s / $${WAIT_LIMIT}s)"
-    sleep 10
-    WAITED=$((WAITED + 10))
+    sleep 5
+    WAITED=$((WAITED + 5))
   done
+  echo "✅ code serve-web is responding."
+
+  # Resolve the actual code-server binary path that the CLI just downloaded
+  # so we can use it for `--install-extension`. The directory is named after
+  # whichever commit the CLI picked (equals our pinned COMMIT_ID when set,
+  # or the current 'latest stable' otherwise).
+  VSCODE_WEB=""
+  for d in ~/.vscode/cli/serve-web/*/; do
+    [ -d "$${d}" ] || continue
+    candidate="$${d}bin/code-server"
+    if [ -f "$${candidate}" ]; then
+      VSCODE_WEB="$${candidate}"
+      break
+    fi
+  done
+  if [ -z "$${VSCODE_WEB}" ]; then
+    echo "⚠️  code-server is responding but no binary was found in ~/.vscode/cli/serve-web; skipping extension install."
+    return 0
+  fi
+  echo "Using $${VSCODE_WEB} for extension installs."
 
   # Install each extension from the EXTENSIONS list.
   IFS=',' read -r -a EXTENSIONLIST <<< "$${EXTENSIONS}"
