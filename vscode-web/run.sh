@@ -65,25 +65,18 @@ fi
 printf "$${BOLD}VS Code Web CLI has been installed.\n"
 
 install_extension() {
-  # Wait for `code serve-web` to actually accept HTTP connections — this means
-  # the inner code-server has been downloaded by the CLI and is fully started.
-  # Probing the listening port is a stronger signal than checking for the
-  # presence of a file in ~/.vscode/cli/serve-web/<hash>/bin/code-server,
-  # because the binary exists briefly before the server is ready.
-  #
-  # Side benefit: `code serve-web` lazy-downloads the inner server only after
-  # the first health-check hit, so this curl loop is what actually triggers
-  # the download — no need for a separate kick.
+  # Step 1: wait for `code serve-web` to listen on its port. This is also what
+  # triggers the lazy download of the inner code-server (the CLI only fetches
+  # it on the first health-check hit), so this curl loop pulls double duty as
+  # readiness probe AND download trigger.
   echo "⏳ Waiting for code serve-web to listen on 127.0.0.1:${PORT}..."
   WAITED=0
   WAIT_LIMIT=600
   until curl -fsS -o /dev/null -m 2 "http://127.0.0.1:${PORT}/"; do
     if [ "$${WAITED}" -ge "$${WAIT_LIMIT}" ]; then
-      echo "❌ Timed out after $${WAIT_LIMIT}s waiting for code-server."
+      echo "❌ Timed out after $${WAIT_LIMIT}s waiting for code serve-web."
       echo "   Tail of ${LOG_PATH}:"
       tail -n 50 "${LOG_PATH}" 2>/dev/null || true
-      echo "   Contents of ~/.vscode/cli/serve-web:"
-      ls -la ~/.vscode/cli/serve-web/ 2>/dev/null || true
       return 1
     fi
     sleep 5
@@ -91,26 +84,32 @@ install_extension() {
   done
   echo "✅ code serve-web is responding."
 
-  # Resolve the actual code-server binary path that the CLI just downloaded
-  # so we can use it for `--install-extension`. The directory is named after
-  # whichever commit the CLI picked (equals our pinned COMMIT_ID when set,
-  # or the current 'latest stable' otherwise).
+  # Step 2: HTTP 200 only means the CLI returned the "downloading..."
+  # placeholder page. The actual ~120MB inner server is still being extracted
+  # in the background, and bin/code-server doesn't exist yet. Poll the
+  # filesystem until it lands. Use `find` instead of a fixed glob so we don't
+  # depend on a specific layout under ~/.vscode/cli/serve-web/<hash>/.
+  echo "⏳ Waiting for code-server binary to be extracted..."
   VSCODE_WEB=""
-  for d in ~/.vscode/cli/serve-web/*/; do
-    [ -d "$${d}" ] || continue
-    candidate="$${d}bin/code-server"
-    if [ -f "$${candidate}" ]; then
-      VSCODE_WEB="$${candidate}"
+  WAITED=0
+  WAIT_LIMIT=600
+  while [ -z "$${VSCODE_WEB}" ]; do
+    VSCODE_WEB=$(find ~/.vscode/cli/serve-web -maxdepth 5 -type f -name code-server -executable 2>/dev/null | head -n 1)
+    if [ -n "$${VSCODE_WEB}" ]; then
       break
     fi
+    if [ "$${WAITED}" -ge "$${WAIT_LIMIT}" ]; then
+      echo "⚠️  Timed out after $${WAIT_LIMIT}s waiting for code-server binary. Cache layout dump:"
+      find ~/.vscode/cli/serve-web -maxdepth 5 2>/dev/null | head -n 40
+      echo "Skipping extension install."
+      return 0
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
   done
-  if [ -z "$${VSCODE_WEB}" ]; then
-    echo "⚠️  code-server is responding but no binary was found in ~/.vscode/cli/serve-web; skipping extension install."
-    return 0
-  fi
-  echo "Using $${VSCODE_WEB} for extension installs."
+  echo "✅ Using $${VSCODE_WEB} for extension installs."
 
-  # Install each extension from the EXTENSIONS list.
+  # Step 3: install each extension from the EXTENSIONS list.
   IFS=',' read -r -a EXTENSIONLIST <<< "$${EXTENSIONS}"
   for extension in "$${EXTENSIONLIST[@]}"; do
     if [ -z "$${extension}" ]; then
