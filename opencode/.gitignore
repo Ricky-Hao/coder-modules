@@ -1,0 +1,4 @@
+# Keep the reviewed provider lock; inherited rules still ignore Terraform caches.
+!.terraform.lock.hcl
+__pycache__/
+*.pyc
