@@ -24,6 +24,17 @@ locals {
   install_script = templatefile("${path.module}/scripts/install.sh.tftpl", { bundle = local.bundle })
   # HOME is deliberately expanded by the workspace shell, never by Terraform.
   command_root = var.install_root == "" ? "\"$HOME\"/.coder-opencode" : "'${replace(var.install_root, "'", "'\"'\"'")}'"
+  # Pure input/file expression: safe for init-container use without depending on
+  # coder_agent, coder_workspace data, or coder_script attributes.
+  volume_prepare_script = var.dedicated_volume == null ? null : join("\n", [
+    file("${path.module}/scripts/prepare_volume.py"),
+    "import base64",
+    "sys.exit(main(json.loads(base64.b64decode('${base64encode(jsonencode({
+      mount_path   = var.dedicated_volume.mount_path
+      install_root = var.install_root
+      workspace_id = var.dedicated_volume.workspace_id
+    }))}'))))",
+  ])
 }
 
 resource "coder_script" "opencode" {
@@ -33,4 +44,10 @@ resource "coder_script" "opencode" {
   run_on_start       = true
   start_blocks_login = var.start_blocks_login
   timeout            = var.install_timeout
+  lifecycle {
+    precondition {
+      condition     = var.dedicated_volume == null ? true : var.install_root == "/mnt/opencode/toolset"
+      error_message = "Dedicated volume preparation requires install_root=/mnt/opencode/toolset."
+    }
+  }
 }

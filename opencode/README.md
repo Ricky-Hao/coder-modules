@@ -39,9 +39,9 @@ writable; HOME and installation paths cannot traverse symlinks.
 An existing mount can be user-owned or root-owned with a suitable writable filesystem
 group. Infrastructure must supply the correct UID/fsGroup/volume permissions for the
 image. A root-owned, unwritable volume does not work for an arbitrary nonroot UID.
-The module never sudo/chmods/chowns the parent or silently adopts an existing
+By default the module never changes parent permissions or silently adopts an existing
 unmarked directory, even an empty one. No special init container or copied parent
-preparation script is needed when the mount already satisfies this contract.
+preparation script is needed **when the mount already satisfies this contract**.
 
 **Ancestor trust:** every installation and HOME/profile ancestor must be a real
 directory owned by root or the current UID. World-writable nonsticky directories
@@ -59,6 +59,52 @@ is a trust boundary, not race-safe support for an arbitrary untrusted writable P
 HOME/profile access walks descriptors with no symlink following. Installation still
 uses absolute paths after ancestor validation and relies on that declared boundary.
 The module fails closed on an unsafe ancestor instead of changing its permissions.
+
+### Opt-in preparation for a root-owned 0777 dedicated PVC
+
+Some provisioners present `/mnt/opencode` as root-owned 0777 without the sticky bit.
+The installer correctly refuses that unsafe parent, even when the workspace user is
+root. For this specific case, set `dedicated_volume = { mount_path = "/mnt/opencode",
+workspace_id = data.coder_workspace.me.id }` together with
+`install_root = "/mnt/opencode/toolset"`. The new `volume_prepare_script` output is
+a Python program for a **root init container before any workspace process**. The
+output depends only on inputs/module files, not agent/script/data-resource attributes;
+it can be used in a Pod/Deployment init command without a module/agent cycle.
+
+The init command is `["python3", "-B", "-c", module.opencode.volume_prepare_script]`
+(index the module when the caller uses count). Mount only the dedicated PVC at
+`/mnt/opencode` in that init container. Use an image with Python 3.11+ and Linux
+procfs (`/proc/self/fdinfo`, `/proc/self/mountinfo`); BusyBox alone is insufficient.
+Preparation requires UID/EUID 0 to change a root-owned volume's mode. It does not
+force the final workspace user to root and never uses sudo, chown or recursive chmod.
+Templates must explicitly wire and order the init container; setting the input alone
+does not execute preparation. With null/default input the output is null.
+
+Scope is intentionally fixed: only the actual mounted `/mnt/opencode`, with private
+child `toolset`. `/`, system/HOME/project/shared roots and non-mount directories are
+refused. No symlinks are followed. Root-owned safe ancestors are required; fdinfo's
+mount ID must match that exact mountpoint in mountinfo. The volume must be empty or
+contain only a valid private `toolset` with the supplied workspace's owner marker and
+recognized private installation entries. Foreign/unmarked children, unexpected files,
+unsafe links or inconsistent ownership fail closed. Existing `active` is allowed
+only in its module-managed relative-version form; the installer separately verifies
+the cached inventory. No session data is migrated or recursively inspected/changed.
+
+Only mode **0777 → 1777** is changed, using `fchmod` on the validated open directory
+descriptor; existing 1777 and supported safe modes are respected. Content is checked
+before and after the change. A detected concurrent content change fails init; if the
+sticky bit was already added, it is retained rather than weakened back to 0777.
+Mount ownership and all child bytes/modes remain untouched. The volume must be
+exclusively assigned to this workspace, with preparation before its users start;
+checks and advisory locks do not establish lifetime exclusivity or prevent malicious
+root/same-UID/trusted-group interference. Sticky protects against other UIDs replacing
+existing children, not against those trusted actors or arbitrary future file creation.
+
+This API is a local candidate until its new source commit is reviewed and published.
+The earlier zero-init interface applied only to preprepared mounts. Safe-mode mounts
+remain an infrastructure writability contract; preparation does not broaden a 0755
+mount for nonroot users. Default HOME mode, strict ancestor checks and agent-only
+invocation remain unchanged.
 
 Without a persisted HOME or explicit persisted mount, there is **no persistence
 guarantee**. Repeated startup with the same UID, workspace identity and filesystem
@@ -98,6 +144,7 @@ archives require network on first installation; verified cached reuse is offline
 | --- | --- |
 | `agent_id` | Required existing agent ID |
 | `install_root` | Empty: runtime `$HOME/.coder-opencode` |
+| `dedicated_volume` | Null; explicit dedicated-volume root-init output opt-in |
 | `release` | Null: pinned public release below |
 | `runtime_profile` | `env`; `none` opts out |
 | `runtime_env_allowlist` | `[]`; extra names only |

@@ -73,6 +73,16 @@ def main():
     assert len(scripts) >= 2, 'verbose mock plans must expose both actual rendered scripts'
     for record in plans:
         plan = record.get('test_plan', {})
+        preparation = plan.get('output_changes', {}).get('volume_prepare_script', {}).get('after')
+        if preparation:
+            assert preparation.startswith((module / 'scripts/prepare_volume.py').read_text())
+            compile(preparation, '<volume-preparation>', 'exec')
+            prepared_config = json.loads(base64.b64decode(
+                preparation.rsplit("base64.b64decode('", 1)[1].split("')", 1)[0]))
+            assert prepared_config == {'mount_path': '/mnt/opencode',
+                                       'install_root': '/mnt/opencode/toolset',
+                                       'workspace_id': '11111111-1111-4111-8111-111111111111'}
+            (scratch / 'volume-prepare.py').write_text(preparation)
         for resource in plan.get('resource_changes', []):
             if resource.get('type') != 'coder_script':
                 continue
@@ -101,6 +111,7 @@ def main():
         compile(body, '<bootstrap>', 'exec')
     assert any(c['install_root'] == '' and c['runtime_profile'] == 'env' for c in configs)
     assert any(c['install_root'] == '/mnt/opencode/toolset' and c['runtime_profile'] == 'none' for c in configs)
+    assert (scratch / 'volume-prepare.py').is_file()
     print('PASS: cached init, validate, provider schema, mock plans, actual payload render, Bash/Python syntax; no apply')
 
 

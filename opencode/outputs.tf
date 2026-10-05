@@ -16,3 +16,8 @@ output "status_path" {
 output "script_id" {
   value = coder_script.opencode.id
 }
+
+output "volume_prepare_script" {
+  description = "Opt-in Python 3.11+ root init program, or null. Depends only on inputs and module source; execute before workspace users, with the exact dedicated volume mounted."
+  value       = local.volume_prepare_script
+}

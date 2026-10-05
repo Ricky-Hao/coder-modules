@@ -54,6 +54,34 @@ run "quoted_mount" {
   }
 }
 
+run "prepared_mount" {
+  command = plan
+  variables {
+    agent_id     = "22222222-2222-4222-8222-222222222222"
+    install_root = "/mnt/opencode/toolset"
+    dedicated_volume = {
+      mount_path   = "/mnt/opencode"
+      workspace_id = "11111111-1111-4111-8111-111111111111"
+    }
+  }
+  assert {
+    condition     = startswith(output.volume_prepare_script, file("${path.module}/scripts/prepare_volume.py"))
+    error_message = "Preparation must be the actual module-owned helper, known at plan time."
+  }
+}
+
+run "invalid_preparation_scope" {
+  command = plan
+  variables {
+    agent_id = "22222222-2222-4222-8222-222222222222"
+    dedicated_volume = {
+      mount_path   = "/mnt"
+      workspace_id = "test-workspace"
+    }
+  }
+  expect_failures = [var.dedicated_volume]
+}
+
 run "invalid_root" {
   command = plan
   variables {

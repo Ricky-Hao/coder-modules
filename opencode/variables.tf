@@ -16,6 +16,22 @@ variable "install_root" {
   }
 }
 
+variable "dedicated_volume" {
+  description = "Opt-in root init script for the exclusive /mnt/opencode mount. Null disables preparation. Supply the workspace identity; invoke volume_prepare_script before any workspace process."
+  type = object({
+    mount_path   = string
+    workspace_id = string
+  })
+  default = null
+  validation {
+    condition = var.dedicated_volume == null ? true : (
+      var.dedicated_volume.mount_path == "/mnt/opencode" &&
+      can(regex("^[A-Za-z0-9_-]{1,128}$", var.dedicated_volume.workspace_id))
+    )
+    error_message = "Preparation is restricted to /mnt/opencode and an explicit stable workspace identity."
+  }
+}
+
 variable "release" {
   description = "Optional complete reviewed release override. Null uses the pinned public release; all three fields must be changed together."
   type = object({
