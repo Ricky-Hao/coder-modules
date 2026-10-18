@@ -169,7 +169,7 @@ already-appended safe PATH blocks may remain and are idempotent on retry.
 ## Environment-only provider and MCP configuration
 
 Default `env` profile includes a nine-model catalog and selects
-**`copilot/gpt-6-astra`**, variant **`medium`**, with compaction and deny-other-provider
+**`copilot/gpt-6.1-sol`**, variant **`max`**, with compaction and deny-other-provider
 policy. **`copilot` is a local provider alias, not official GitHub Copilot login/auth**.
 It uses the fork's installed OpenAI Responses provider implementation. Users must
 supply a compatible endpoint/key and actual model access; the catalog does not

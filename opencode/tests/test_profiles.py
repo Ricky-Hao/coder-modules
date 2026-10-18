@@ -79,7 +79,7 @@ class ProfileTests(unittest.TestCase):
     def test_full_snapshot_catalog_and_policy(self):
         cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
         self.assertEqual(hashlib.sha256(json.dumps(cfg['providers']['copilot']['models'], sort_keys=True).encode()).hexdigest(),
-                         '0c04351f5ad2436498e638cffd04d1e10599e26ff6a24419dc31978ec2b40f3d')
+                         'a8f0c25eb5ebd602960e303e7bdcaee4243b544cb86e4137f6826d8481353db8')
         self.assertEqual(len(cfg['providers']['copilot']['models']), 9)
         self.assertEqual(cfg['compaction'], {'buffer': 13600})
         self.assertEqual(cfg['experimental']['policies'], [
@@ -99,8 +99,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(child['PATH'], self.env['PATH'])
         self.assertEqual(child['LLM_API_KEY'], self.env['LLM_API_KEY'])
-        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6-astra')
-        self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'medium')
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(child['OPENCODE_ACP_CATALOG_TIMEOUT_MS'], '30000')
         for name in ('FIRECRAWL_MCP_API_KEY', 'FIRECRAWL_MCP_URL', 'CODER_AGENT_TOKEN',
                      'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'OPENCODE_CONFIG_CONTENT'):
@@ -191,7 +191,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             info = json.loads(result.stdout)
             self.assertEqual(info['source'], 'env')
-            self.assertEqual(info['model']['variant'], 'medium')
+            self.assertEqual(info['model']['variant'], 'max')
             self.assertEqual(info['enabled_mcp'], [])
             self.assertEqual(info['required_environment_names'], ['LLM_API_KEY', 'LLM_BASE_URL'])
         self.assertFalse((self.root / 'runtime/module-profiles').exists())
@@ -328,8 +328,8 @@ elif sys.argv[-1] == '--version':
     print('0.19.3')
 else:
     assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
-    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'copilot/gpt-6-astra'
-    assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'medium'
+    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'copilot/gpt-6.1-sol'
+    assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
     assert 'CONTEXT7_MCP_API_KEY' not in os.environ
     assert 'FIRECRAWL_MCP_API_KEY' not in os.environ
     config=json.loads((Path(os.environ['HOME'])/'.acpx/config.json').read_text())
@@ -353,7 +353,7 @@ else:
         self.assertEqual(actual['argv'], ['acp'])
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(actual['env']['PATH'], self.env['PATH'])
-        self.assertEqual(actual['env']['OPENCODE_ACP_REQUIRED_VARIANT'], 'medium')
+        self.assertEqual(actual['env']['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(actual['env']['GITHUB_ACTIONS_MCP_AUTH_SCHEME'], 'Token')
         self.assertNotIn('CONTEXT7_MCP_API_KEY', actual['env'])
         self.assertNotIn('FIRECRAWL_MCP_API_KEY', actual['env'])
