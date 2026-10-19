@@ -100,37 +100,79 @@ class VolumePreparationTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(target.stat().st_mode & 0o7777, 0o777)
 
-    def test_foreign_content_unmarked_or_linked_child_refused(self):
+    def test_sibling_content_survives_first_and_repeat_preparation(self):
+        tasks = self.mount / 'tasks'
+        tasks.mkdir(mode=0o700)
+        record = tasks / 'task.md'
+        record.write_text('keep task checkpoint\n')
+        other = self.mount / 'unrelated'
+        other.write_text('keep sibling file\n')
+        link = self.mount / 'unrelated-link'
+        link.symlink_to(self.fixture.base / 'missing-sibling-target')
+        pipe = self.mount / 'unrelated-pipe'
+        os.mkfifo(pipe, 0o600)
+        siblings = (tasks, record, other, link, pipe)
+
+        def snapshot():
+            result = {}
+            for path in siblings:
+                info = path.lstat()
+                result[str(path.relative_to(self.mount))] = (
+                    info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+                    info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            return result
+
+        before = snapshot()
+        self.prepare()
+        self.assertEqual(self.mount.stat().st_mode & 0o7777, 0o1777)
+        self.assertEqual(snapshot(), before)
+        self.fixture.install()
+        self.prepare()
+        self.prepare()
+        self.fixture.install()
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(record.read_text(), 'keep task checkpoint\n')
+        self.assertEqual(other.read_text(), 'keep sibling file\n')
+        self.assertEqual(os.readlink(link), str(self.fixture.base / 'missing-sibling-target'))
+        self.assertEqual(self.fixture.downloads, 2)
+
+    def test_unmarked_linked_or_non_directory_child_refused_with_siblings(self):
         other = self.mount / 'unrelated'
         other.write_text('keep')
-        with self.assertRaises(ValueError):
-            self.prepare()
-        other.unlink()
         child = self.mount / 'toolset'
         child.mkdir(mode=0o700)
         with self.assertRaises(FileNotFoundError):
             self.prepare()
         child.rmdir()
-        child.symlink_to(self.fixture.home)
+        for target in (self.fixture.home, self.fixture.base / 'missing-toolset-target'):
+            with self.subTest(target=target):
+                child.symlink_to(target)
+                with self.assertRaises(OSError):
+                    self.prepare()
+                child.unlink()
+        child.write_text('not an installation directory')
         with self.assertRaises(OSError):
             self.prepare()
+        self.assertEqual(child.read_text(), 'not an installation directory')
+        self.assertEqual(other.read_text(), 'keep')
         self.assertEqual(self.mount.stat().st_mode & 0o7777, 0o777)
 
     def test_foreign_workspace_marker_and_unsafe_child_entries_refused(self):
         self.prepare()
         self.fixture.install()
         child = self.mount / 'toolset'
+        (self.mount / 'tasks').mkdir(mode=0o700)
         self.config['workspace_id'] = 'other-test-workspace'
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'another workspace or UID'):
             self.prepare()
         self.config['workspace_id'] = 'test-workspace'
         (child / 'foreign').write_text('keep')
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'unexpected private-child content'):
             self.prepare()
         (child / 'foreign').unlink()
         (child / 'active').unlink()
         (child / 'active').symlink_to('/tmp')
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'unsafe active link'):
             self.prepare()
 
     def test_safe_modes_respected_and_descriptor_does_not_follow_substitution(self):

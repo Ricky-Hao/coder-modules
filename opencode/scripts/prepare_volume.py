@@ -33,12 +33,11 @@ def verify_mount(fd):
 
 
 def child_snapshot(fd, workspace_id):
-    names = os.listdir(fd)
-    if not names:
+    # Only toolset is module-managed; leave sibling content untouched.
+    try:
+        child = os.open(CHILD, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    except FileNotFoundError:
         return ()
-    if names != [CHILD]:
-        raise ValueError('unexpected dedicated-volume content')
-    child = os.open(CHILD, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
     try:
         info = os.fstat(child)
         if stat.S_IMODE(info.st_mode) not in (0o700, 0o2700):

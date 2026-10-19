@@ -83,17 +83,21 @@ does not execute preparation. With null/default input the output is null.
 Scope is intentionally fixed: only the actual mounted `/mnt/opencode`, with private
 child `toolset`. `/`, system/HOME/project/shared roots and non-mount directories are
 refused. No symlinks are followed. Root-owned safe ancestors are required; fdinfo's
-mount ID must match that exact mountpoint in mountinfo. The volume must be empty or
-contain only a valid private `toolset` with the supplied workspace's owner marker and
-recognized private installation entries. Foreign/unmarked children, unexpected files,
-unsafe links or inconsistent ownership fail closed. Existing `active` is allowed
-only in its module-managed relative-version form; the installer separately verifies
-the cached inventory. No session data is migrated or recursively inspected/changed.
+mount ID must match that exact mountpoint in mountinfo. Only `toolset` is managed by
+this module; other volume-root entries, such as `tasks`, are allowed and are not
+opened, traversed or modified. A missing `toolset` is left for the installer to create.
+An existing `toolset` must be a valid private directory with the supplied workspace's
+owner marker and recognized private installation entries. An unmarked directory,
+unexpected files inside `toolset`, unsafe links or inconsistent ownership fail closed.
+Existing `active` is allowed only in its module-managed relative-version form; the
+installer separately verifies the cached inventory. No session data is migrated or
+recursively inspected/changed.
 
 Only mode **0777 → 1777** is changed, using `fchmod` on the validated open directory
-descriptor; existing 1777 and supported safe modes are respected. Content is checked
-before and after the change. A detected concurrent content change fails init; if the
-sticky bit was already added, it is retained rather than weakened back to 0777.
+descriptor; existing 1777 and supported safe modes are respected. The managed
+`toolset` child is checked before and after the change. A detected concurrent change
+to that child fails init; if the sticky bit was already added, it is retained rather
+than weakened back to 0777.
 Mount ownership and all child bytes/modes remain untouched. The volume must be
 exclusively assigned to this workspace, with preparation before its users start;
 checks and advisory locks do not establish lifetime exclusivity or prevent malicious
