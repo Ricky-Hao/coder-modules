@@ -229,6 +229,58 @@ class StartupTests(unittest.TestCase):
         self.fixture.install()
         self.assertNotEqual(active, os.readlink(root / 'active'))
 
+    def test_task_wrapper_startup_and_repeat_preserve_runtime_and_mount_siblings(self):
+        mount = self.base / 'mount'
+        mount.mkdir(mode=0o700)
+        sibling = mount / 'tasks'
+        sibling.mkdir(mode=0o700)
+        (sibling / 'old-task').write_bytes(b'unrelated task state')
+        root = mount / 'toolset'
+        self.fixture.bundle['config']['install_root'] = str(root)
+        self.fixture.install()
+        manifest = json.loads((root / 'active/installed.json').read_text())
+        for name in ('task.mjs', 'task-cli.mjs', 'task-acp.mjs'):
+            self.assertIn(name, manifest['files'])
+        self.assertIn('opencode-task', {p.name for p in (root / 'bin').iterdir()})
+        task = root / 'runtime/tasks' / ('task_' + 'a' * 64)
+        task.mkdir(mode=0o700)
+        (task / 'task.json').write_bytes(b'preserve private task bytes')
+        (task / 'task.json').chmod(0o600)
+        old = root / 'runtime/home/.acpx/old-session'
+        old.write_bytes(b'old acpx history')
+        cache = root / 'runtime/cache/old-cache'
+        cache.write_bytes(b'cache')
+        before = {p: p.read_bytes() for p in (sibling / 'old-task', task / 'task.json', old, cache)}
+        self.fixture.install()
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        result = subprocess.run([str(root / 'bin/opencode-task'), '--help'],
+                                env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_callback_environment_not_forwarded_even_via_lc_prefix_or_extra(self):
+        self.fixture.install()
+        import runtime
+        sentinel = 'tcb_' + 'a' * 43
+        environment = runtime.environment({'LC_ALL': 'C.UTF-8', 'LC_TASK_CALLBACK_ID': sentinel,
+                                           'LC_OTHER': sentinel, 'EXTRA': sentinel},
+                                          self.fixture.root, ['EXTRA'])
+        self.assertEqual(environment['LC_ALL'], 'C.UTF-8')
+        self.assertNotIn(sentinel, json.dumps(environment))
+
+    def test_cancelled_queued_task_launcher_needs_no_provider_credentials(self):
+        self.fixture.bundle['config']['runtime_profile'] = 'env'
+        self.fixture.install()
+        root = self.fixture.root
+        task_id = 'task_' + 'b' * 64
+        task = root / 'runtime/tasks' / task_id
+        task.mkdir(mode=0o700)
+        for name, value in (('task.json', {'state': 'queued'}), ('cancel.json', {'requested': True})):
+            (task / name).write_text(json.dumps(value))
+            (task / name).chmod(0o600)
+        result = subprocess.run([str(root / 'bin/opencode-task'), '_worker', task_id],
+                                env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -13,6 +13,10 @@
 
 Modules extend Coder Templates to create reusable components for your development environment.
 
+- [OpenCode module](opencode/README.md): pinned private runtime and
+  [detached tasks/callback recovery](opencode/TASKS.md). This fork module is a
+  source candidate; read its publication boundary before selecting a fixed revision.
+
 e.g.
 
 ```tf

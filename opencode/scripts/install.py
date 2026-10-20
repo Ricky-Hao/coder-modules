@@ -22,7 +22,7 @@ NODE_SHA256 = '9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37'
 NODE_URL = 'https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.xz'
 ACPX_VERSION = '0.19.3'
 TARGET = 'opencode-linux-x64-baseline'
-PAYLOAD_FILES = {'install.py', 'runtime.py', 'safety.py', 'profiles.py', 'shell_path.py',
+PAYLOAD_FILES = {'install.py', 'runtime.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}
 
 
@@ -212,6 +212,7 @@ def install(bundle):
             safety['write_json'](root / 'status.json', {
                 'state': state, 'error': error, 'requested': key, 'versions': {
                     'opencode': config['release_tag'], 'node': NODE_VERSION, 'acpx': ACPX_VERSION},
+                'features': {'task_callbacks': 1},
                 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                 'active': os.readlink(root / 'active') if (root / 'active').is_symlink() else None})
 
@@ -224,7 +225,7 @@ def install(bundle):
             for name in ('versions', 'bin', 'runtime'):
                 safety['directory'](root / name, create=True)
             # Refuse foreign wrappers before any downloads or active switch.
-            for tool in ('opencode', 'acpx'):
+            for tool in ('opencode', 'acpx', 'opencode-task'):
                 path = root / 'bin' / tool
                 if os.path.lexists(path):
                     safety['regular'](path)
@@ -295,7 +296,7 @@ def install(bundle):
                     'agents': {'opencode': {'argv': [str(root / 'bin/opencode'), 'acp']}}})
             else:
                 safety['regular'](acpx / 'config.json')
-            for tool in ('opencode', 'acpx'):
+            for tool in ('opencode', 'acpx', 'opencode-task'):
                 path = root / 'bin' / tool
                 if not path.exists():
                     with path.open('x') as stream:
@@ -309,8 +310,12 @@ def install(bundle):
             finally:
                 temp.unlink(missing_ok=True)
             shell_path['install'](user_home, str(root / 'bin'))
+            # Recover only module-owned records. The command detaches workers;
+            # installation does not wait on model turns or callback networking.
+            subprocess.run([str(root / 'bin/opencode-task'), 'recover'], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             status('ready')
-            print('OpenCode and acpx installation verified; status: ' + str(root / 'status.json'))
+            print('OpenCode, acpx and opencode-task installation verified; status: ' + str(root / 'status.json'))
         except BaseException as exc:
             if activated:
                 if previous is None:

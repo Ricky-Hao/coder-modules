@@ -9,6 +9,10 @@ tags: [helper, ide, ai]
 
 # OpenCode and acpx
 
+The module also installs **`opencode-task`** for detached tasks, durable callback
+delivery and recovery using the pinned acpx runtime. See [TASKS.md](TASKS.md) for
+the CLI, private-input contract, protocol and focused verification.
+
 Install pinned OpenCode and acpx as the existing workspace user. Only `agent_id` is
 required. For persistent use, a dedicated writable PVC is recommended:
 
@@ -130,7 +134,8 @@ No global PATH or Node installation is changed.
 
 Profile edits apply to **fresh shells**; they cannot modify the already-running
 parent agent's environment. Existing terminals and non-Bash programs may need a new
-process or absolute commands. `opencode_command` and `acpx_command` are shell-quoted
+process or absolute commands. `opencode_command`, `acpx_command` and
+`opencode_task_command` are shell-quoted
 absolute invocations for automation. In HOME mode these expand `"$HOME"` at execution
 time; Terraform cannot know that absolute HOME path. Treat outputs as shell command
 expressions, not executable filenames. Explicit-PVC mode returns a quoted absolute
@@ -144,16 +149,16 @@ Linux **x86-64 glibc**, Bash, Python **3.11+**, curl, tar and xz are required. N
 build or package-manager installation of prerequisites occurs. Release and Node
 archives require network on first installation; verified cached reuse is offline.
 
-| Input | Default |
-| --- | --- |
-| `agent_id` | Required existing agent ID |
-| `install_root` | Empty: runtime `$HOME/.coder-opencode` |
-| `dedicated_volume` | Null; explicit dedicated-volume root-init output opt-in |
-| `release` | Null: pinned public release below |
-| `runtime_profile` | `env`; `none` opts out |
-| `runtime_env_allowlist` | `[]`; extra names only |
-| `start_blocks_login` | `true` |
-| `install_timeout` | `1200` seconds |
+| Input                   | Default                                                 |
+| ----------------------- | ------------------------------------------------------- |
+| `agent_id`              | Required existing agent ID                              |
+| `install_root`          | Empty: runtime `$HOME/.coder-opencode`                  |
+| `dedicated_volume`      | Null; explicit dedicated-volume root-init output opt-in |
+| `release`               | Null: pinned public release below                       |
+| `runtime_profile`       | `env`; `none` opts out                                  |
+| `runtime_env_allowlist` | `[]`; extra names only                                  |
+| `start_blocks_login`    | `true`                                                  |
+| `install_timeout`       | `1200` seconds                                          |
 
 OpenCode is pinned to the public fork release
 [v2.0.19-ricky.1](https://github.com/Ricky-Hao/opencode/releases/tag/v2.0.19-ricky.1),
@@ -180,12 +185,12 @@ supply a compatible endpoint/key and actual model access; the catalog does not
 establish availability or official pricing. Catalog settings/cost/limits/variants
 are bundled nonsecret defaults, not a continuously synchronized service catalog.
 
-| Environment names | Contract |
-| --- | --- |
-| `LLM_BASE_URL`, `LLM_API_KEY` | Required on a real provider launch |
+| Environment names                                                                                   | Contract                                                         |
+| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `LLM_BASE_URL`, `LLM_API_KEY`                                                                       | Required on a real provider launch                               |
 | `CONTEXT7_MCP_ENABLED`, `FIRECRAWL_MCP_ENABLED`, `GITHUB_MCP_ENABLED`, `GITHUB_ACTIONS_MCP_ENABLED` | Only literal `1` enables; absent/`0` disables; other values fail |
-| Each enabled prefix's `_MCP_URL`, `_MCP_API_KEY` | Required endpoint/key, child env only |
-| Each prefix's `_MCP_AUTH_HEADER`, `_MCP_AUTH_SCHEME` | Optional validated nonsecret header/scheme |
+| Each enabled prefix's `_MCP_URL`, `_MCP_API_KEY`                                                    | Required endpoint/key, child env only                            |
+| Each prefix's `_MCP_AUTH_HEADER`, `_MCP_AUTH_SCHEME`                                                | Optional validated nonsecret header/scheme                       |
 
 Context7 defaults to `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`. The other
 three default to `X-MCP-API-Key: {env:..._MCP_API_KEY}`. An Authorization header

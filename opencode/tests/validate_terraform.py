@@ -25,7 +25,7 @@ def main():
     for path in module.glob('*.tf'):
         shutil.copyfile(path, scratch / path.name)
     shutil.copyfile(module / '.terraform.lock.hcl', scratch / '.terraform.lock.hcl')
-    shutil.copytree(module / 'scripts', scratch / 'scripts')
+    shutil.copytree(module / 'scripts', scratch / 'scripts', ignore=shutil.ignore_patterns('node_modules', '__pycache__'))
     (scratch / 'tests').mkdir()
     shutil.copyfile(module / 'tests/defaults.tftest.hcl', scratch / 'tests/defaults.tftest.hcl')
     env = {'HOME': str(scratch), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
@@ -90,8 +90,9 @@ def main():
             config = json.loads(base64.b64decode(
                 script.split("base64.b64decode('", 1)[1].split("')", 1)[0]))['config']
             if config['install_root']:
-                for tool in ('opencode', 'acpx'):
-                    command = plan['output_changes'][tool + '_command']['after']
+                for tool, output in (('opencode', 'opencode_command'), ('acpx', 'acpx_command'),
+                                     ('opencode-task', 'opencode_task_command')):
+                    command = plan['output_changes'][output]['after']
                     assert shlex.split(command) == [config['install_root'] + '/bin/' + tool]
     configs = []
     for number, script in enumerate(scripts):
@@ -99,7 +100,8 @@ def main():
         bundle = json.loads(base64.b64decode(encoded))
         configs.append(bundle['config'])
         assert set(bundle['files']) == {'install.py', 'runtime.py', 'safety.py', 'profiles.py',
-                                       'profile-env.json', 'shell_path.py', 'package.json', 'package-lock.json'}
+                                        'profile-env.json', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs',
+                                        'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():
             assert text == (module / 'scripts' / name).read_text()
             if name.endswith('.py'):

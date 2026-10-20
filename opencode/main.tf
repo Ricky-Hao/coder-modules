@@ -17,7 +17,7 @@ locals {
       runtime_profile       = var.runtime_profile
       runtime_env_allowlist = sort(tolist(var.runtime_env_allowlist))
     }
-    files = { for name in ["install.py", "runtime.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "package.json", "package-lock.json"] :
+    files = { for name in ["install.py", "runtime.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-cli.mjs", "task-acp.mjs", "package.json", "package-lock.json"] :
       name => file("${path.module}/scripts/${name}")
     }
   }))

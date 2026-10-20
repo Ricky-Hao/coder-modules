@@ -326,6 +326,8 @@ elif sys.argv[1].endswith('npm-cli.js'):
     (dest/'cli.js').write_text('fixture only')
 elif sys.argv[-1] == '--version':
     print('0.19.3')
+elif sys.argv[1].endswith('task-cli.mjs'):
+    assert sys.argv[2:] == ['recover']
 else:
     assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
     assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'copilot/gpt-6.1-sol'
@@ -397,7 +399,7 @@ else:
                 fixtures.installer.install(bundle)
         bundle = copy.deepcopy(self.fixture.bundle)
         bundle['config']['runtime_profile'] = 'unknown'
-        with self.assertRaisesRegex(ValueError, 'profile'):
+        with self.fixture.fixtures(), self.assertRaisesRegex(ValueError, 'profile'):
             fixtures.installer.install(bundle)
         self.assertEqual(self.fixture.downloads, 0)
         self.fixture.install()

@@ -8,6 +8,11 @@ output "acpx_command" {
   value       = "${local.command_root}/bin/acpx"
 }
 
+output "opencode_task_command" {
+  description = "Shell-quoted module task command for detached submission, status, cancel and recovery. Callback input uses stdin or a private file."
+  value       = "${local.command_root}/bin/opencode-task"
+}
+
 output "status_path" {
   description = "Absolute status path with explicit install_root; null for runtime HOME mode (HOME/.coder-opencode/status.json)."
   value       = var.install_root == "" ? null : "${var.install_root}/status.json"

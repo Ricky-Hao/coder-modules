@@ -31,6 +31,10 @@ run "agent_only" {
     condition     = output.opencode_command == "\"$HOME\"/.coder-opencode/bin/opencode"
     error_message = "Automation must not rely on agent PATH."
   }
+  assert {
+    condition     = output.opencode_task_command == "\"$HOME\"/.coder-opencode/bin/opencode-task" && contains(keys(jsondecode(base64decode(local.bundle)).files), "task.mjs")
+    error_message = "Detached task wrapper and runtime must be bundled together."
+  }
 }
 
 run "dedicated_mount" {
@@ -43,6 +47,10 @@ run "dedicated_mount" {
   assert {
     condition     = output.acpx_command == "'/mnt/opencode/toolset'/bin/acpx"
     error_message = "Persistent automation command must be absolute."
+  }
+  assert {
+    condition     = output.opencode_task_command == "'/mnt/opencode/toolset'/bin/opencode-task"
+    error_message = "Detached task command must follow the persistent root."
   }
 }
 
