@@ -21,7 +21,9 @@ locals {
       name => file("${path.module}/scripts/${name}")
     }
   }))
-  install_script = templatefile("${path.module}/scripts/install.sh.tftpl", { bundle = local.bundle })
+  # Coder passes the script through exec arguments. Keep the embedded source
+  # compressed so it fits Linux's per-argument limit before the installer runs.
+  install_script = templatefile("${path.module}/scripts/install.sh.tftpl", { bundle = base64gzip(base64decode(local.bundle)) })
   # HOME is deliberately expanded by the workspace shell, never by Terraform.
   command_root = var.install_root == "" ? "\"$HOME\"/.coder-opencode" : "'${replace(var.install_root, "'", "'\"'\"'")}'"
   # Pure input/file expression: safe for init-container use without depending on
@@ -45,6 +47,12 @@ resource "coder_script" "opencode" {
   start_blocks_login = var.start_blocks_login
   timeout            = var.install_timeout
   lifecycle {
+    precondition {
+      # The rendered template is ASCII (including its base64 payload), so this
+      # is also its byte size. Reserve half of Linux's 128-KiB argument ceiling.
+      condition     = length(local.install_script) <= 65536
+      error_message = "OpenCode startup script exceeds its 64-KiB execution budget; reduce the embedded payload before publishing."
+    }
     precondition {
       condition     = var.dedicated_volume == null ? true : var.install_root == "/mnt/opencode/toolset"
       error_message = "Dedicated volume preparation requires install_root=/mnt/opencode/toolset."

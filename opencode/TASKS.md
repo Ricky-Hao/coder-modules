@@ -13,6 +13,11 @@ old acpx/OpenCode sessions/cache, old versions, and all `/mnt/opencode` siblings
 outside the module-owned `toolset` child.
 Installation `status.json` advertises `features.task_callbacks: 1` alongside
 `state: ready`; the existing OpenCode/Node/acpx pins are unchanged.
+The source bundle uses the bounded compressed
+[startup transport](README.md#startup-execution-budget), so callback runtime growth
+cannot silently exceed the Linux execution argument limit before installation.
+The 6516ad1 gate rollout failure left the prior toolset intact; source readiness
+and a successful Coder build do not prove that `opencode-task` was installed.
 
 ## CLI and private input
 

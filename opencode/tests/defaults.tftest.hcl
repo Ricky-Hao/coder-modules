@@ -111,3 +111,14 @@ run "invalid_release" {
   }
   expect_failures = [var.release]
 }
+
+run "oversized_startup" {
+  command = plan
+  variables {
+    agent_id = "22222222-2222-4222-8222-222222222222"
+    # Valid but deliberately incompressible extra names exercise the actual
+    # rendered script, rather than checking a duplicate compression formula.
+    runtime_env_allowlist = [for index in range(1024) : "EXTRA_${sha256(tostring(index))}"]
+  }
+  expect_failures = [coder_script.opencode]
+}

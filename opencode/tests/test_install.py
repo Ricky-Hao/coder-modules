@@ -60,6 +60,9 @@ elif sys.argv[1].endswith('npm-cli.js'):
     (dest/'cli.js').write_text('fixture only')
 elif sys.argv[-1] == '--version':
     print('0.19.3')
+elif sys.argv[1].endswith('task-cli.mjs') and sys.argv[2:] == ['recover']:
+    marker=Path(os.environ['XDG_STATE_HOME'])/'fixture-startup-recoveries'
+    marker.write_text(str(int(marker.read_text())+1) if marker.exists() else '1')
 else:
     print(json.dumps({'argv':sys.argv[2:],'cwd':os.getcwd(),'env':dict(os.environ)}))
 '''

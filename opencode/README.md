@@ -125,6 +125,38 @@ default. The module derives identity with `data.coder_workspace.me.id`. It conta
 all helpers; the caller supplies no `file()` helpers, startup snippets or dependency
 from agent configuration back to module outputs. This avoids agent/module cycles.
 
+### Startup execution budget
+
+The startup script embeds a gzip-compressed, base64-encoded bundle using Terraform's
+`base64gzip`. Python's standard-library `gzip` decoder restores the exact source
+files and settings in memory before invoking the existing installer. This adds no
+remote bootstrap, download, prerequisite, or trust source. Installed-file inventory,
+payload fingerprints, ownership checks, wrapper commands and persistent state keep
+their existing contracts; transport-only changes do not invalidate a verified cache.
+
+Coder launches scripts through execution arguments. On a Linux host with 4096-byte
+pages, one argument may occupy at most 131072 bytes including its terminator.
+The rendered script is ASCII and has a **65536-byte plan-time budget**, leaving
+headroom for the launch wrapper. If payload/settings growth exceeds that budget,
+Terraform rejects the plan; maintainers must reduce the embedded payload before
+publication. Passing `bash -n` or executing a script file does not verify this
+boundary. Regression tests pass the actual rendered script as one `env bash -c`
+argument, then verify first installation, offline cache reuse, startup recovery
+invocation, private modes and preservation of runtime and sibling data.
+
+The 2026-10-20 gate rollout of source
+`6516ad1f2242a46dce9ed42f834542a34e525121` exposed the missing execution-boundary
+check: its dedicated-mount script was 153559 bytes, and the Agent failed with
+`argument list too long` before the installer ran. Coder's build could succeed
+while the script log stayed empty and the old installation status remained on disk.
+The compact transport reduces that same rendered configuration to 40722 bytes.
+The negative control reproduces `E2BIG` for the original script size; the bounded
+positive cases execute on Linux, including a nonroot fixture. These are local
+source/fixture results; a repaired fixed template still needs operator review,
+publication and rollout verification. Check the requested source/version and
+installed command as well as readiness; an old status file is not fresh startup
+evidence. No runtime data repair or deletion is needed for this transport failure.
+
 The helper appends **only the wrapper bin directory** to `.bashrc` and Bash's existing
 preferred login profile (`.bash_profile`, `.bash_login`, otherwise `.profile`). It
 preserves existing bytes, modes and PATH order. Modified managed blocks, unsafe links,
@@ -234,6 +266,10 @@ They use synthetic archives/keys and mocked downloads, never real tools or servi
 For actual Terraform validation/rendering use `tests/validate_terraform.py --terraform
 <binary> --provider-dir <cached-provider-mirror> --scratch <new-directory>`. This
 requires Terraform 1.7+ for mock-provider tests; no apply or cluster is used.
+It also enforces the script budget, rejects an oversized plan, and executes the
+rendered HOME/dedicated startup through the real Linux argument path using local
+synthetic archives. The installer, cache and startup recovery paths run; no model
+or live provider is invoked.
 
 Before publication, review the added files and fixed source revision, then separately
 verify first/repeat startup on root/nonroot images, mount persistence, fresh Bash and

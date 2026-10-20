@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import shlex
 import subprocess
+from bootstrap_fixture import BOOTSTRAP_MARKER, SCRIPT_BUDGET, unpack, verify_startup
 
 
 def main():
@@ -28,6 +29,19 @@ def main():
     shutil.copytree(module / 'scripts', scratch / 'scripts', ignore=shutil.ignore_patterns('node_modules', '__pycache__'))
     (scratch / 'tests').mkdir()
     shutil.copyfile(module / 'tests/defaults.tftest.hcl', scratch / 'tests/defaults.tftest.hcl')
+    execution_dir = scratch / 'execution-dedicated'
+    fixture_root = str(execution_dir / 'mount/toolset')
+    provider_mock = (module / 'tests/defaults.tftest.hcl').read_text().split('run "agent_only"', 1)[0]
+    (scratch / 'tests/execution.tftest.hcl').write_text(provider_mock + '''
+run "executable_dedicated_startup" {
+  command = plan
+  variables {
+    agent_id = "22222222-2222-4222-8222-222222222222"
+    install_root = ROOT
+    runtime_profile = "none"
+  }
+}
+'''.replace('ROOT', json.dumps(fixture_root)))
     env = {'HOME': str(scratch), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
            'TF_CLI_CONFIG_FILE': '/dev/null', 'CHECKPOINT_DISABLE': '1', 'TF_IN_AUTOMATION': '1'}
     records = {}
@@ -69,9 +83,11 @@ def main():
             for child in value:
                 visit(child)
 
-    visit(plans)
+    visit([record for record in plans if record.get('@testrun') != 'oversized_startup'])
     assert len(scripts) >= 2, 'verbose mock plans must expose both actual rendered scripts'
     for record in plans:
+        if record.get('@testrun') == 'oversized_startup':
+            continue
         plan = record.get('test_plan', {})
         preparation = plan.get('output_changes', {}).get('volume_prepare_script', {}).get('after')
         if preparation:
@@ -87,17 +103,20 @@ def main():
             if resource.get('type') != 'coder_script':
                 continue
             script = resource['change']['after']['script']
-            config = json.loads(base64.b64decode(
-                script.split("base64.b64decode('", 1)[1].split("')", 1)[0]))['config']
+            config = unpack(script)['config']
             if config['install_root']:
                 for tool, output in (('opencode', 'opencode_command'), ('acpx', 'acpx_command'),
                                      ('opencode-task', 'opencode_task_command')):
                     command = plan['output_changes'][output]['after']
                     assert shlex.split(command) == [config['install_root'] + '/bin/' + tool]
     configs = []
+    sizes = []
+    execution = []
     for number, script in enumerate(scripts):
-        encoded = script.split("base64.b64decode('", 1)[1].split("')", 1)[0]
-        bundle = json.loads(base64.b64decode(encoded))
+        bundle = unpack(script)
+        size = len(script.encode('utf-8'))
+        assert size <= SCRIPT_BUDGET, f'actual rendered script is {size} bytes, exceeding startup budget'
+        sizes.append({'script': number, 'bytes': size, 'budget': SCRIPT_BUDGET})
         configs.append(bundle['config'])
         assert set(bundle['files']) == {'install.py', 'runtime.py', 'safety.py', 'profiles.py',
                                         'profile-env.json', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs',
@@ -109,12 +128,22 @@ def main():
         path = scratch / ('rendered-' + str(number) + '.sh')
         path.write_text(script)
         subprocess.run(['bash', '-n', str(path)], check=True, env=env)
-        body = script.split("<<'OPENCODE_BOOTSTRAP'\n", 1)[1].rsplit('\nOPENCODE_BOOTSTRAP', 1)[0]
+        body = script.split(BOOTSTRAP_MARKER, 1)[1].rsplit('\nOPENCODE_BOOTSTRAP', 1)[0]
         compile(body, '<bootstrap>', 'exec')
+        config = bundle['config']
+        if config['install_root'] == '':
+            result = verify_startup(script, scratch / 'execution-home')
+            execution.append({'mode': 'home', **result})
+        elif config['install_root'] == fixture_root:
+            result = verify_startup(script, execution_dir)
+            execution.append({'mode': 'dedicated', **result})
     assert any(c['install_root'] == '' and c['runtime_profile'] == 'env' for c in configs)
     assert any(c['install_root'] == '/mnt/opencode/toolset' and c['runtime_profile'] == 'none' for c in configs)
     assert (scratch / 'volume-prepare.py').is_file()
-    print('PASS: cached init, validate, provider schema, mock plans, actual payload render, Bash/Python syntax; no apply')
+    assert {record['mode'] for record in execution} == {'home', 'dedicated'}
+    (scratch / 'startup-evidence.json').write_text(json.dumps({'sizes': sizes, 'execution': execution}, indent=2) + '\n')
+    print(json.dumps({'sizes': sizes, 'execution': execution}, indent=2))
+    print('PASS: cached init, validate, mock plans, budget rejection, rendered env/bash -c execution, install/cache/recovery/preservation; no apply')
 
 
 if __name__ == '__main__':
