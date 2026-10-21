@@ -1,6 +1,33 @@
 # Contributing
 
-## Getting started
+## Fork-local validation
+
+This fork's OpenCode module uses manual validation, not the inherited upstream CI.
+The three inherited workflows are [archived](.github/workflows-archive/README.md)
+outside `.github/workflows`; no replacement CI or registry deployment is enabled
+in this source tree. This does not change repository Actions settings or cancel
+existing jobs. Deliver the workflow removals together with the reviewed module changes.
+
+From the repository root, with Python 3.11+ and Node 22+ available:
+
+```sh
+python3 -B -m unittest discover -s opencode/tests -v
+node --test opencode/tests/task.test.mjs
+git diff --check
+```
+
+These fixtures use synthetic tools/credentials and mock ACP or local HTTP, not
+real provider/MCP requests. See [opencode/README.md](opencode/README.md#validation-and-publication-boundary)
+for Terraform mock/render checks and [opencode/TASKS.md](opencode/TASKS.md#verification-and-rollout-boundary)
+for optional acpx runtime/CLI fixtures and their prerequisites. Offline checks do
+not establish live acceptance, publication or deployment.
+
+Before Git delivery, verify no `.yml`/`.yaml` files remain under `.github/workflows`
+and compare the archived workflow bytes with their original paths at commit
+`51524055c61443b5768b62e0d0e059459f88caa7`. Keep the archive unchanged; restoring a
+workflow is a separate, explicitly approved review following its restoration policy.
+
+## Upstream getting started (reference)
 
 This repo uses the [Bun runtime](https://bun.sh/) to to run all code and tests. To install Bun, you can run this command on Linux/MacOS:
 
@@ -20,7 +47,7 @@ Follow the instructions to ensure that Bun is available globally. Once Bun has b
 ./new.sh NAME_OF_NEW_MODULE
 ```
 
-## Testing a Module
+## Upstream module tests (reference)
 
 > **Note:** It is the responsibility of the module author to implement tests for their module. The author must test the module locally before submitting a PR.
 
@@ -51,12 +78,16 @@ module "example" {
 }
 ```
 
-## Releases
+## Upstream releases (reference only)
+
+The process below describes upstream `coder/modules`, not this fork's delivery.
+The archived workflows do not run it. Any fork publication or workflow restoration
+requires a separate deliberate owner decision; merging source alone does not deploy it.
 
 > [!WARNING]
 > When creating a new release, make sure that your new version number is fully accurate. If a version number is incorrect or does not exist, we may end up serving incorrect/old data for our various tools and providers.
 
-Much of our release process is automated. To cut a new release:
+Much of the upstream release process is automated. To cut an upstream release:
 
 1. Navigate to [GitHub's Releases page](https://github.com/coder/modules/releases)
 2. Click "Draft a new release"

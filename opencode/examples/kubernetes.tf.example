@@ -1,0 +1,39 @@
+# Integration fragment: merge the mount/volume blocks into your existing Pod.
+# The module remains Kubernetes-independent. No init container or helper file.
+resource "kubernetes_persistent_volume_claim_v1" "opencode" {
+  metadata {
+    name      = "opencode-${data.coder_workspace.me.id}"
+    namespace = "workspaces" # Use your template's namespace.
+  }
+  spec {
+    access_modes = ["ReadWriteOnce"]
+    resources {
+      requests = { storage = "5Gi" }
+    }
+  }
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Inside existing kubernetes_pod_v1.spec:
+# security_context { fs_group = <group suitable for your image and storage driver> }
+# volume {
+#   name = "opencode"
+#   persistent_volume_claim {
+#     claim_name = kubernetes_persistent_volume_claim_v1.opencode.metadata[0].name
+#   }
+# }
+# Inside its existing container:
+# volume_mount {
+#   name       = "opencode"
+#   mount_path = "/mnt/opencode"
+# }
+# Confirm the fixed container UID can write the mount. The module does not fix
+# volume ownership or migrate sessions when that UID/workspace identity changes.
+
+module "opencode" {
+  source       = "git::https://github.com/Ricky-Hao/coder-modules.git//opencode?ref=<FIXED_COMMIT>"
+  agent_id     = coder_agent.example.id
+  install_root = "/mnt/opencode/toolset"
+}

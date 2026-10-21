@@ -7,11 +7,23 @@
 
 [![discord](https://img.shields.io/discord/747933592273027093?label=discord)](https://discord.gg/coder)
 [![license](https://img.shields.io/github/license/coder/modules)](./LICENSE)
-[![Health](https://github.com/coder/modules/actions/workflows/check.yaml/badge.svg)](https://github.com/coder/modules/actions/workflows/check.yaml)
 
 </div>
 
 Modules extend Coder Templates to create reusable components for your development environment.
+
+## Fork scope and validation
+
+This fork maintains the OpenCode module while retaining the upstream modules and
+registry references below. The inherited CI, scheduled health check and registry
+deployment workflows are [archived](.github/workflows-archive/README.md), outside
+`.github/workflows`; this source tree has no active GitHub workflows or replacement CI.
+This is source-level deactivation, not a change to repository Actions settings.
+Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before Git delivery.
+
+- [OpenCode module](opencode/README.md): pinned private runtime and
+  [detached tasks/callback recovery](opencode/TASKS.md). This fork module is a
+  source candidate; read its publication boundary before selecting a fixed revision.
 
 e.g.
 
@@ -35,4 +47,6 @@ Check out the [Coder Registry](https://registry.coder.com) for instructions to i
 
 ## Contributing a Module
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for instructions on how to construct and publish a module to the [Coder Registry](https://registry.coder.com).
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for fork-local validation and the inherited
+upstream module contribution/release guidance. This fork does not automatically
+publish or deploy to the Coder Registry.
