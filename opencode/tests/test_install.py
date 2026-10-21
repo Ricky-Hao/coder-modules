@@ -125,6 +125,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.downloads, 2)
         self.assertEqual(os.readlink(self.root / 'active'), active)
         self.assertEqual(json.loads((self.root / 'status.json').read_text())['state'], 'ready')
+        self.assertEqual((self.root / 'active/profile-env.json').read_bytes(), (SCRIPTS / 'profile-env.json').read_bytes())
         self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
         for name in ('opencode', 'acpx'):
             self.assertFalse((self.root / 'bin' / name).is_symlink())

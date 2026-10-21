@@ -209,13 +209,75 @@ already-appended safe PATH blocks may remain and are idempotent on retry.
 
 ## Environment-only provider and MCP configuration
 
-Default `env` profile includes a nine-model catalog and selects
-**`copilot/gpt-6.1-sol`**, variant **`max`**, with compaction and deny-other-provider
+Default `env` profile includes **only `gpt-6.1-sol` and `gpt-6-astra`** and selects
+**`copilot/gpt-6.1-sol`**, variant **`max`** / `reasoningEffort: "max"`, with compaction and deny-other-provider
 policy. **`copilot` is a local provider alias, not official GitHub Copilot login/auth**.
 It uses the fork's installed OpenAI Responses provider implementation. Users must
 supply a compatible endpoint/key and actual model access; the catalog does not
 establish availability or official pricing. Catalog settings/cost/limits/variants
 are bundled nonsecret defaults, not a continuously synchronized service catalog.
+
+### Context and input budgeting
+
+| Model         | Context tokens | Input tokens       | Output tokens      | Default reasoning    |
+| ------------- | -------------- | ------------------ | ------------------ | -------------------- |
+| `gpt-6.1-sol`  | 400000         | 272000             | 128000             | `max`                |
+| `gpt-6-astra`  | 400000         | 272000 (unchanged) | 128000 (unchanged) | `medium` (unchanged) |
+
+Both retain their existing costs, capabilities and `low`/`medium`/`high`/`xhigh`/`max`
+variants. Compatibility is checked against **v2.0.19-ricky.1**, commit
+`20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d`, including its
+[`ConfigProvider` model limit/variant schema](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/schema/src/config/provider.ts#L62-L83),
+not the latest schema/docs:
+
+- [`SessionCompaction.calculateCeiling`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/compaction.ts#L856-L900)
+  uses `(limit.input || limit.context) - compaction.buffer` when the buffer is explicit.
+  It does **not** subtract the output limit. Sol's explicit **272000 = 400000 - 128000**
+  input budget preserves room for the existing full output allowance. The unchanged
+  **13600** buffer then triggers compaction at **258400** estimated prompt tokens,
+  leaving **141600 = 128000 + 13600** tokens in the context window. The buffer is not
+  deducted twice from the configured input limit. Astra keeps the same input cap.
+- [`SessionModelRequest.outputLimit`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/model-request.ts#L43-L98)
+  independently fits output to the remaining context, adding 15% to the unmeasured
+  input estimate; compaction summaries are capped at 32000 output tokens. These are
+  local budgeting thresholds, not a hard prompt truncation or a guarantee against
+  provider overflow. An oversized turn or estimation error can still reduce output
+  or invoke the fork's overflow recovery.
+
+### Auxiliary model and reasoning isolation
+
+The only automatic small-model consumer in this pin is **session title generation**:
+
+- [`Model.small`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/model.ts#L256-L268)
+  searches active text models in the primary provider by family (`gpt-luna`,
+  `gemini-flash-lite`, `gemini-flash`, `claude-haiku`). Neither retained model is one
+  of those families, so relying on automatic selection would fall back to the primary model.
+- The native override is **`agents.title.model = { providerID: "copilot", model:
+  "gpt-6.1-sol", variant: "low" }`**. The pinned
+  [`ConfigAgent.Info`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/schema/src/config/agent.ts#L11-L22)
+  and [`ConfigModel.Selection`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/schema/src/config/model.ts#L12-L28)
+  accept this shape. Legacy `small_model` only migrates to the title agent; it is
+  not a global auxiliary setting and is not added to this profile.
+- [`SessionContext.selectTitle`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/context.ts#L95-L119)
+  resolves that model/variant separately from the session (its automatic minimal
+  variant order is `none`, `minimal`, `low`).
+  [`ModelResolver.withVariant`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/model-resolver.ts#L136-L161)
+  overlays settings on a request-local copy, leaving Sol's catalog default and main
+  selection at **max**.
+  [`OpenResponses.lowerGeneration`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/ai/src/protocols/open-responses.ts#L767-L789)
+  lowers `reasoningEffort` to `reasoning.effort`.
+  [`SessionTitle.generate`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/title.ts#L100-L134)
+  handles initial titles and regeneration without coding tools. If the low title
+  request fails, it may retry with the unchanged primary model/variant (normally max).
+- Compaction uses the loaded **session model/agent**, not the hidden `compaction`
+  or `summary` agent's model
+  ([`SessionCompaction.prepare`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/compaction.ts#L563-L579)).
+  Generic [`SessionGenerate.generate`](https://github.com/Ricky-Hao/opencode/blob/20a13a9138a1bfa3dbd9a40f53659bd4ddd6001d/packages/core/src/session/generate.ts#L20-L57)
+  also resolves the current session model. Subagents use explicit selections or
+  inherit their parent, not `Model.small`. These paths keep main reasoning; no
+  unsupported global small-model reasoning option, third model or fork change is needed.
+
+### Launch environment
 
 | Environment names                                                                                   | Contract                                                         |
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |

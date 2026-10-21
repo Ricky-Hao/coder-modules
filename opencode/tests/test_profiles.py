@@ -76,15 +76,45 @@ class ProfileTests(unittest.TestCase):
                 for value in forbidden:
                     self.assertNotIn(value, path.read_bytes(), path.name)
 
-    def test_full_snapshot_catalog_and_policy(self):
+    def test_two_model_snapshot_limits_and_policy(self):
         cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
-        self.assertEqual(hashlib.sha256(json.dumps(cfg['providers']['copilot']['models'], sort_keys=True).encode()).hexdigest(),
-                         'a8f0c25eb5ebd602960e303e7bdcaee4243b544cb86e4137f6826d8481353db8')
-        self.assertEqual(len(cfg['providers']['copilot']['models']), 9)
+        self.assertEqual(set(cfg['providers']), {'copilot'})
+        provider = cfg['providers']['copilot']
+        self.assertEqual(provider['package'], '@opencode/ai/providers/openai/responses')
+        self.assertEqual(provider['env'], ['LLM_API_KEY'])
+        self.assertEqual(provider['settings'], {'baseURL': '{env:LLM_BASE_URL}', 'apiKey': '{env:LLM_API_KEY}'})
+        models = provider['models']
+        self.assertEqual(set(models), {'gpt-6.1-sol', 'gpt-6-astra'})
+        self.assertEqual(hashlib.sha256(json.dumps(models, sort_keys=True).encode()).hexdigest(),
+                         '6c8d5e4c904137afa2d806ebebd32ea33dd4b9f84052c63ff551db4c1daf159c')
+        self.assertEqual(cfg['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'max'})
+        for name, model in models.items():
+            with self.subTest(model=name):
+                self.assertEqual(model['limit'], {'context': 400000, 'input': 272000, 'output': 128000})
+                self.assertEqual(model['capabilities'], {'tools': True, 'input': ['text', 'image'], 'output': ['text']})
+                self.assertEqual(model['variants'], [{'id': level, 'settings': {'reasoningEffort': level}}
+                                                    for level in ('low', 'medium', 'high', 'xhigh', 'max')])
+        self.assertEqual(models['gpt-6.1-sol']['settings'], {'reasoningEffort': 'max'})
+        self.assertEqual(models['gpt-6-astra']['settings'], {'reasoningEffort': 'medium'})
         self.assertEqual(cfg['compaction'], {'buffer': 13600})
+        # The pinned fork subtracts buffer from input, not output from context.
+        sol = models['gpt-6.1-sol']['limit']
+        self.assertEqual(sol['input'] + sol['output'], sol['context'])
+        self.assertEqual(sol['input'] - cfg['compaction']['buffer'], 258400)
         self.assertEqual(cfg['experimental']['policies'], [
             {'action': 'provider.use', 'resource': '*', 'effect': 'deny'},
             {'action': 'provider.use', 'resource': 'copilot', 'effect': 'allow'}])
+
+    def test_title_model_reasoning_is_separate_from_primary(self):
+        cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        self.assertEqual(cfg['agents'], {'title': {'model': {
+            'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'}}})
+        self.assertNotIn('small_model', cfg)  # Legacy spelling only migrates to the title agent.
+        sol = cfg['providers']['copilot']['models']['gpt-6.1-sol']
+        variants = {variant['id']: variant['settings'] for variant in sol['variants']}
+        self.assertEqual(variants[cfg['agents']['title']['model']['variant']], {'reasoningEffort': 'low'})
+        self.assertEqual(variants[cfg['model']['variant']], {'reasoningEffort': 'max'})
+        self.assertEqual(sol['settings'], {'reasoningEffort': 'max'})
 
     def test_default_profile_launch_and_idempotent_private_config(self):
         self.fixture.install()
@@ -109,6 +139,9 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(path.parent, self.root / 'runtime/module-profiles')
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         cfg = json.loads(path.read_text())
+        expected = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        expected['mcp']['servers'] = {}
+        self.assertEqual(cfg, expected)  # Model limits and title override survive env-profile generation.
         self.assertEqual(cfg['mcp']['servers'], {})
         self.assertEqual(cfg['providers']['copilot']['settings']['apiKey'], '{env:LLM_API_KEY}')
         before = (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
@@ -359,6 +392,10 @@ else:
         self.assertEqual(actual['env']['GITHUB_ACTIONS_MCP_AUTH_SCHEME'], 'Token')
         self.assertNotIn('CONTEXT7_MCP_API_KEY', actual['env'])
         self.assertNotIn('FIRECRAWL_MCP_API_KEY', actual['env'])
+        cfg = json.loads(Path(actual['env']['OPENCODE_CONFIG']).read_text())
+        bundled = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        for key in ('model', 'providers', 'agents', 'compaction'):
+            self.assertEqual(cfg[key], bundled[key])
         self.assertEqual(len(list((self.root / 'runtime/module-profiles').glob('*.json'))), 2)
         self.no_serialized_values()
 

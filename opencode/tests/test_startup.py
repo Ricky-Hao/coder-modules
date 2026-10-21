@@ -46,6 +46,15 @@ class StartupTests(unittest.TestCase):
         self.assertIn('LLM_API_KEY', result.stderr)
         self.assertIn('LLM_BASE_URL', result.stderr)
         self.assertEqual(result.stdout, '')
+        # The executable is a local fixture: exercise the installed env profile, not a provider.
+        result = subprocess.run([str(root / 'bin/opencode'), 'run', 'offline fixture'],
+                                env={'PATH': '/usr/bin:/bin', 'LLM_BASE_URL': 'https://llm.example.invalid/v1',
+                                     'LLM_API_KEY': 'SYNTHETIC-STARTUP-KEY'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = Path(json.loads(result.stdout)['env']['OPENCODE_CONFIG'])
+        expected = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        expected['mcp']['servers'] = {}
+        self.assertEqual(json.loads(generated.read_text()), expected)
 
     def test_writable_dedicated_mount_child_restart_identity_and_no_parent_changes(self):
         mount = self.base / 'mount'
