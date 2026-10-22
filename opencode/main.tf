@@ -3,9 +3,9 @@ data "coder_workspace" "me" {}
 locals {
   install_root = var.install_root
   release = var.release == null ? {
-    tag    = "v2.0.19-ricky.1"
-    asset  = "opencode-linux-x64-baseline-v2.0.19-ricky.1.tar.gz"
-    sha256 = "3494e42923ec3279bacc227e7274d6c580c76e7b28d3a6ea85042edb79feae0a"
+    tag    = "v2.1.2-ricky.1"
+    asset  = "opencode-linux-x64-baseline-v2.1.2-ricky.1.tar.gz"
+    sha256 = "36d60f0fdae6ada8e62f14bf70561bc85151201adfcf4ae6cc4df6f7d9dfc2b8"
   } : var.release
   bundle = base64encode(jsonencode({
     config = {

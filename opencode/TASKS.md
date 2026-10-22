@@ -12,7 +12,10 @@ shell-quoted `opencode_task_command`. Repeat installation preserves `runtime/tas
 old acpx/OpenCode sessions/cache, old versions, and all `/mnt/opencode` siblings
 outside the module-owned `toolset` child.
 Installation `status.json` advertises `features.task_callbacks: 1` alongside
-`state: ready`; the existing OpenCode/Node/acpx pins are unchanged.
+`state: ready`. OpenCode now follows the module's **v2.1.2-ricky.1** release pin;
+private Node **22.22.0** and acpx **0.19.3** are unchanged.
+This upgrade does not migrate task/session/cache data or change callback, recovery,
+request-targeted cancellation or permission contracts.
 The source bundle uses the bounded compressed
 [startup transport](README.md#startup-execution-budget), so callback runtime growth
 cannot silently exceed the Linux execution argument limit before installation.
