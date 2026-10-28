@@ -12,10 +12,9 @@ shell-quoted `opencode_task_command`. Repeat installation preserves `runtime/tas
 old acpx/OpenCode sessions/cache, old versions, and all `/mnt/opencode` siblings
 outside the module-owned `toolset` child.
 Installation `status.json` advertises `features.task_callbacks: 1` alongside
-`state: ready`. OpenCode now follows the module's **v2.1.2-ricky.1** release pin;
+`state: ready`. OpenCode follows the published **v2.2.0-ricky.1** release pin;
 private Node is **22.23.4** and acpx is **0.21.1**.
-The **v2.2.0-ricky.1** source candidate still needs publication and verified asset
-inputs before changing the OpenCode default; see [UPGRADE.md](UPGRADE.md).
+正式 tag、asset、SHA256 和试点交接见 [UPGRADE.md](UPGRADE.md)。
 This upgrade does not migrate task/session/cache data or change callback, recovery,
 request-targeted cancellation or permission contracts.
 The source bundle uses the bounded compressed
@@ -225,7 +224,9 @@ the global deny-all config remains unchanged.
 双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
 去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用
 已发布 v2.1.2-ricky.1 和本地 v2.2.0 候选检查不同 Provider 端口上的主请求 max/title low、
-Astra 档位、同 session 追问及恢复定向取消；它不连接真实 Provider/MCP。
+Astra 档位、同 session 追问及恢复定向取消。当前正式发布 v2.2.0-ricky.1 包另通过
+首次/缓存安装和 codex→独立 copilot→原 codex named session 的最短追问回环，
+确认原回答历史保留；它不连接真实 Provider/MCP。旧 SQLite 故障未证成因，原证据保留。
 
 These are local source checks, with no paid inference or production webhook.
 Publish/deploy reviewed matching module/LibreChat versions, ensure persistent volume

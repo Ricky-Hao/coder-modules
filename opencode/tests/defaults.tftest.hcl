@@ -25,9 +25,9 @@ run "agent_only" {
   }
   assert {
     condition = var.runtime_profile == "env" && local.release == {
-      tag    = "v2.1.2-ricky.1"
-      asset  = "opencode-linux-x64-baseline-v2.1.2-ricky.1.tar.gz"
-      sha256 = "36d60f0fdae6ada8e62f14bf70561bc85151201adfcf4ae6cc4df6f7d9dfc2b8"
+      tag    = "v2.2.0-ricky.1"
+      asset  = "opencode-linux-x64-baseline-v2.2.0-ricky.1.tar.gz"
+      sha256 = "09ed8c564754413a7296c12ce147c4b60d98456dc3815db71b399e093ad7ddcd"
     }
     error_message = "Default profile and public release pin changed."
   }
@@ -108,7 +108,7 @@ run "invalid_release" {
   variables {
     agent_id = "22222222-2222-4222-8222-222222222222"
     release = {
-      tag    = "v2.1.2-ricky.1"
+      tag    = "v2.2.0-ricky.1"
       asset  = "mismatched.tar.gz"
       sha256 = "not-a-digest"
     }

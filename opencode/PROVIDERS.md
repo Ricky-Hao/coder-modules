@@ -84,4 +84,6 @@ Sol/low title。任务记录保存非秘密选择与配置路径，纳入去重�
 
 `opencode --module-profile-info` 只显示来源、默认选择和变量名，不读取凭据或联系端点。
 已在真实 pinned acpx 0.21.1、已发布 fork v2.1.2-ricky.1 及本地 v2.2.0 候选上用隔离
-Responses/回调回环验证；实际服务的端点和访问权仍由使用方提供，本次未联系真实 Provider/MCP。
+Responses/回调回环验证。当前默认已更新为正式发布的 v2.2.0-ricky.1，并用实际发布包
+核验 codex→copilot→原 codex named session 的成功追问及历史延续；见 [UPGRADE.md](UPGRADE.md)。
+实际服务的端点和访问权仍由使用方提供，本次未联系真实 Provider/MCP。

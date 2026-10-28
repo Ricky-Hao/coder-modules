@@ -193,17 +193,16 @@ archives require network on first installation; verified cached reuse is offline
 | `install_timeout`       | `1200` seconds                                          |
 
 OpenCode is pinned to the published fork release
-[v2.1.2-ricky.1](https://github.com/Ricky-Hao/opencode/releases/tag/v2.1.2-ricky.1),
-asset `opencode-linux-x64-baseline-v2.1.2-ricky.1.tar.gz`, SHA256
-`36d60f0fdae6ada8e62f14bf70561bc85151201adfcf4ae6cc4df6f7d9dfc2b8`.
-Its clean tagged source is `0fb11752eced8baa84fb546bbf8212cff2f9e5e0`,
-based on upstream v2.1.2 (`a517687fde98a7329ada3ae644a01a9fc6c4e99e`).
+[v2.2.0-ricky.1](https://github.com/Ricky-Hao/opencode/releases/tag/v2.2.0-ricky.1),
+asset `opencode-linux-x64-baseline-v2.2.0-ricky.1.tar.gz`, SHA256
+`09ed8c564754413a7296c12ce147c4b60d98456dc3815db71b399e093ad7ddcd`.
+Its clean tagged source is `9291b46db483415e1c9bdaa72f8e48637e3f7b49`,
+based on upstream v2.2.0 (`1097e2668b1e08ad63bdf0b1c4860b9bc01e420c`).
 Do not substitute a dirty local validation build or a moving latest asset.
 Private Node **22.23.4** and acpx **0.21.1** use fixed checksums/dependency lock.
 Node follows the current Node 22 LTS maintenance release; acpx requires Node >=22.13.0.
-The OpenCode v2.2.0-ricky.1 source candidate is prepared separately; the default
-above stays on the verified published asset until that candidate is released and downloaded.
-See [UPGRADE.md](UPGRADE.md) for the exact pending downstream inputs.
+该 Release 是 prerelease，非 latest；已核 archive、metadata、tag 与源码 commit。
+发布证据、旧记录恢复限制和负责人试点顺序见 [UPGRADE.md](UPGRADE.md)。
 Node stays off project PATH. npm lifecycle scripts are disabled.
 
 To override OpenCode, supply the complete `release = { tag = ..., asset = ...,
@@ -233,21 +232,20 @@ catalog 不证明服务可用或官方定价；其中的 settings/cost/limits/va
 | `gpt-6-astra`  | 400000         | 272000 (unchanged) | 128000 (unchanged) | `medium` (unchanged) |
 
 Both retain their existing costs, capabilities and `low`/`medium`/`high`/`xhigh`/`max`
-variants. Compatibility is checked against **v2.1.2-ricky.1**, commit
-`0fb11752eced8baa84fb546bbf8212cff2f9e5e0`, including its
-[`ConfigProvider` model limit/variant schema](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/schema/src/config/provider.ts#L66-L114),
-not the latest schema/docs:
+variants. Compatibility follows **v2.2.0-ricky.1**, commit
+`9291b46db483415e1c9bdaa72f8e48637e3f7b49`, including its
+[`ConfigProvider` model limit/variant schema](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/provider.ts#L75-L114):
 
-- [`SessionCompaction.calculateCeiling`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/compaction.ts#L849-L856)
+- [`SessionCompaction.calculateCeiling`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/compaction.ts#L1133-L1141)
   uses `(limit.input || limit.context) - compaction.buffer` when the buffer is explicit.
   It does **not** subtract the output limit. Sol's explicit **272000 = 400000 - 128000**
   input budget preserves room for the existing full output allowance. The unchanged
   **13600** buffer then triggers compaction at **258400** estimated prompt tokens,
   leaving **141600 = 128000 + 13600** tokens in the context window. The buffer is not
   deducted twice from the configured input limit. Astra keeps the same input cap.
-- [`SessionModelRequest.outputLimit`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/model-request.ts#L87-L97)
+- [`SessionModelRequest.outputLimit`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/model-request.ts#L85-L90)
   independently fits output to the remaining context, adding 15% to the unmeasured
-  input estimate; compaction summaries are capped at 32000 output tokens. These are
+  input estimate. These are
   local budgeting thresholds, not a hard prompt truncation or a guarantee against
   provider overflow. An oversized turn or estimation error can still reduce output
   or invoke the fork's overflow recovery.
@@ -256,31 +254,31 @@ not the latest schema/docs:
 
 The only automatic small-model consumer in this pin is **session title generation**:
 
-- [`Model.small`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/model.ts#L277-L289)
+- [`Model.small`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/model.ts#L306-L318)
   searches active text models in the primary provider by family (`gpt-luna`,
   `gemini-flash-lite`, `gemini-flash`, `claude-haiku`). Neither retained model is one
-  of those families, so relying on automatic selection would fall back to the primary model.
+  of those families; the title selector can use a lower primary-model variant instead.
 - The native override is **`agents.title.model = { providerID: "codex", model:
   "gpt-6.1-sol", variant: "low" }`**. The pinned
-  [`ConfigAgent.Info`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/schema/src/config/agent.ts#L11-L22)
-  and [`ConfigModel.Selection`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/schema/src/config/model.ts#L12-L28)
+  [`ConfigAgent.Info`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/agent.ts#L11-L26)
+  and [`ConfigModel.Selection`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/model.ts#L12-L28)
   accept this shape. Legacy `small_model` only migrates to the title agent; it is
   not a global auxiliary setting and is not added to this profile.
-- [`SessionContext.selectTitle`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/context.ts#L94-L118)
+- [`SessionContext.selectTitle`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/context.ts#L94-L124)
   resolves that model/variant separately from the session (its automatic minimal
   variant order is `none`, `minimal`, `low`).
-  [`ModelResolver.withVariant`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/model-resolver.ts#L136-L161)
+  [`ModelResolver.withVariant`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/model-resolver.ts#L160-L184)
   overlays settings on a request-local copy, leaving Sol's catalog default and main
   selection at **max**.
-  [`OpenResponses.lowerGeneration`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/ai/src/protocols/open-responses.ts#L774-L802)
+  [`OpenResponses.lowerGeneration`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/ai/src/protocols/open-responses.ts#L752-L780)
   lowers `reasoningEffort` to `reasoning.effort`.
-  [`SessionTitle.generate`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/title.ts#L100-L134)
+  [`SessionTitle.generate`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/title.ts#L105-L139)
   handles initial titles and regeneration without coding tools. If the low title
   request fails, it may retry with the unchanged primary model/variant (normally max).
 - Compaction uses the loaded **session model/agent**, not the hidden `compaction`
   or `summary` agent's model
-  ([`SessionCompaction.prepare`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/compaction.ts#L594-L611)).
-  Generic [`SessionGenerate.generate`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/core/src/session/generate.ts#L26-L62)
+  ([`SessionCompaction.prepare`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/compaction.ts#L833-L850)).
+  Generic [`SessionGenerate.generate`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/generate.ts#L26-L68)
   also resolves the current session model. Subagents use explicit selections or
   inherit their parent, not `Model.small`. These paths keep main reasoning; no
   unsupported global small-model reasoning option, third model or fork change is needed.
@@ -333,10 +331,9 @@ config, verbose service logs or environment values as a credential check.
 
 ## Validation and publication boundary
 
-The predecessor's published binaries and integration have separate prior live
-evidence. That does **not** validate this refactored public interface: HOME setup,
-dedicated-mount startup and integrated PATH setup have **offline fixture validation
-only**, not new live acceptance or registry publication.
+HOME setup、dedicated-mount startup 和 PATH 设置已通过离线 fixtures；
+正式 v2.2.0-ricky.1 包另通过隔离首次/缓存安装与真实 ACP loopback。
+这些检查不代表新 Workspace 的 live 验收或 registry 发布。
 
 Run self-contained fixtures: `python3 -B -m unittest discover -s opencode/tests -v`.
 They use synthetic archives/keys and mocked downloads, never real tools or services.
@@ -348,13 +345,11 @@ rendered HOME/dedicated startup through the real Linux argument path using local
 synthetic archives. The installer, cache and startup recovery paths run; no model
 or live provider is invoked.
 
-The v2.1.2-ricky.1 upgrade also passed an isolated check with the published OpenCode
-archive, private Node 22.22.0 and acpx 0.19.3. It covered first/cached installation,
-the two-model catalog, task success, request-targeted cancellation with no further
-provider events, same-session follow-up, callback receipts and cancelled-result
-replay. Responses and callbacks used loopback fixtures; this is not live Coder,
-provider or MCP acceptance. Module source, template activation and existing
-Workspace upgrades remain separate delivery steps.
+当前正式包回环使用私有 Node 22.23.4、acpx 0.21.1，验证默认 codex、显式 copilot、
+各自 Provider 的主请求 max/title low，并在 copilot 之后返回原 codex named session
+成功追问、保留历史。上轮恢复取消队列证据保留，旧 SQLite 疑点的定向结论见
+[UPGRADE.md](UPGRADE.md)。所有 Responses/回调均为本地 fixture，MCP disabled；
+真实 Provider/MCP 与 Workspace 试点尚需环境管家执行。
 
 Before publication, review the added files and fixed source revision, then separately
 verify first/repeat startup on root/nonroot images, mount persistence, fresh Bash and
