@@ -53,21 +53,21 @@ def node(path):
 import json,os,sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
-    print('v22.22.0')
+    print('v22.23.4')
 elif sys.argv[1].endswith('npm-cli.js'):
     assert sys.argv[2:] == ['ci','--ignore-scripts','--no-audit','--no-fund']
     dest=Path('node_modules/acpx/dist');dest.mkdir(parents=True)
     (dest/'cli.js').write_text('fixture only')
 elif sys.argv[-1] == '--version':
-    print('0.19.3')
+    print('0.21.1')
 elif sys.argv[1].endswith('task-cli.mjs') and sys.argv[2:] == ['recover']:
     marker=Path(os.environ['XDG_STATE_HOME'])/'fixture-startup-recoveries'
     marker.write_text(str(int(marker.read_text())+1) if marker.exists() else '1')
 else:
     print(json.dumps({'argv':sys.argv[2:],'cwd':os.getcwd(),'env':dict(os.environ)}))
 '''
-    archive(path, {'node-v22.22.0-linux-x64/bin/node': program,
-                   'node-v22.22.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js': 'fixture'})
+    archive(path, {'node-v22.23.4-linux-x64/bin/node': program,
+                   'node-v22.23.4-linux-x64/lib/node_modules/npm/bin/npm-cli.js': 'fixture'})
 
 
 class InstallerTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 # Detached OpenCode tasks and callback delivery
 
 `opencode-task` adapts LibreChat's generic `create_task_callback` tool to pinned
-**acpx 0.19.3**. It reuses the module's private Node, OpenCode wrapper, runtime HOME,
+**acpx 0.21.1**. It reuses the module's private Node, OpenCode wrapper, runtime HOME,
 model selection, provider/MCP profile and permission defaults. No acpx patch,
 session migration, parent-volume ownership change, or task dashboard is involved.
 
@@ -13,7 +13,9 @@ old acpx/OpenCode sessions/cache, old versions, and all `/mnt/opencode` siblings
 outside the module-owned `toolset` child.
 Installation `status.json` advertises `features.task_callbacks: 1` alongside
 `state: ready`. OpenCode now follows the module's **v2.1.2-ricky.1** release pin;
-private Node **22.22.0** and acpx **0.19.3** are unchanged.
+private Node is **22.23.4** and acpx is **0.21.1**.
+The **v2.2.0-ricky.1** source candidate still needs publication and verified asset
+inputs before changing the OpenCode default; see [UPGRADE.md](UPGRADE.md).
 This upgrade does not migrate task/session/cache data or change callback, recovery,
 request-targeted cancellation or permission contracts.
 The source bundle uses the bounded compressed
@@ -125,7 +127,7 @@ session and context while each notifies once.
 Cancellation always targets the original request ID, including an active request
 recovered after driver exit. It never calls session-wide `runtime.cancel`, so an
 unrelated queued follow-up can continue. The small `task-acp.mjs` adapter uses the
-same request-targeted queue primitive as acpx 0.19.3's `turn.cancel`; that dist export
+same request-targeted queue primitive as acpx 0.21.1's `turn.cancel`; that dist export
 is version-bound and must be revalidated with a dependency upgrade. Passive watch
 still determines the canonical result. A queued request whose driver disappeared
 before a durable journal entry can remain ambiguous (including a lost cancellation
@@ -181,7 +183,7 @@ CODER_MODULES_CHECKOUT=/workspaces/coder-modules npx jest src/agents/callbacks.i
 
 Task fixtures use mock ACP and local HTTP for terminal statuses, dedupe, pre-POST
 persistence, stable retry/restart, request-specific watch recovery, ambiguity,
-payload bounds and redirect refusal. The pinned runtime test uses real acpx 0.19.3
+payload bounds and redirect refusal. The pinned runtime test uses real acpx 0.21.1
 and a synthetic ACP peer for `turn.result`, watch cursor/request identity and
 cancellation while the owner remains alive. The cross-repository test posts the
 production `TaskRunner` payload into LibreChat's actual handler/Mongo/continuation

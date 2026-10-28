@@ -4,12 +4,12 @@
 import path from "node:path";
 import { createRequire } from "node:module";
 import { createSharedAcpRuntime, createAgentRegistry } from "acpx/runtime";
-import { t as tryCancelOnRunningOwner } from "acpx/dist/ipc-BW06Pbb8.js";
+import { t as tryCancelOnRunningOwner } from "acpx/dist/ipc-BbYFsKOj.js";
 import { taskPermissions } from "./task.mjs";
 
 const installed = createRequire(import.meta.url)("acpx/package.json").version;
 export function createTaskRuntime(root, record) {
-  if (installed !== "0.19.3") throw new Error("UNSUPPORTED_ACPX_RUNTIME");
+  if (installed !== "0.21.1") throw new Error("UNSUPPORTED_ACPX_RUNTIME");
   const permissions = taskPermissions(
     record.permissions?.mode,
     record.permissions?.policy,

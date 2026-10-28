@@ -17,10 +17,10 @@ import tarfile
 import tempfile
 import time
 
-NODE_VERSION = '22.22.0'
-NODE_SHA256 = '9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37'
-NODE_URL = 'https://nodejs.org/dist/v22.22.0/node-v22.22.0-linux-x64.tar.xz'
-ACPX_VERSION = '0.19.3'
+NODE_VERSION = '22.23.4'
+NODE_SHA256 = '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce'
+NODE_URL = 'https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz'
+ACPX_VERSION = '0.21.1'
 TARGET = 'opencode-linux-x64-baseline'
 PAYLOAD_FILES = {'install.py', 'runtime.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}

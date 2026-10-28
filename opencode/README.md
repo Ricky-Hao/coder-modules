@@ -199,7 +199,11 @@ asset `opencode-linux-x64-baseline-v2.1.2-ricky.1.tar.gz`, SHA256
 Its clean tagged source is `0fb11752eced8baa84fb546bbf8212cff2f9e5e0`,
 based on upstream v2.1.2 (`a517687fde98a7329ada3ae644a01a9fc6c4e99e`).
 Do not substitute a dirty local validation build or a moving latest asset.
-Private Node **22.22.0** and acpx **0.19.3** retain fixed checksums/dependency lock.
+Private Node **22.23.4** and acpx **0.21.1** use fixed checksums/dependency lock.
+Node follows the current Node 22 LTS maintenance release; acpx requires Node >=22.13.0.
+The OpenCode v2.2.0-ricky.1 source candidate is prepared separately; the default
+above stays on the verified published asset until that candidate is released and downloaded.
+See [UPGRADE.md](UPGRADE.md) for the exact pending downstream inputs.
 Node stays off project PATH. npm lifecycle scripts are disabled.
 
 To override OpenCode, supply the complete `release = { tag = ..., asset = ...,
@@ -318,6 +322,12 @@ an external file keeps the explicit model/readiness-env contract. acpx keeps
 deny-all/noninteractive-deny defaults; there is no automatic permission escalation.
 OpenCode's own project config merging still applies. Do not print resolved debug
 config, verbose service logs or environment values as a credential check.
+
+For the same models at a second endpoint, use the native external JSON method in
+[PROVIDERS.md](PROVIDERS.md). It preserves the bundled defaults and complete model
+metadata, and specifies policy, environment forwarding, main and title selections.
+No OpenCode or module runtime extension is needed. The example is prepared support;
+an actual Provider ID, URL and secret injection location are still required.
 
 ## Validation and publication boundary
 

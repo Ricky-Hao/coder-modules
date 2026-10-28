@@ -353,12 +353,12 @@ class ProfileTests(unittest.TestCase):
 import json, os, sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
-    print('v22.22.0')
+    print('v22.23.4')
 elif sys.argv[1].endswith('npm-cli.js'):
     dest=Path('node_modules/acpx/dist');dest.mkdir(parents=True)
     (dest/'cli.js').write_text('fixture only')
 elif sys.argv[-1] == '--version':
-    print('0.19.3')
+    print('0.21.1')
 elif sys.argv[1].endswith('task-cli.mjs'):
     assert sys.argv[2:] == ['recover']
 else:
@@ -372,8 +372,8 @@ else:
     os.execve(argv[0], argv, dict(os.environ))
 '''
         fixtures.archive(self.fixture.node, {
-            'node-v22.22.0-linux-x64/bin/node': node_program,
-            'node-v22.22.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js': 'fixture'})
+            'node-v22.23.4-linux-x64/bin/node': node_program,
+            'node-v22.23.4-linux-x64/lib/node_modules/npm/bin/npm-cli.js': 'fixture'})
         self.fixture.bundle['config']['runtime_env_allowlist'] += [
             'CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY']
         self.fixture.install()
