@@ -54,8 +54,8 @@ class ProfileTests(unittest.TestCase):
         self.root = self.fixture.root
         self.base = self.fixture.base
         self.fixture.bundle['config']['runtime_profile'] = 'env'
-        self.env = {'PATH': '/usr/bin:/bin', 'LLM_BASE_URL': 'https://llm.example.invalid/v1',
-                    'LLM_API_KEY': 'SENTINEL-LLM-NEVER-IN-FILES',
+        self.env = {'PATH': '/usr/bin:/bin', 'CODEX_BASE_URL': 'https://llm.example.invalid/v1',
+                    'CODEX_API_KEY': 'SENTINEL-LLM-NEVER-IN-FILES',
                     'CODER_AGENT_TOKEN': 'SENTINEL-CODER', 'GITHUB_TOKEN': 'SENTINEL-GIT',
                     'SSH_AUTH_SOCK': '/synthetic/socket', 'OPENCODE_CONFIG_CONTENT': 'SENTINEL-OVERRIDE'}
 
@@ -78,16 +78,21 @@ class ProfileTests(unittest.TestCase):
 
     def test_two_model_snapshot_limits_and_policy(self):
         cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
-        self.assertEqual(set(cfg['providers']), {'copilot'})
-        provider = cfg['providers']['copilot']
+        self.assertEqual(set(cfg['providers']), {'copilot', 'codex'})
+        provider = cfg['providers']['codex']
         self.assertEqual(provider['package'], '@opencode/ai/providers/openai/responses')
-        self.assertEqual(provider['env'], ['LLM_API_KEY'])
-        self.assertEqual(provider['settings'], {'baseURL': '{env:LLM_BASE_URL}', 'apiKey': '{env:LLM_API_KEY}'})
+        self.assertEqual(provider['env'], ['CODEX_API_KEY'])
+        self.assertEqual(provider['settings'], {'baseURL': '{env:CODEX_BASE_URL}', 'apiKey': '{env:CODEX_API_KEY}'})
+        # Compare every behavioral field, including all metadata, to prevent Provider drift.
+        self.assertEqual({k: v for k, v in provider.items() if k not in ('name', 'env', 'settings')},
+                         {k: v for k, v in cfg['providers']['copilot'].items() if k not in ('name', 'env', 'settings')})
+        self.assertEqual(cfg['providers']['copilot']['settings'],
+                         {'baseURL': '{env:COPILOT_BASE_URL}', 'apiKey': '{env:COPILOT_API_KEY}'})
         models = provider['models']
         self.assertEqual(set(models), {'gpt-6.1-sol', 'gpt-6-astra'})
         self.assertEqual(hashlib.sha256(json.dumps(models, sort_keys=True).encode()).hexdigest(),
                          '6c8d5e4c904137afa2d806ebebd32ea33dd4b9f84052c63ff551db4c1daf159c')
-        self.assertEqual(cfg['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'max'})
+        self.assertEqual(cfg['model'], {'providerID': 'codex', 'model': 'gpt-6.1-sol', 'variant': 'max'})
         for name, model in models.items():
             with self.subTest(model=name):
                 self.assertEqual(model['limit'], {'context': 400000, 'input': 272000, 'output': 128000})
@@ -103,12 +108,13 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(sol['input'] - cfg['compaction']['buffer'], 258400)
         self.assertEqual(cfg['experimental']['policies'], [
             {'action': 'provider.use', 'resource': '*', 'effect': 'deny'},
-            {'action': 'provider.use', 'resource': 'copilot', 'effect': 'allow'}])
+            {'action': 'provider.use', 'resource': 'copilot', 'effect': 'allow'},
+            {'action': 'provider.use', 'resource': 'codex', 'effect': 'allow'}])
 
     def test_title_model_reasoning_is_separate_from_primary(self):
         cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
         self.assertEqual(cfg['agents'], {'title': {'model': {
-            'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'}}})
+            'providerID': 'codex', 'model': 'gpt-6.1-sol', 'variant': 'low'}}})
         self.assertNotIn('small_model', cfg)  # Legacy spelling only migrates to the title agent.
         sol = cfg['providers']['copilot']['models']['gpt-6.1-sol']
         variants = {variant['id']: variant['settings'] for variant in sol['variants']}
@@ -128,8 +134,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(actual['argv'], ['run', 'argument with spaces', '', '$HOME', "a'b"])
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(child['PATH'], self.env['PATH'])
-        self.assertEqual(child['LLM_API_KEY'], self.env['LLM_API_KEY'])
-        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'codex/gpt-6.1-sol')
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(child['OPENCODE_ACP_CATALOG_TIMEOUT_MS'], '30000')
         for name in ('FIRECRAWL_MCP_API_KEY', 'FIRECRAWL_MCP_URL', 'CODER_AGENT_TOKEN',
@@ -143,7 +149,7 @@ class ProfileTests(unittest.TestCase):
         expected['mcp']['servers'] = {}
         self.assertEqual(cfg, expected)  # Model limits and title override survive env-profile generation.
         self.assertEqual(cfg['mcp']['servers'], {})
-        self.assertEqual(cfg['providers']['copilot']['settings']['apiKey'], '{env:LLM_API_KEY}')
+        self.assertEqual(cfg['providers']['codex']['settings']['apiKey'], '{env:CODEX_API_KEY}')
         before = (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
         self.assertEqual(self.call().returncode, 0)
         self.assertEqual(before, (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes()))
@@ -185,8 +191,8 @@ class ProfileTests(unittest.TestCase):
     def test_missing_and_invalid_values_fail_before_exec_with_names_only(self):
         self.fixture.install()
         invalid = {
-            'LLM_API_KEY': ['', 'SECRET\nBAD', 'SECRET"BAD', 'SECRET\\BAD', '{env:SECRET}', 'é'],
-            'LLM_BASE_URL': ['http://remote.example.invalid', 'https://user:SECRET@example.invalid',
+            'CODEX_API_KEY': ['', 'SECRET\nBAD', 'SECRET"BAD', 'SECRET\\BAD', '{env:SECRET}', 'é'],
+            'CODEX_BASE_URL': ['http://remote.example.invalid', 'https://user:SECRET@example.invalid',
                              'https://example.invalid?SECRET=1', 'https://example.invalid#SECRET',
                              'https://example.invalid:invalid', 'https://bad host.invalid', 'file:///SECRET'],
             'CONTEXT7_MCP_ENABLED': ['', 'true', '2', ' 1'],
@@ -207,10 +213,10 @@ class ProfileTests(unittest.TestCase):
                     self.assertIn(name, result.stderr)
                     self.assertNotIn('SECRET', result.stderr)
         result = self.call(env={'PATH': '/usr/bin:/bin'})
-        self.assertIn('LLM_API_KEY', result.stderr)
-        self.assertIn('LLM_BASE_URL', result.stderr)
+        self.assertIn('CODEX_API_KEY', result.stderr)
+        self.assertIn('CODEX_BASE_URL', result.stderr)
         self.assertFalse((self.root / 'runtime/module-profiles').exists())
-        profiles.endpoint({'LLM_BASE_URL': 'http://127.0.0.1:123/v1'}, 'LLM_BASE_URL')
+        profiles.endpoint({'CODEX_BASE_URL': 'http://127.0.0.1:123/v1'}, 'CODEX_BASE_URL')
 
     def test_help_version_and_module_info_without_credentials_or_writes(self):
         self.fixture.install()
@@ -226,7 +232,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(info['source'], 'env')
             self.assertEqual(info['model']['variant'], 'max')
             self.assertEqual(info['enabled_mcp'], [])
-            self.assertEqual(info['required_environment_names'], ['LLM_API_KEY', 'LLM_BASE_URL'])
+            self.assertEqual(info['required_environment_names'], ['CODEX_API_KEY', 'CODEX_BASE_URL'])
         self.assertFalse((self.root / 'runtime/module-profiles').exists())
         self.assertFalse(profiles.harmless(['run', '--', '--help']))
         self.assertFalse(profiles.harmless(['run', 'prompt with spaces', '--help']))
@@ -245,12 +251,12 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(child['OPENCODE_CONFIG'], str(external))
             self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'external/model')
             self.assertNotIn('OPENCODE_ACP_REQUIRED_VARIANT', child)
-            self.assertNotIn('LLM_API_KEY', child)
+            self.assertNotIn('CODEX_API_KEY', child)
             self.assertNotIn('CONTEXT7_MCP_ENABLED', child)
-        self.fixture.bundle['config']['runtime_env_allowlist'].append('LLM_API_KEY')
+        self.fixture.bundle['config']['runtime_env_allowlist'].append('CODEX_API_KEY')
         self.fixture.install()
         result = self.call(env=env)
-        self.assertEqual(json.loads(result.stdout)['env']['LLM_API_KEY'], env['LLM_API_KEY'])
+        self.assertEqual(json.loads(result.stdout)['env']['CODEX_API_KEY'], env['CODEX_API_KEY'])
         self.assertEqual(json.loads(self.call(args=['--module-profile-info'], env=env).stdout)['source'], 'external')
 
     def test_no_profile_legacy_behavior_and_no_stale_native_config(self):
@@ -261,7 +267,7 @@ class ProfileTests(unittest.TestCase):
         result = self.call(args=['run', 'fixture'])
         self.assertEqual(result.returncode, 0, result.stderr)
         child = json.loads(result.stdout)['env']
-        self.assertNotIn('LLM_API_KEY', child)
+        self.assertNotIn('CODEX_API_KEY', child)
         self.assertNotIn('OPENCODE_CONFIG', child)
         self.assertNotIn('OPENCODE_ACP_REQUIRED_MODEL', child)
         self.assertNotEqual(self.call().returncode, 0)
@@ -363,7 +369,7 @@ elif sys.argv[1].endswith('task-cli.mjs'):
     assert sys.argv[2:] == ['recover']
 else:
     assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
-    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'copilot/gpt-6.1-sol'
+    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.1-sol'
     assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
     assert 'CONTEXT7_MCP_API_KEY' not in os.environ
     assert 'FIRECRAWL_MCP_API_KEY' not in os.environ
@@ -426,7 +432,90 @@ else:
         self.assertEqual((self.root / 'active').resolve(), previous)
         child = json.loads(self.call(args=['run', 'fixture']).stdout)['env']
         self.assertNotIn('OPENCODE_CONFIG', child)
-        self.assertNotIn('LLM_API_KEY', child)
+        self.assertNotIn('CODEX_API_KEY', child)
+
+    def test_selected_provider_pair_optional_other_and_no_legacy_fallback(self):
+        self.fixture.install()
+        copilot = {'PATH': '/usr/bin:/bin', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1',
+                   'COPILOT_API_KEY': 'SYNTHETIC-COPILOT'}
+        args = ['submit', '--key', 'fixture', '--prompt-file', 'unused', '--model', 'copilot/gpt-6.1-sol']
+        import runtime
+        child = runtime.environment(copilot, self.root, [], 'env', 'test-workspace', args, submit=True)
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertNotIn('CODEX_API_KEY', child)
+        selected = json.loads(child['OPENCODE_MODULE_TASK_SELECTION'])
+        self.assertEqual(selected, {'id': 'copilot/gpt-6.1-sol', 'variant': 'max'})
+        cfg = json.loads(Path(child['OPENCODE_CONFIG']).read_text())
+        self.assertEqual(cfg['agents']['title']['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'})
+        task = {'model': selected, 'modelConfig': child['OPENCODE_CONFIG'], 'modelProfile': 'env'}
+        second = runtime.environment(child, self.root, [], 'env', 'test-workspace', ['acp'], task)
+        self.assertEqual(second['COPILOT_API_KEY'], copilot['COPILOT_API_KEY'])
+        self.assertEqual(second['OPENCODE_ACP_REQUIRED_MODEL'], selected['id'])
+        self.assertEqual(second['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
+        self.assertNotIn('CODEX_API_KEY', second)
+        astra = runtime.environment(copilot, self.root, [], 'env', 'test-workspace',
+                                    [*args[:-1], 'copilot/gpt-6-astra'], submit=True)
+        self.assertEqual(json.loads(astra['OPENCODE_MODULE_TASK_SELECTION'])['variant'], 'medium')
+        for pair in (copilot, {'LLM_BASE_URL': 'https://old.example.invalid', 'LLM_API_KEY': 'SECRET-OLD'}):
+            with self.assertRaisesRegex(profiles.ProfileError, 'CODEX_API_KEY.*CODEX_BASE_URL'):
+                profiles.configuration(pair, fixtures.SCRIPTS)
+        for name in ('CODEX_API_KEY', 'CODEX_BASE_URL'):
+            partial = {**copilot, name: 'SECRET' if name.endswith('KEY') else 'https://partial.example.invalid'}
+            with self.assertRaises(profiles.ProfileError) as error:
+                profiles.configuration(partial, fixtures.SCRIPTS, 'copilot')
+            self.assertIn('CODEX_', str(error.exception))
+            self.assertNotIn('SECRET', str(error.exception))
+        for name, bad in [('COPILOT_API_KEY', 'SECRET\nBAD'), ('COPILOT_BASE_URL', 'https://u:SECRET@example.invalid')]:
+            with self.assertRaisesRegex(profiles.ProfileError, name) as error:
+                profiles.configuration({**self.env, **copilot, name: bad}, fixtures.SCRIPTS)
+            self.assertNotIn('SECRET', str(error.exception))
+        for model, variant in [('copilot/missing', None), ('copilot/gpt-6-astra', 'missing')]:
+            with self.assertRaises(ValueError):
+                profiles.task_configuration(json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text()), model, variant)
+
+    def test_legacy_worker_passive_recovery_and_unrecorded_queue_do_not_change_default_or_record(self):
+        self.fixture.install()
+        task_id = 'task_' + 'a' * 64
+        tasks = self.root / 'runtime/tasks'
+        task_dir = tasks / task_id
+        task_dir.mkdir(mode=0o700)
+        filename = task_dir / 'task.json'
+        for state in ('queued', 'running', 'outbox', 'delivered'):
+            filename.write_text(json.dumps({'state': state}))
+            filename.chmod(0o600)
+            before = filename.read_bytes()
+            result = self.call('opencode-task', ['_worker', task_id], {'PATH': '/usr/bin:/bin'})
+            if state == 'queued':
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('TASK_MODEL_UNRECORDED', result.stderr)
+            else:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                child = json.loads(result.stdout)['env']
+                self.assertNotIn('CODEX_API_KEY', child)
+            self.assertEqual(filename.read_bytes(), before)
+
+    def test_external_task_snapshot_keeps_allowlist_contract_without_original_path_env(self):
+        import runtime
+        self.fixture.install()
+        source = self.base / 'external.json'
+        config = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        source.write_text(json.dumps(config))
+        source.chmod(0o600)
+        before = source.read_bytes()
+        names = ['COPILOT_API_KEY', 'COPILOT_BASE_URL']
+        env = {'PATH': '/usr/bin:/bin', 'OPENCODE_MODULE_CONFIG': str(source),
+               'COPILOT_API_KEY': 'SYNTHETIC', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1'}
+        child = runtime.environment(env, self.root, names, 'env', 'test-workspace',
+                                    ['submit', '--model', 'copilot/gpt-6.1-sol'], submit=True)
+        self.assertEqual(child['OPENCODE_MODULE_TASK_PROFILE'], 'external')
+        task = {'model': json.loads(child['OPENCODE_MODULE_TASK_SELECTION']),
+                'modelConfig': child['OPENCODE_MODULE_TASK_CONFIG'], 'modelProfile': 'external'}
+        del env['OPENCODE_MODULE_CONFIG']
+        restored = runtime.environment(env, self.root, names, 'env', 'test-workspace', ['acp'], task)
+        self.assertEqual(restored['COPILOT_API_KEY'], env['COPILOT_API_KEY'])
+        self.assertNotIn('CODEX_API_KEY', restored)
+        self.assertEqual(restored['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertEqual(source.read_bytes(), before)
 
     def test_payload_allowlist_profile_validation_and_cached_profile_inventory(self):
         for name in ('profiles.py', 'profile-env.json', 'shell_path.py'):

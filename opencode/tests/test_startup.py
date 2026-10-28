@@ -43,13 +43,13 @@ class StartupTests(unittest.TestCase):
         result = subprocess.run([str(root / 'bin/opencode'), 'acp'], env={'PATH': '/usr/bin:/bin'},
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('LLM_API_KEY', result.stderr)
-        self.assertIn('LLM_BASE_URL', result.stderr)
+        self.assertIn('CODEX_API_KEY', result.stderr)
+        self.assertIn('CODEX_BASE_URL', result.stderr)
         self.assertEqual(result.stdout, '')
         # The executable is a local fixture: exercise the installed env profile, not a provider.
         result = subprocess.run([str(root / 'bin/opencode'), 'run', 'offline fixture'],
-                                env={'PATH': '/usr/bin:/bin', 'LLM_BASE_URL': 'https://llm.example.invalid/v1',
-                                     'LLM_API_KEY': 'SYNTHETIC-STARTUP-KEY'}, capture_output=True, text=True)
+                                env={'PATH': '/usr/bin:/bin', 'CODEX_BASE_URL': 'https://llm.example.invalid/v1',
+                                     'CODEX_API_KEY': 'SYNTHETIC-STARTUP-KEY'}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         generated = Path(json.loads(result.stdout)['env']['OPENCODE_CONFIG'])
         expected = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())

@@ -32,6 +32,10 @@ test(
       "task-acp.mjs",
     ])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
+    // Only this synthetic fixture may expose diagnostics from its copied worker.
+    const copiedCli = path.join(version, 'task-cli.mjs');
+    fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
+      '} catch (error) {\n  // No raw', '} catch (error) {\n  console.error(error.stack);\n  // No raw'));
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -63,8 +67,8 @@ test(
       JSON.stringify({
         install_root: root,
         workspace_id: "cli-fixture",
-        runtime_profile: "none",
-        runtime_env_allowlist: ["TASK_FIXTURE_LOG"],
+        runtime_profile: "env",
+        runtime_env_allowlist: ["TASK_FIXTURE_LOG", "TASK_FIXTURE_CONTROL_LOG", "TASK_FIXTURE_REFUSE_MODEL"],
       }),
       { mode: 0o600 },
     );
@@ -73,7 +77,7 @@ test(
     for (const tool of ["opencode", "opencode-task"]) {
       const pid =
         tool === "opencode-task"
-          ? `if [[ "\${1-}" == _worker ]]; then printf '%s' "$$" > ${quote(base)}/worker-\${2}.pid; fi\n`
+           ? `if [[ "\${1-}" == _worker ]]; then printf '%s' "$$" > ${quote(base)}/worker-\${2}.pid; exec 2>>${quote(path.join(base, 'worker-errors'))}; fi\n`
           : "";
       fs.writeFileSync(
         path.join(root, "bin", tool),
@@ -109,6 +113,9 @@ test(
       HOME: base,
       OPENCODE_ACP_REQUIRED_MODEL: "fixture/test",
       TASK_FIXTURE_LOG: executions,
+      TASK_FIXTURE_CONTROL_LOG: path.join(base, 'controls'),
+      CODEX_BASE_URL: 'https://codex.example.invalid/v1', CODEX_API_KEY: 'synthetic-codex',
+      COPILOT_BASE_URL: 'https://copilot.example.invalid/v1', COPILOT_API_KEY: 'synthetic-copilot',
     };
     const cli = (args, input) =>
       spawnSync(path.join(root, "bin/opencode-task"), args, {
@@ -168,7 +175,10 @@ test(
       assert.equal(submitted.stdout.includes(callbackId), false);
       const deadline = Date.now() + 15000;
       while (seen.length < 1 && Date.now() < deadline) await pause(50);
-      assert.equal(seen.length, 1);
+      assert.equal(seen.length, 1, JSON.stringify({
+        state: JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', taskId, 'task.json'), 'utf8')).state,
+        workerError: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '',
+      }));
       const workerPid = Number(fs.readFileSync(pidfile(taskId), "utf8"));
       process.kill(workerPid, "SIGKILL");
       await pause(100);
@@ -369,6 +379,35 @@ test(
         ).defaultPermissions,
         "deny-all",
       );
+      // Each session selects only once; queued/follow-up workers send no model controls.
+      assert.equal(fs.readFileSync(path.join(base, 'controls'), 'utf8'), 'model\nmodel\n');
+      const modelFile = path.join(base, 'model.txt');
+      fs.writeFileSync(modelFile, 'model selection');
+      const registrationFor = (letter) => JSON.stringify({ callback_id: `tcb_${letter.repeat(43)}`,
+        callback_url: JSON.parse(registration).callback_url });
+      const modelArgs = ['submit', '--key', 'copilot-model', '--session', 'copilot-session', '--prompt-file', modelFile,
+        '--model', 'copilot/gpt-6-astra', '--variant', 'high'];
+      const chosen = JSON.parse(cli(modelArgs, registrationFor('c')).stdout);
+      const chosenRecord = await delivered(chosen.task_id);
+      const selection = JSON.parse(JSON.parse(chosenRecord.body).output);
+      assert.equal(selection.model, 'copilot/gpt-6-astra'); assert.equal(selection.effort, 'high');
+      assert.deepEqual(selection.title, { providerID: 'copilot', model: 'gpt-6.1-sol', variant: 'low' });
+      assert.deepEqual(selection.env, ['CODEX_API_KEY', 'COPILOT_API_KEY']);
+      assert.deepEqual(JSON.parse(cli(['status', chosen.task_id]).stdout).model, 'copilot/gpt-6-astra');
+      assert.equal(JSON.parse(cli(['status', chosen.task_id]).stdout).variant, 'high');
+      assert.equal(cli([...modelArgs.slice(0, -1), 'max'], registrationFor('c')).status, 1);
+      assert.equal(cli(['submit', '--key', 'conflicting-provider', '--session', 'copilot-session', '--prompt-file', modelFile], registrationFor('d')).status, 1);
+      assert.deepEqual(JSON.parse(cli(modelArgs, registrationFor('c')).stdout), chosen);
+      const beforeRefusal = fs.readFileSync(executions, 'utf8');
+      env.TASK_FIXTURE_REFUSE_MODEL = 'copilot/gpt-6.1-sol';
+      const refused = JSON.parse(cli(['submit', '--key', 'refused-model', '--prompt-file', modelFile,
+        '--model', 'copilot/gpt-6.1-sol'], registrationFor('f')).stdout);
+      await until(() => load(refused.task_id).executionError === 'MODEL_OR_SESSION_SETUP_FAILED');
+      assert.equal(fs.readFileSync(executions, 'utf8'), beforeRefusal);
+      assert.equal(load(refused.task_id).state, 'queued');
+      cli(['cancel', refused.task_id]);
+      assert.equal((await delivered(refused.task_id)).resultStatus, 'cancelled');
+      delete env.TASK_FIXTURE_REFUSE_MODEL;
       // Graceful fixture shutdown only; never wait for an idle ACP owner to report completion.
       const { createSharedAcpRuntime, createAgentRegistry } =
         await import("../scripts/node_modules/acpx/dist/runtime.js");
@@ -382,7 +421,7 @@ test(
         }),
       });
       try {
-        for (const handle of [stored.handle, afterCancel.handle])
+        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle])
           await runtime.close({ handle, reason: "CLI fixture cleanup" });
       } finally {
         await runtime.shutdown();

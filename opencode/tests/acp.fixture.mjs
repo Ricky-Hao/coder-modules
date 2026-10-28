@@ -8,6 +8,16 @@ const send = (value) =>
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...value })}\n`);
 let active;
 let turns = 0;
+const config = process.env.OPENCODE_CONFIG ? JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, 'utf8')) : {};
+let model = process.env.TASK_FIXTURE_REFUSE_MODEL ? 'fixture/refused' : process.env.OPENCODE_ACP_REQUIRED_MODEL ?? 'fixture/test';
+let effort = process.env.OPENCODE_ACP_REQUIRED_VARIANT ?? 'default';
+const configOptions = () => [
+  { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: model,
+    options: Object.entries(config.providers ?? { fixture: { models: { test: {} } } }).flatMap(([provider, info]) =>
+      Object.keys(info.models).map((id) => ({ value: `${provider}/${id}`, name: `${provider}/${id}` }))) },
+  { id: 'effort', name: 'Effort', category: 'thought_level', type: 'select', currentValue: effort,
+    options: ['low', 'medium', 'high', 'xhigh', 'max', 'default'].map((value) => ({ value, name: value })) },
+];
 const pending = new Map();
 function call(method, params, receive) {
   const id = randomUUID();
@@ -31,8 +41,17 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       agentCapabilities: { loadSession: true },
       agentInfo: { name: "module-fixture", version: "1" },
     });
-  else if (request.method === "session/new") reply({ sessionId: randomUUID() });
-  else if (request.method === "session/load") reply({});
+  else if (request.method === "session/new") reply({ sessionId: randomUUID(), configOptions: configOptions() });
+  else if (request.method === "session/load") reply({ configOptions: configOptions() });
+  else if (request.method === 'session/set_config_option') {
+    if (process.env.TASK_FIXTURE_CONTROL_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_CONTROL_LOG, `${request.params.configId}\n`);
+    if (request.params.configId === 'model' && process.env.TASK_FIXTURE_REFUSE_MODEL === request.params.value) {
+      send({ id: request.id, error: { code: -32602, message: 'synthetic model refusal' } }); return;
+    }
+    if (request.params.configId === 'model') model = request.params.value;
+    else effort = request.params.value;
+    reply({ configOptions: configOptions() });
+  }
   else if (request.method === "session/prompt") {
     turns++;
     const text = request.params.prompt.map((part) => part.text ?? "").join("");
@@ -107,7 +126,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
           );
         },
       );
-    } else if (text === "continuity") finish(`Session turn ${turns}`);
+    } else if (text === 'model selection') finish(JSON.stringify({ model, effort, title: config.agents?.title?.model,
+      env: ['CODEX_API_KEY', 'COPILOT_API_KEY'].filter((name) => Boolean(process.env[name])) }));
+    else if (text === "continuity") finish(`Session turn ${turns}`);
     else if (text === "wait for cancellation")
       active = { request, timer: setTimeout(() => finish(), 30000) };
     else finish();

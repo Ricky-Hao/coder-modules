@@ -36,6 +36,8 @@ OpenCode prompt, logs, URLs and ordinary prose.
 opencode-task submit --key ticket-123 --prompt-file ./task-prompt.txt --callback-file /private/task-registration.json
 # Alternative: registration JSON on stdin, never bearer bytes in argv/env.
 opencode-task submit --key ticket-123 --prompt-file ./task-prompt.txt < /private/task-registration.json
+opencode-task submit --key copilot-123 --model copilot/gpt-6.1-sol --variant max --prompt-file ./task-prompt.txt < /private/task-registration.json
+opencode-task submit --key astra-123 --model copilot/gpt-6-astra --variant high --prompt-file ./task-prompt.txt < /private/task-registration.json
 opencode-task submit --key ticket-123-fix --session ticket-123 --permission-mode approve-all --prompt-file ./fix.txt < /private/fix-registration.json
 opencode-task status task_<64-hex-digest-from-submit>
 opencode-task recover
@@ -50,6 +52,21 @@ returns the same task/request; changed data fails closed. `status` exposes
 state/result status, permission mode, optional session name, cancellation request
 and safe codes, never callback, prompt, output or raw errors.
 A stopped worker is recovered by startup or `recover`.
+
+内置 env profile 的新任务默认 **codex/gpt-6.1-sol / max**，title 为 codex/Sol/low。
+`--model provider/model` 和独立的 `--variant variant` 正式选择单任务模型；
+只给 variant 会调整本次默认模型。显式模型省略 variant 时，内置 Sol 取 max，Astra 取 medium。
+copilot 任务的 title 为 copilot/Sol/low，辅助请求使用该任务的 Provider。
+请在原 Secret/env 机制独立填写 `COPILOT_BASE_URL`、`COPILOT_API_KEY`、
+`CODEX_BASE_URL`、`CODEX_API_KEY`，迁移步骤见 [PROVIDERS.md](PROVIDERS.md)。
+只需选中 Provider 的完整变量对；另一个完全未填写可跳过，部分填写则按变量名报错。
+缺 codex 默认凭据不会改用 copilot。外部完整配置的优先级和 allowlist 契约保留。
+
+模型、variant 和不可变配置路径保存于非秘密任务意图并参与去重，`status` 返回 model/variant。
+同 key 改选择会冲突；恢复使用已保存的选择，不重新读取当前默认值。
+配置快照为 0600，仅含 env 引用，不修改原外部文件或全局默认。
+ACP 初始化显式选择模型，并核对 agent 确认的模型/effort，再发 prompt。
+初始化失败保持 queued，status 报 `MODEL_OR_SESSION_SETUP_FAILED`；不会先发送 prompt。
 
 Callback input is capped at 4096 bytes, prompts at 1 MiB. Callback files must be
 regular, current-UID-owned, single-link, and inaccessible to group/other; symlinks
@@ -124,6 +141,17 @@ session per task. There is no arbitrary external handle-adoption interface and n
 existing session migration. The fixture proves multiple runs retain the same ACP
 session and context while each notifies once.
 
+新 named session 同时固定模型、variant 和配置快照。后续请求须显式匹配，或当前默认值
+恰好相同；不会从旧 session 隐式继承其他 Provider。冲突报 `SESSION_MODEL_CONFLICT`，
+应换新 session 名。短暂初始化锁覆盖首次 ACP 选择和确认，随后释放，仍由原队列执行。
+同 session 的后续任务不会发送选模型控制，避免影响 running/queued 请求。
+若首次初始化中断，已有 session 缺少成功确认则失败关闭；不会通过重发 prompt 修复。
+
+旧记录不增加模型字段、不回写已封存结果，已 dispatch 请求仍按原 request ID 被动恢复/取消。
+旧 named session 无模型绑定，拒绝新选择自动接管。旧 queued 记录未保存选择，
+不能直接套用新的 codex 默认；请在原工具版本环境中，或使用原完整外部配置及 allowlist 恢复。
+`runtime_profile=none` 且无外部完整配置时，保留原显式 readiness 契约，模型参数需完整配置。
+
 Cancellation always targets the original request ID, including an active request
 recovered after driver exit. It never calls session-wide `runtime.cancel`, so an
 unrelated queued follow-up can continue. The small `task-acp.mjs` adapter uses the
@@ -193,6 +221,11 @@ The installed CLI fixture uses the actual wrapper/private Node/acpx path to prov
 task-scoped permission/policy, named-session continuity, callback secrecy, driver
 recovery, and cancellation isolation from another queued run. It also checks that
 the global deny-all config remains unchanged.
+
+双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
+去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用
+已发布 v2.1.2-ricky.1 和本地 v2.2.0 候选检查不同 Provider 端口上的主请求 max/title low、
+Astra 档位、同 session 追问及恢复定向取消；它不连接真实 Provider/MCP。
 
 These are local source checks, with no paid inference or production webhook.
 Publish/deploy reviewed matching module/LibreChat versions, ensure persistent volume

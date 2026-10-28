@@ -236,6 +236,49 @@ test("permissions and shared cwd/session are immutable submit identity", async (
   );
 });
 
+test("model intent binds dedupe/session and survives recovery; old records stay readable", async (t) => {
+  const f = fixture(t);
+  const common = { key: 'model-intent', prompt: 'Perform the task.', cwd: f.root, callback,
+    model: { id: 'copilot/gpt-6-astra', variant: 'high' }, modelConfig: path.join(f.root, 'immutable.json') };
+  const accepted = f.runner.submit(common);
+  assert.deepEqual(f.runner.submit(common), accepted);
+  for (const change of [{ model: { id: 'codex/gpt-6-astra', variant: 'high' } },
+    { model: { id: 'copilot/gpt-6-astra', variant: 'max' } }, { modelConfig: path.join(f.root, 'changed.json') }])
+    assert.throws(() => f.runner.submit({ ...common, ...change }), /SUBMIT_CONFLICT/);
+  const named = f.runner.submit({ ...common, key: 'named-model', session: 'fixed' });
+  assert.throws(() => f.runner.submit({ ...common, key: 'changed-named', session: 'fixed',
+    model: { id: 'codex/gpt-6.1-sol', variant: 'max' } }), /SESSION_MODEL_CONFLICT/);
+  const record = f.runner.load(accepted.task_id);
+  assert.deepEqual(record.model, common.model);
+  const ensure = f.runtime.ensureSession;
+  f.runtime.ensureSession = async (input) => {
+    assert.deepEqual(input.model, common.model); throw new Error('selection refused before prompt');
+  };
+  await assert.rejects(f.runner.execute(accepted.task_id), /selection refused/);
+  assert.equal(f.executions(), 0);
+  assert.equal(f.runner.status(accepted.task_id).execution_error, 'MODEL_OR_SESSION_SETUP_FAILED');
+  f.runtime.ensureSession = ensure;
+  await f.runner.execute(accepted.task_id);
+  assert.equal(f.executions(), 1);
+  const completed = f.runner.load(accepted.task_id);
+  const recovered = new TaskRunner({ root: f.root, runtime: f.runtime });
+  await recovered.execute(accepted.task_id);
+  assert.deepEqual(recovered.load(accepted.task_id), completed);
+  assert.equal(f.executions(), 1);
+  assert.deepEqual(recovered.load(named.task_id).model, common.model);
+  // The original fixture record has no selection fields or new fingerprint inputs.
+  const legacy = f.runner.load(f.id);
+  assert.equal(legacy.model, undefined);
+  await recovered.execute(f.id);
+  assert.equal(recovered.load(f.id).model, undefined);
+  f.runner.submit({ key: 'legacy-session', prompt: 'old request', cwd: f.root, callback, session: 'legacy' });
+  const sessionFile = fs.readdirSync(path.join(f.root, '.sessions')).filter((name) => name !== 'owner.json')
+    .map((name) => path.join(f.root, '.sessions', name)).find((file) => JSON.parse(fs.readFileSync(file, 'utf8')).name === 'legacy');
+  const before = fs.readFileSync(sessionFile);
+  assert.throws(() => f.runner.submit({ ...common, key: 'no-adoption', session: 'legacy' }), /SESSION_MODEL_CONFLICT/);
+  assert.deepEqual(fs.readFileSync(sessionFile), before);
+});
+
 test("cancellation targets only the stored request; mismatched handles fail closed", async (t) => {
   const f = fixture(t);
   const record = f.runner.load(f.id);

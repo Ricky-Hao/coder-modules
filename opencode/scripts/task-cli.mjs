@@ -22,7 +22,7 @@ const allowed = new Set([
   "_worker",
 ]);
 const help =
-  "opencode-task submit --key KEY --prompt-file FILE [--callback-file PRIVATE_FILE] [--session NAME] [--permission-mode deny-all|approve-reads|approve-all] [--permission-policy-file PRIVATE_FILE]\nopencode-task status TASK_ID\nopencode-task cancel TASK_ID\nopencode-task recover\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nCallback registration JSON is read from stdin unless --callback-file is supplied. No callback values in arguments or environment. Permission overrides require existing user authorization for this task; no automatic escalation.";
+  "opencode-task submit --key KEY --prompt-file FILE [--callback-file PRIVATE_FILE] [--session NAME] [--model PROVIDER/MODEL] [--variant VARIANT] [--permission-mode deny-all|approve-reads|approve-all] [--permission-policy-file PRIVATE_FILE]\nopencode-task status TASK_ID\nopencode-task cancel TASK_ID\nopencode-task recover\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nEnv profile defaults to codex/gpt-6.1-sol, max. A named session fixes model/variant/config; conflicts require a new session. Callback registration JSON is read from stdin unless --callback-file is supplied. No callback values in arguments or environment. Permission overrides require existing user authorization for this task; no automatic escalation.";
 
 function spawnWorker(id) {
   const child = spawn(path.join(root, "bin/opencode-task"), ["_worker", id], {
@@ -91,6 +91,8 @@ async function main() {
         "--prompt-file",
         "--callback-file",
         "--session",
+        "--model",
+        "--variant",
         "--permission-mode",
         "--permission-policy-file",
       ]);
@@ -110,6 +112,10 @@ async function main() {
         cwd: process.cwd(),
         callback,
         session: flags["--session"],
+        model: process.env.OPENCODE_MODULE_TASK_SELECTION
+          ? JSON.parse(process.env.OPENCODE_MODULE_TASK_SELECTION) : undefined,
+        modelConfig: process.env.OPENCODE_MODULE_TASK_CONFIG,
+        modelProfile: process.env.OPENCODE_MODULE_TASK_PROFILE,
         permissionMode: flags["--permission-mode"],
         permissionPolicy: flags["--permission-policy-file"]
           ? JSON.parse(
@@ -164,15 +170,21 @@ async function main() {
     }
   } finally {
     await runtime?.shutdown();
+    if (process.env.OPENCODE_MODULE_SESSION_LOCK) {
+      fs.closeSync(Number(process.env.OPENCODE_MODULE_SESSION_LOCK));
+      delete process.env.OPENCODE_MODULE_SESSION_LOCK;
+    }
   }
 }
 
 try {
   await main();
-} catch {
+} catch (error) {
   // No raw exception, request, environment, response body, or callback is printable.
   console.error(
-    "opencode-task failed; check command syntax and private module task state.",
+    ["SESSION_MODEL_CONFLICT", "SUBMIT_CONFLICT", "SESSION_CWD_CONFLICT"].includes(error.message)
+      ? `${error.message}: use the original intent or a new key/session.`
+      : "opencode-task failed; check command syntax and private module task state.",
   );
   process.exitCode = 1;
 }

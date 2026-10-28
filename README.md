@@ -24,6 +24,8 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
 - [OpenCode module](opencode/README.md): pinned private runtime and
   [detached tasks/callback recovery](opencode/TASKS.md). This fork module is a
   source candidate; read its publication boundary before selecting a fixed revision.
+  内置 copilot、codex 默认使用 codex；四个独立环境变量及单任务选模型见
+  [Provider 说明](opencode/PROVIDERS.md)。
 
 e.g.
 

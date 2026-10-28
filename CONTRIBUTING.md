@@ -22,6 +22,11 @@ for Terraform mock/render checks and [opencode/TASKS.md](opencode/TASKS.md#verif
 for optional acpx runtime/CLI fixtures and their prerequisites. Offline checks do
 not establish live acceptance, publication or deployment.
 
+修改 Provider/任务选模型时，还须运行 pinned acpx 的 runtime/CLI fixtures、相关
+Terraform mock/render，并用真实已发布 OpenCode 与本地候选做隔离 Responses/回调验收。
+检查默认 codex、显式 copilot 的主请求和 title 路由、session 固定选择、恢复与取消队列。
+只用合成凭据和 loopback，不因测试读取真实秘密或替换当前 toolset。
+
 Before Git delivery, verify no `.yml`/`.yaml` files remain under `.github/workflows`
 and compare the archived workflow bytes with their original paths at commit
 `51524055c61443b5768b62e0d0e059459f88caa7`. Keep the archive unchanged; restoring a

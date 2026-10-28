@@ -103,6 +103,17 @@ export function taskPermissions(mode = "deny-all", policy = {}) {
   return { mode, policy: selected };
 }
 
+export function taskModel(model) {
+  if (model === undefined) return undefined; // Pre-selection records retain their original shape.
+  if (
+    !model || typeof model.id !== "string" || model.id.length > 256 ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:-]+$/.test(model.id) ||
+    (model.variant !== undefined && (typeof model.variant !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(model.variant)))
+  )
+    throw new Error("INVALID_MODEL");
+  return { id: model.id, ...(model.variant !== undefined ? { variant: model.variant } : {}) };
+}
+
 function validateHandle(record, handle) {
   if (
     !handle ||
@@ -254,6 +265,9 @@ export class TaskRunner {
     session,
     permissionMode,
     permissionPolicy,
+    model,
+    modelConfig,
+    modelProfile = "external",
   }) {
     if (
       typeof key !== "string" ||
@@ -268,6 +282,11 @@ export class TaskRunner {
       throw new Error("INVALID_CWD");
     cwd = fs.realpathSync(cwd);
     const permissions = taskPermissions(permissionMode, permissionPolicy);
+    model = taskModel(model);
+    if (model && (typeof modelConfig !== "string" || !path.isAbsolute(modelConfig)))
+      throw new Error("TASK_MODEL_CONFIG_REQUIRED");
+    if (model && !["env", "external"].includes(modelProfile))
+      throw new Error("INVALID_MODEL_PROFILE");
     if (
       session !== undefined &&
       (typeof session !== "string" ||
@@ -311,7 +330,13 @@ export class TaskRunner {
           prior.sessionKey !== sessionKey
         )
           throw new Error("SESSION_CWD_CONFLICT");
-      } else save(binding, { version: 1, name: session, cwd, sessionKey });
+        if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig ||
+            model && prior.modelProfile !== modelProfile)
+          throw new Error("SESSION_MODEL_CONFLICT");
+      } else save(binding, {
+        version: 1, name: session, cwd, sessionKey,
+        ...(model ? { model, modelConfig, modelProfile } : {}),
+      });
     }
     const fingerprint = hash(
       JSON.stringify({
@@ -320,6 +345,7 @@ export class TaskRunner {
         callback: selected,
         sessionKey,
         permissions,
+        ...(model ? { model, modelConfig, modelProfile } : {}),
       }),
     );
     const dirname = path.join(this.root, id);
@@ -345,6 +371,7 @@ export class TaskRunner {
         sessionKey,
         ...(session !== undefined ? { sessionName: session } : {}),
         permissions,
+        ...(model ? { model, modelConfig, modelProfile } : {}),
         cwd,
         prompt,
         callback: selected,
@@ -368,10 +395,12 @@ export class TaskRunner {
       request_id: record.requestId,
       state: record.state,
       permission_mode: record.permissions?.mode ?? "deny-all",
+      ...(record.model ? { model: record.model.id, variant: record.model.variant ?? null } : {}),
       ...(record.sessionName ? { session: record.sessionName } : {}),
       cancel_requested: fs.existsSync(this.filename(id, "cancel.json")),
       ...(record.resultStatus ? { result_status: record.resultStatus } : {}),
       ...(record.deliveryError ? { delivery_error: record.deliveryError } : {}),
+      ...(record.executionError ? { execution_error: record.executionError } : {}),
       ...(record.state === "ambiguous"
         ? {
             guidance:
@@ -513,15 +542,23 @@ export class TaskRunner {
         return;
       }
       // ensureSession does not dispatch the prompt. A queued crash is safe to resume.
-      record.handle = validateHandle(
-        record,
-        await this.runtime.ensureSession({
-          sessionKey: record.sessionKey,
-          agent: "opencode",
-          mode: "persistent",
-          cwd: record.cwd,
-        }),
-      );
+      try {
+        record.handle = validateHandle(
+          record,
+          await this.runtime.ensureSession({
+            sessionKey: record.sessionKey,
+            agent: "opencode",
+            mode: "persistent",
+            cwd: record.cwd,
+            ...(record.model ? { model: record.model } : {}),
+          }),
+        );
+        delete record.executionError;
+      } catch (error) {
+        record.executionError = "MODEL_OR_SESSION_SETUP_FAILED";
+        this.write(record);
+        throw error; // No dispatch has been attempted; retain queued for explicit recovery.
+      }
       record.state = "dispatching";
       this.write(record);
       let monitor;

@@ -1,7 +1,8 @@
 # v2.2.0-ricky.1 下游升级准备
 
 当前模块默认仍引用已经发布并核验过的 **v2.1.2-ricky.1**。
-本次仅将私有 Node 更新到 **22.23.4**、acpx 更新到 **0.21.1**，并更新 exact npm lock。
+工具源码已固定私有 Node **22.23.4**、acpx **0.21.1** 和 exact npm lock；
+当前模块另包含下文的双 Provider 与任务选模型实现。
 不创建 fork tag/Release，不更换已运行 toolset，也不激活模板。
 
 fork 候选基于上游 **v2.2.0**，提交
@@ -56,4 +57,8 @@ Node 的 linux-x64 tar.xz SHA256 固定为
 request ID，排队的下一请求仍成功。主模型 Sol/max、title Sol/low 的请求均已核对。
 该验收只连接本地 Responses 和回调服务，MCP 保持 disabled，不证明真实新端点可用。
 
-第二个 Provider 的配置准备见 [PROVIDERS.md](PROVIDERS.md)。
+当前内置 profile 已改为 copilot、codex，默认 codex/Sol/max，title codex/Sol/low。
+四个独立 env 及旧 LLM_* 迁移、任务 `--model`/`--variant`、固定 session 规则见
+[PROVIDERS.md](PROVIDERS.md)。源码变更不表示运行中的 toolset 已更新。
+该任务选模型实现也已用默认的已发布 v2.1.2-ricky.1 和本地候选分别完成隔离 loopback；
+默认下载 pin 保持上述已发布版本，不需要为本次模块需求重建或发布 fork。

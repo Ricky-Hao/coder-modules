@@ -12,8 +12,9 @@ from urllib.parse import urlsplit
 from safety import directory, regular
 
 MCP_NAMES = ('CONTEXT7', 'FIRECRAWL', 'GITHUB', 'GITHUB_ACTIONS')
-LLM_KEYS = ('LLM_API_KEY', 'LLM_BASE_URL')
-PROFILE_KEYS = set(LLM_KEYS) | {
+PROVIDERS = ('copilot', 'codex')
+LLM_KEYS = tuple(name.upper() + suffix for name in PROVIDERS for suffix in ('_API_KEY', '_BASE_URL'))
+PROFILE_KEYS = set(LLM_KEYS) | {'LLM_API_KEY', 'LLM_BASE_URL'} | {
     f'{name}_MCP_{suffix}' for name in MCP_NAMES
     for suffix in ('URL', 'API_KEY', 'ENABLED', 'AUTH_HEADER', 'AUTH_SCHEME')}
 
@@ -59,18 +60,24 @@ def enabled_servers(environ):
     return enabled
 
 
-def configuration(environ, version):
+def configuration(environ, version, provider='codex'):
     """Validate only selected credentials; return settings with refs and allowed names."""
     enabled = enabled_servers(environ)
-    required = set(LLM_KEYS) | {name + '_MCP_' + suffix for name in enabled for suffix in ('URL', 'API_KEY')}
+    if provider not in PROVIDERS:
+        raise ValueError('unknown env-profile provider')
+    configured = [name for name in PROVIDERS if name == provider or any(
+        environ.get(name.upper() + suffix) for suffix in ('_API_KEY', '_BASE_URL'))]
+    required = {name.upper() + suffix for name in configured for suffix in ('_API_KEY', '_BASE_URL')} | {
+        name + '_MCP_' + suffix for name in enabled for suffix in ('URL', 'API_KEY')}
     missing = [name for name in required if not environ.get(name)]
     if missing:
         raise ProfileError('missing', missing)
-    value(environ, 'LLM_API_KEY')
-    endpoint(environ, 'LLM_BASE_URL')
+    for name in configured:
+        value(environ, name.upper() + '_API_KEY')
+        endpoint(environ, name.upper() + '_BASE_URL')
     config = json.loads((version / 'profile-env.json').read_text())
     servers = config['mcp']['servers']
-    allowed = set(LLM_KEYS)
+    allowed = required & set(LLM_KEYS)
     for name in MCP_NAMES:
         prefix = name + '_MCP_'
         server_name = name.lower().replace('_', '-')
@@ -91,6 +98,44 @@ def configuration(environ, version):
         # Controls must survive acpx -> opencode so the same profile is reconstructed.
         allowed.update(prefix + suffix for suffix in ('URL', 'API_KEY', 'ENABLED', 'AUTH_HEADER', 'AUTH_SCHEME'))
     return config, allowed
+
+
+def selection(model, variant=None):
+    if isinstance(model, dict):
+        variant = model.get('variant')
+        model = model['providerID'] + '/' + model['model']
+    if isinstance(model, str) and '#' in model:
+        model, variant = model.split('#', 1)
+    if not isinstance(model, str) or len(model) > 256 or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_./:-]+', model):
+        raise ValueError('INVALID_MODEL')
+    if variant is not None and (not isinstance(variant, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', variant)):
+        raise ValueError('INVALID_VARIANT')
+    return {'id': model, **({'variant': variant} if variant is not None else {})}
+
+
+def task_configuration(config, model=None, variant=None):
+    """Snapshot nonsecret task defaults, including title routing, before acceptance."""
+    if model is not None and (not isinstance(model, str) or '#' in model):
+        raise ValueError('INVALID_MODEL')
+    selected = selection(model if model is not None else config.get('model'))
+    provider, model_id = selected['id'].split('/', 1)
+    definition = config.get('providers', {}).get(provider, {}).get('models', {}).get(model_id)
+    if definition is None:
+        raise ValueError('INVALID_MODEL')
+    effort = variant if variant is not None else selected.get('variant', definition.get('settings', {}).get('reasoningEffort'))
+    selected = selection(selected['id'], effort)
+    if effort is not None and effort not in [item['id'] for item in definition.get('variants', [])]:
+        raise ValueError('INVALID_VARIANT')
+    config['model'] = {'providerID': provider, 'model': model_id, **({'variant': effort} if effort else {})}
+    title = config.setdefault('agents', {}).setdefault('title', {})
+    title_model = title.get('model', {}).get('model', model_id) if isinstance(title.get('model'), dict) else model_id
+    title_definition = config['providers'][provider]['models'].get(title_model, definition)
+    if title_model not in config['providers'][provider]['models']:
+        title_model = model_id
+    if 'low' not in [item['id'] for item in title_definition.get('variants', [])]:
+        raise ValueError('TASK_TITLE_LOW_UNAVAILABLE')
+    title['model'] = {'providerID': provider, 'model': title_model, 'variant': 'low'}
+    return selected
 
 
 def private_file(path):
@@ -176,5 +221,6 @@ def information(profile, external, environ, version):
     enabled = enabled_servers(environ)
     return {'source': 'env', 'model': selected,
             'enabled_mcp': [name.lower().replace('_', '-') for name in enabled],
-            'required_environment_names': sorted(set(LLM_KEYS) | {
+            'provider_environment_names': list(LLM_KEYS),
+            'required_environment_names': sorted({'CODEX_API_KEY', 'CODEX_BASE_URL'} | {
                 name + '_MCP_' + suffix for name in enabled for suffix in ('URL', 'API_KEY')})}

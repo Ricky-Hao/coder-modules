@@ -216,13 +216,14 @@ already-appended safe PATH blocks may remain and are idempotent on retry.
 
 ## Environment-only provider and MCP configuration
 
-Default `env` profile includes **only `gpt-6.1-sol` and `gpt-6-astra`** and selects
-**`copilot/gpt-6.1-sol`**, variant **`max`** / `reasoningEffort: "max"`, with compaction and deny-other-provider
-policy. **`copilot` is a local provider alias, not official GitHub Copilot login/auth**.
-It uses the fork's installed OpenAI Responses provider implementation. Users must
-supply a compatible endpoint/key and actual model access; the catalog does not
-establish availability or official pricing. Catalog settings/cost/limits/variants
-are bundled nonsecret defaults, not a continuously synchronized service catalog.
+内置 `env` profile 恰好包含 **copilot、codex**，两者均完整提供
+**`gpt-6.1-sol`、`gpt-6-astra`**。默认主模型为 **`codex/gpt-6.1-sol` / max**，
+标题为同 Provider 的 Sol/low。两者使用相同 OpenAI Responses 实现和模型元数据；
+完整一致性回归防止定义漂移，其余 Provider 仍被原策略禁止。
+它们是本地别名，不启用官方 Copilot/Codex 登录。单任务参数、四变量及迁移方法见
+[PROVIDERS.md](PROVIDERS.md)。用户自行提供兼容的端点、密钥和模型访问权。
+catalog 不证明服务可用或官方定价；其中的 settings/cost/limits/variants 是随源码维护的
+非秘密默认值，不会自动同步实际服务。
 
 ### Context and input budgeting
 
@@ -259,7 +260,7 @@ The only automatic small-model consumer in this pin is **session title generatio
   searches active text models in the primary provider by family (`gpt-luna`,
   `gemini-flash-lite`, `gemini-flash`, `claude-haiku`). Neither retained model is one
   of those families, so relying on automatic selection would fall back to the primary model.
-- The native override is **`agents.title.model = { providerID: "copilot", model:
+- The native override is **`agents.title.model = { providerID: "codex", model:
   "gpt-6.1-sol", variant: "low" }`**. The pinned
   [`ConfigAgent.Info`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/schema/src/config/agent.ts#L11-L22)
   and [`ConfigModel.Selection`](https://github.com/Ricky-Hao/opencode/blob/0fb11752eced8baa84fb546bbf8212cff2f9e5e0/packages/schema/src/config/model.ts#L12-L28)
@@ -288,7 +289,8 @@ The only automatic small-model consumer in this pin is **session title generatio
 
 | Environment names                                                                                   | Contract                                                         |
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `LLM_BASE_URL`, `LLM_API_KEY`                                                                       | Required on a real provider launch                               |
+| `CODEX_BASE_URL`, `CODEX_API_KEY`                                                                   | 默认 codex 任务所需；缺少则失败，不回退 |
+| `COPILOT_BASE_URL`, `COPILOT_API_KEY`                                                               | 显式 copilot 任务所需；另一个完整未配置可跳过 |
 | `CONTEXT7_MCP_ENABLED`, `FIRECRAWL_MCP_ENABLED`, `GITHUB_MCP_ENABLED`, `GITHUB_ACTIONS_MCP_ENABLED` | Only literal `1` enables; absent/`0` disables; other values fail |
 | Each enabled prefix's `_MCP_URL`, `_MCP_API_KEY`                                                    | Required endpoint/key, child env only                            |
 | Each prefix's `_MCP_AUTH_HEADER`, `_MCP_AUTH_SCHEME`                                                | Optional validated nonsecret header/scheme                       |
@@ -304,7 +306,7 @@ Endpoints/keys remain **`{env:NAME}` references** in generated config; resolved
 values are never put in Terraform, installer settings, argv or module errors.
 Header names/schemes are literal nonsecret settings; enable flags select entries.
 Validation rejects control/non-ASCII characters, JSON interpolation delimiters,
-URL credentials/query/fragment/invalid ports. LLM requires HTTPS except loopback HTTP;
+URL credentials/query/fragment/invalid ports. Provider endpoints require HTTPS except loopback HTTP;
 MCP allows HTTP(S), so supply HTTPS when transport confidentiality is needed.
 Errors identify missing/invalid **variable names only**.
 
@@ -323,11 +325,11 @@ deny-all/noninteractive-deny defaults; there is no automatic permission escalati
 OpenCode's own project config merging still applies. Do not print resolved debug
 config, verbose service logs or environment values as a credential check.
 
-For the same models at a second endpoint, use the native external JSON method in
-[PROVIDERS.md](PROVIDERS.md). It preserves the bundled defaults and complete model
-metadata, and specifies policy, environment forwarding, main and title selections.
-No OpenCode or module runtime extension is needed. The example is prepared support;
-an actual Provider ID, URL and secret injection location are still required.
+内置 profile 不再使用 `LLM_BASE_URL`、`LLM_API_KEY`，迁移由操作者在原 Secret/env
+机制中完成。另一个 Provider 部分填写或已填写的值无效时，只报告变量名。
+`opencode-task submit --model copilot/gpt-6.1-sol --variant max` 可显式选择；省略参数
+默认 codex。任务配置与 ACP 选择共同固定主请求、title 和辅助请求的 Provider，
+不修改全局默认。named session 固定选择，冲突须换新 session；见 [TASKS.md](TASKS.md)。
 
 ## Validation and publication boundary
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import sys
 import fcntl
+import hashlib
 
 # The active symlink resolves once: a concurrent upgrade cannot mix version files.
 VERSION = Path(__file__).resolve().parent
@@ -24,10 +25,11 @@ NORMAL_ENV = {
 }
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
-            'OPENCODE_DISABLE_AUTOUPDATE'}
+            'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_MODULE_TASK_SELECTION',
+            'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK'}
 
 
-def environment(environ, root, allowlist, profile='none', workspace_id=None, arguments=()):
+def environment(environ, root, allowlist, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
     keys = NORMAL_ENV | set(allowlist) | {k for k in environ if k.startswith('LC_')}
@@ -40,7 +42,11 @@ def environment(environ, root, allowlist, profile='none', workspace_id=None, arg
                   'XDG_CACHE_HOME': str(state / 'cache'), 'XDG_STATE_HOME': str(state / 'state'),
                   'TMPDIR': str(state / 'tmp'), 'OPENCODE_CONFIG_DIR': str(state / 'config/opencode'),
                   'OPENCODE_DISABLE_AUTOUPDATE': 'true'})
-    config_path = environ.get('OPENCODE_MODULE_CONFIG')
+    config_path = task.get('modelConfig') if task else environ.get('OPENCODE_MODULE_CONFIG')
+    model = task.get('model') if task else None
+    model_profile = task['modelProfile'] if task else 'env' if profile == 'env' and not config_path else 'external'
+    model_flag = arguments[arguments.index('--model') + 1] if submit and '--model' in arguments else None
+    variant_flag = arguments[arguments.index('--variant') + 1] if submit and '--variant' in arguments else None
     if profiles.harmless(list(arguments)):
         for name in profiles.PROFILE_KEYS:
             child.pop(name, None)
@@ -52,12 +58,30 @@ def environment(environ, root, allowlist, profile='none', workspace_id=None, arg
         config = json.loads(path.read_text())
         child['OPENCODE_CONFIG'] = str(path)
     elif profile == 'env':
-        config, automatic = profiles.configuration(environ, VERSION)
+        provider = (model['id'] if model else model_flag or 'codex/').split('/', 1)[0]
+        config, automatic = profiles.configuration(environ, VERSION, provider)
         # Disabled MCP credentials cannot leak through user extras in env mode.
         for name in profiles.PROFILE_KEYS:
             child.pop(name, None)
         child.update({name: environ[name] for name in automatic if name in environ})
+    if task and model_profile == 'env':
+        # A saved task config is external to discovery but still uses the bundled env contract.
+        _, automatic = profiles.configuration(environ, VERSION, model['id'].split('/', 1)[0])
+        for name in profiles.PROFILE_KEYS:
+            child.pop(name, None)
+        child.update({name: environ[name] for name in automatic if name in environ})
+    if submit and config is not None:
+        model = profiles.task_configuration(config, model_flag, variant_flag)
+    elif submit and (model_flag is not None or variant_flag is not None):
+        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    if config is not None and (submit or not config_path):
         child['OPENCODE_CONFIG'] = str(profiles.materialize(root, workspace_id, config))
+    if model is not None:
+        if profiles.selection(config['model']) != model:
+            raise ValueError('TASK_MODEL_CONFIG_CONFLICT')
+        child['OPENCODE_MODULE_TASK_SELECTION'] = json.dumps(model, sort_keys=True)
+        child['OPENCODE_MODULE_TASK_CONFIG'] = child['OPENCODE_CONFIG']
+        child['OPENCODE_MODULE_TASK_PROFILE'] = model_profile
     if config is not None:
         selected = config.get('model')
         if selected is not None:
@@ -106,6 +130,14 @@ def main():
     for name in ('home', 'config', 'data', 'cache', 'state', 'tmp'):
         directory(root / 'runtime' / name)
     tool, arguments = sys.argv[1], sys.argv[2:]
+    task = None
+    if tool == 'opencode' and arguments[:1] == ['--module-task']:
+        if len(arguments) != 6 or arguments[-1] != 'acp' or arguments[4] not in ('env', 'external'):
+            raise ValueError('invalid task launch')
+        task = {'modelConfig': arguments[1], 'model': profiles.selection(arguments[2], arguments[3] or None),
+                'modelProfile': arguments[4]}
+        regular(Path(arguments[1]))
+        arguments = ['acp']
     if tool not in ('opencode', 'acpx', 'opencode-task'):
         raise ValueError('unknown command')
     profile = settings.get('runtime_profile', 'none')
@@ -114,6 +146,7 @@ def main():
                                               os.environ, VERSION), sort_keys=True))
         return
     task_arguments = arguments
+    session_lock = None
     if tool == 'opencode-task':
         tasks = root / 'runtime/tasks'
         # Serialize first marker creation and submit dedupe on a trusted directory.
@@ -147,9 +180,15 @@ def main():
             task_state = json.loads((task_dir / 'task.json').read_text())
             if task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
                 task_arguments = ['--help']  # Passive watch/outbox needs no provider credentials.
+            elif task_state.get('model'):
+                task = task_state
+                session_lock = tasks / ('.model-' + hashlib.sha256(task_state['sessionKey'].encode()).hexdigest() + '.lock')
+            elif profile == 'env' and not os.environ.get('OPENCODE_MODULE_CONFIG'):
+                # Old records did not snapshot model intent. Never reinterpret one as the new default.
+                print('TASK_MODEL_UNRECORDED: use the original installed launcher or original external config for this queued task.', file=sys.stderr)
+                raise SystemExit(1)
         elif arguments[:1] != ['submit']:
-            if arguments[:1] != ['recover'] or not os.environ.get('LLM_API_KEY'):
-                task_arguments = ['--help']
+            task_arguments = ['--help']
         if arguments[:1] in (['submit'], ['_worker'], ['resolve']):
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
@@ -160,8 +199,22 @@ def main():
                     return
                 raise
             os.set_inheritable(task_lock, True)
+    # Serialize only initialization/selection, not execution or the session queue.
+    selection_lock = None
+    if session_lock is not None:
+        selection_lock = os.open(session_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        regular(session_lock)
+        fcntl.flock(selection_lock, fcntl.LOCK_EX)
+        os.set_inheritable(selection_lock, True)
     child = environment(os.environ, root, settings['runtime_env_allowlist'], profile,
-                         settings['workspace_id'], task_arguments)
+                          settings['workspace_id'], task_arguments, task,
+                          submit=tool == 'opencode-task' and arguments[:1] == ['submit'])
+    if selection_lock is not None:
+        child['OPENCODE_MODULE_SESSION_LOCK'] = str(selection_lock)
+    if tool == 'opencode-task' and arguments == ['recover'] and profile == 'env' and not os.environ.get('OPENCODE_MODULE_CONFIG'):
+        # Recover itself is passive; each queued worker validates its saved Provider.
+        child.update({name: os.environ[name] for name in profiles.PROFILE_KEYS - {'LLM_API_KEY', 'LLM_BASE_URL'}
+                      if name in os.environ})
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')
     if tool == 'opencode':

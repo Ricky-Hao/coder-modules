@@ -1,102 +1,87 @@
-# 同模型、不同端点的第二个 Provider
+# copilot、codex 与单任务选模型
 
-已核对上游 v2.2.0（`1097e2668b1e08ad63bdf0b1c4860b9bc01e420c`）的
-`ConfigProvider.Info`、`ConfigModel.Selection`、`ConfigAgent.Info` 和
-`core/src/config/plugin/provider.ts`。`providers` 按 Provider ID 区分端点和凭据，
-同名模型可以同时存在。此用法不需要修改 OpenCode 或模块的生产代码。
+内置 `env` profile 恰好提供 `copilot` 和 `codex`。它们是本地 Provider 别名，
+均使用 `@opencode/ai/providers/openai/responses`，不启用官方 Copilot/Codex 登录。
+两个 Provider 的模型元数据和行为配置相同；完整一致性回归防止维护时漂移。
+两者均允许选择，其余 Provider 仍由原策略禁止。
 
-下文是配置准备方法。实际 Provider ID、URL 和密钥注入位置尚未提供；尚未配置或实测新服务。
-请提供非秘密的 Provider ID、URL，以及密钥由哪个现有 secret/env 机制注入。
-不要在聊天、Terraform、JSON、命令参数或报告中粘贴密钥。
-新端点须兼容当前使用的 **OpenAI Responses** 协议；模型同名不等于协议和访问权已验证。
+## 填写环境变量
 
-## 生成外部 JSON
+在原有 Secret/env 机制中分别设置以下变量，不要把值放进 Terraform、JSON、命令参数或聊天：
 
-从仓库根目录执行下面的命令。先选定一个新的、仅当前用户可读写的目录。
-将 `<PROVIDER_ID>` 换成实际别名，将输出路径换成该目录中的新文件。
-若已有 `OPENCODE_MODULE_CONFIG`，把第一个路径换成那个完整 JSON，保留其中的其他设置。
-输入必须包含完整的 `providers.copilot`，不能只使用简化的模型名列表。
-脚本不读取端点或密钥，也不联系服务；输出文件用 0600 模式独占创建，拒绝覆盖。
+| Provider | 端点 | 密钥 |
+| --- | --- | --- |
+| copilot | `COPILOT_BASE_URL` | `COPILOT_API_KEY` |
+| codex | `CODEX_BASE_URL` | `CODEX_API_KEY` |
+
+使用两者时填写四个变量。只使用一个时，只需该 Provider 的完整变量对；另一个完全未填写
+不会阻塞。如果另一个只填了一项，或任一已填写的变量对无效，启动失败且只报变量名。
+端点须兼容 OpenAI Responses。沿用原 URL/秘密校验规则：端点通常要求 HTTPS，
+loopback 可用 HTTP；禁止 URL 用户信息、query、fragment、控制字符和 JSON 插值字符。
+模块生成的 JSON 只保存 `{env:变量名}`，不保存实际值。
+
+新任务不写模型参数时，主模型是 **`codex/gpt-6.1-sol`、max**，标题是
+**`codex/gpt-6.1-sol`、low**。缺少 codex 凭据会明确失败，不回退到 copilot 或旧变量。
+
+### 从 LLM_* 迁移
+
+1. 在原 Secret/env 管理处，将原服务分别配置到 `COPILOT_BASE_URL`、`COPILOT_API_KEY`。
+   操作者自行在该机制内处理值；模块不会读取或迁移旧 `LLM_BASE_URL`、`LLM_API_KEY`。
+2. 在同一机制中独立填写 `CODEX_BASE_URL`、`CODEX_API_KEY`，供默认任务使用。
+3. 后续新启动的进程须获得新变量。内置 env profile 自动转发有效变量对和所需 MCP 变量，
+   无需为这四个变量新增 allowlist。未注入 codex 时，可显式提交 copilot 任务。
+4. 确认其他调用方已迁移后，再由操作者移除旧 LLM_*。内置 profile 不静默兼容旧名。
+
+本次源码修改不注入凭据，不更新模板、不重启 Workspace，也不替换当前运行的工具。
+
+## 单任务选择
 
 ```sh
-python3 -B - opencode/scripts/profile-env.json '<PROVIDER_ID>' /private/opencode-two-providers.json <<'PY'
-import copy
-import json
-import os
-from pathlib import Path
-import re
-import sys
+# 默认 codex / Sol / max
+opencode-task submit --key default-job --prompt-file ./prompt.txt < /private/callback.json
 
-source, provider_id, destination = sys.argv[1:]
-if not re.fullmatch(r'[a-z][a-z0-9_-]*', provider_id):
-    raise ValueError('choose a lowercase provider ID')
-config = json.loads(Path(source).read_text())
-config.setdefault('$schema', 'https://opencode.ai/config.json')
-if provider_id in config['providers']:
-    raise ValueError('provider ID already exists')
-provider = copy.deepcopy(config['providers']['copilot'])
-provider['name'] = provider_id
-provider['env'] = ['SECOND_LLM_API_KEY']
-provider['settings'].update(baseURL='{env:SECOND_LLM_BASE_URL}', apiKey='{env:SECOND_LLM_API_KEY}')
-config['providers'][provider_id] = provider
-# v2.2.0 原生字段；先保留旧策略顺序，再允许新 Provider。
-legacy = config.get('experimental', {}).pop('policies', [])
-config['policies'] = [*legacy, *config.get('policies', []),
-                      {'action': 'provider.use', 'resource': provider_id, 'effect': 'allow'}]
-descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(descriptor, 'w') as stream:
-    json.dump(config, stream, indent=2)
-    stream.write('\n')
-PY
+# 显式 copilot；标题及自动辅助请求沿 copilot，title 仍为 Sol/low
+opencode-task submit --key copilot-job --model copilot/gpt-6.1-sol --variant max --prompt-file ./prompt.txt < /private/callback.json
+
+# Astra 可选 low、medium、high、xhigh、max
+opencode-task submit --key astra-job --model copilot/gpt-6-astra --variant high --prompt-file ./prompt.txt < /private/callback.json
 ```
 
-此命令保留原 copilot、主模型 Sol/max、title Sol/low、compaction buffer=13600 和 MCP 设置。
-它完整复制两个模型的 cost、capabilities、limits、settings 和五个 variants，
-而不依赖 `canonical`、catalog 的默认模型或跨 Provider 的隐式继承。
-两模型仍为 context=400000、input=272000、output=128000。
-`experimental.policies` 在 v2.2.0 仍可读取，但已弃用；新示例用顶层 `policies`。
-策略先 deny `*`，再 allow copilot 和新 ID。更高优先级的 managed policy 仍可能禁止它。
+`--model` 格式为 `provider/model`，variant 单独用 `--variant`。不把 variant 拼进 model，
+也不通过自然语言或 readiness 环境变量选模型。只写 `--variant` 会调整本次默认模型。
+内置 profile 中，显式模型省略 variant 时，Sol 取 max，Astra 取 medium；两个 Provider 相同。
 
-## 转发环境与选择模型
+两个模型均保留 context=400000、input=272000、output=128000，以及原完整
+cost、capabilities、settings 和五个 variants。compaction buffer 仍为 13600。
+MCP 开关、header、凭据转发和默认 disabled 行为保持。
 
-模块输入 `runtime_env_allowlist` 需要包含：
+提交前会生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider 的
+Sol/low title。任务记录保存非秘密选择与配置路径，纳入去重；恢复不重新解释默认值。
+新 ACP session 使用显式模型选择，并在发送 prompt 前核对 ACP 确认的 model/effort。
+选择失败不发送 prompt，任务保持 queued，`status` 给出安全的 setup 失败码。
 
-```hcl
-runtime_env_allowlist = [
-  "LLM_BASE_URL", "LLM_API_KEY",
-  "SECOND_LLM_BASE_URL", "SECOND_LLM_API_KEY",
-]
-```
+`status` 显示 `model`、`variant`。named session 首次提交固定 model、variant 和配置快照；
+同名后续请求须匹配。冲突报 `SESSION_MODEL_CONFLICT`，请使用新 session 名。
+省略参数表示当前 profile 默认值，不会隐式继承另一个 Provider 的旧 session。
+初始化由短暂锁串行化，运行和排队阶段不发送 session 级选模型控制，也不修改全局默认配置。
 
-这只声明变量名，不设置值。请通过既有 secret/env 注入机制给启动 acpx、OpenCode 或
-opencode-task 的进程提供它们。已有 allowlist 应合并保留。
-设置 `OPENCODE_MODULE_CONFIG=/private/opencode-two-providers.json` 后，外部 JSON 会覆盖
-bundled profile；`LLM_*` 也必须显式允许。`OPENCODE_MODULE_CONFIG` 自身已有转发支持，
-acpx → OpenCode 会沿用该路径和获准的变量。文件路径必须能被两个进程读取。
-外部配置不会获得 bundled profile 的 LLM/MCP 值校验或自动 MCP 开关处理。
-若沿用启用的 MCP，请保留完整 server 配置，并显式允许其 URL、API key 等引用变量；
-如果从 bundled JSON 起步，四个 MCP 均保持 disabled。
+旧记录仍可读取，已 dispatch 的请求只按原 request ID watch/cancel，已封存回调不重写。
+旧 named session 没有模型绑定，不能由新选择自动接管。旧 queued 记录未保存模型意图，
+新 env 默认不会重解释它；需在原安装版本的工具环境中恢复，或显式提供原完整外部配置与 allowlist
+后恢复。原任务/session/cache 均不迁移或删除。
 
-只添加 Provider 不改变默认选择。要让后续新任务使用新端点，编辑**新外部文件**：
+## 外部配置优先级
 
-```json
-{
-  "model": { "providerID": "<PROVIDER_ID>", "model": "gpt-6.1-sol", "variant": "max" },
-  "agents": {
-    "title": { "model": { "providerID": "<PROVIDER_ID>", "model": "gpt-6.1-sol", "variant": "low" } }
-  }
-}
-```
+非空 `OPENCODE_MODULE_CONFIG` 仍优先于内置 env profile。原完整 JSON 的 model 作为
+不写参数时的默认值，外部配置所需变量仍须显式列入 `runtime_env_allowlist`；模块不自动注入
+上述四个变量或 MCP 值。旧外部 JSON 若仍引用 LLM_*，须由操作者修改引用和 allowlist，
+也可按原外部契约继续自行维护；这不构成内置 profile 的变量回退。
 
-此片段仅表示要改的字段，不是完整替代配置。两处也可独立选择 copilot 或新 Provider。
-切换 Astra 时沿用完整模型定义并显式选择 variant；现有默认仍是 Sol/max。
-模块从顶层 `model` 自动设置 readiness 的显式 `provider/model` 和 variant；
-无需另设 `OPENCODE_ACP_REQUIRED_*` 来覆盖它。title 单独选 low，不会把主模型改成 low。
-已有 session 的已选模型不会因为修改默认值而自动切换。
+任务模型参数会在该完整配置的私有快照中覆盖主模型，并将 title 固定到所选 Provider 的
+同名标题模型/low（没有该标题模型时用所选主模型/low）。不会修改原文件。
+外部模型须有完整定义且支持所需 variant 与 low title；否则提交失败。
+`runtime_profile=none` 且无外部完整配置时，不支持模型参数，保留旧显式 readiness 契约。
 
-可运行 `opencode --module-profile-info` 确认 source 为 external。
-该命令只报告来源，不证明模型可访问。实际接入仍需用户提供上述非秘密信息，
-另行授权配置注入和端点验证；本次只进行隔离占位配置、schema 与 loopback 验证。
-
-参考：[V2 providers](https://opencode.ai/v2/docs/providers)、
-[V2 policies](https://opencode.ai/v2/docs/policies)。精确行为以上述固定提交为准。
+`opencode --module-profile-info` 只显示来源、默认选择和变量名，不读取凭据或联系端点。
+已在真实 pinned acpx 0.21.1、已发布 fork v2.1.2-ricky.1 及本地 v2.2.0 候选上用隔离
+Responses/回调回环验证；实际服务的端点和访问权仍由使用方提供，本次未联系真实 Provider/MCP。
