@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Workspace-private launcher. Preserve cwd/argv; credentials require named opt-in."""
+"""Workspace-private launcher. Inherit the caller environment with module overrides."""
 import json
 import os
 from pathlib import Path
@@ -14,42 +14,32 @@ sys.path.insert(0, str(VERSION))
 from safety import ancestors, directory, owner, regular
 import profiles
 
-NORMAL_ENV = {
-    'PATH', 'LANG', 'LANGUAGE', 'TERM', 'COLORTERM', 'TZ', 'SHELL', 'USER', 'LOGNAME',
-    'DISPLAY', 'WAYLAND_DISPLAY', 'EDITOR', 'VISUAL', 'PAGER', 'NO_COLOR', 'FORCE_COLOR',
-    'VIRTUAL_ENV', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV', 'PYENV_ROOT', 'NVM_DIR',
-    'JAVA_HOME', 'GOPATH', 'GOROOT', 'CARGO_HOME', 'RUSTUP_HOME',
-    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
-    'OPENCODE_MODULE_CONFIG', 'OPENCODE_ACP_REQUIRED_MODEL', 'OPENCODE_ACP_REQUIRED_VARIANT',
-    'OPENCODE_ACP_CATALOG_TIMEOUT_MS',
-}
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
             'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_MODULE_TASK_SELECTION',
             'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK'}
 
 
-def environment(environ, root, allowlist, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
+def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
-    keys = NORMAL_ENV | set(allowlist) | {k for k in environ if k.startswith('LC_')}
-    child = {k: environ[k] for k in keys - RESERVED if k in environ
+    # Callback capability fields are private to the task protocol, never model input.
+    child = {k: value for k, value in environ.items() if k not in RESERVED
              and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
-             and not re.search(r'tcb_[A-Za-z0-9_-]{43}', environ[k])}
+             and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
     state = root / 'runtime'
-    child.update({'HOME': str(state / 'home'), 'PATH': environ.get('PATH', '/usr/bin:/bin'),
+    child.setdefault('PATH', '/usr/bin:/bin')
+    child.update({'HOME': str(state / 'home'),
                   'XDG_CONFIG_HOME': str(state / 'config'), 'XDG_DATA_HOME': str(state / 'data'),
                   'XDG_CACHE_HOME': str(state / 'cache'), 'XDG_STATE_HOME': str(state / 'state'),
                   'TMPDIR': str(state / 'tmp'), 'OPENCODE_CONFIG_DIR': str(state / 'config/opencode'),
                   'OPENCODE_DISABLE_AUTOUPDATE': 'true'})
-    config_path = task.get('modelConfig') if task else environ.get('OPENCODE_MODULE_CONFIG')
+    config_path = task.get('modelConfig') if task else child.get('OPENCODE_MODULE_CONFIG')
     model = task.get('model') if task else None
     model_profile = task['modelProfile'] if task else 'env' if profile == 'env' and not config_path else 'external'
     model_flag = arguments[arguments.index('--model') + 1] if submit and '--model' in arguments else None
     variant_flag = arguments[arguments.index('--variant') + 1] if submit and '--variant' in arguments else None
     if profiles.harmless(list(arguments)):
-        for name in profiles.PROFILE_KEYS:
-            child.pop(name, None)
         return child
     config = None
     if config_path:
@@ -59,17 +49,10 @@ def environment(environ, root, allowlist, profile='none', workspace_id=None, arg
         child['OPENCODE_CONFIG'] = str(path)
     elif profile == 'env':
         provider = (model['id'] if model else model_flag or 'codex/').split('/', 1)[0]
-        config, automatic = profiles.configuration(environ, VERSION, provider)
-        # Disabled MCP credentials cannot leak through user extras in env mode.
-        for name in profiles.PROFILE_KEYS:
-            child.pop(name, None)
-        child.update({name: environ[name] for name in automatic if name in environ})
+        config = profiles.configuration(child, VERSION, provider)
     if task and model_profile == 'env':
         # A saved task config is external to discovery but still uses the bundled env contract.
-        _, automatic = profiles.configuration(environ, VERSION, model['id'].split('/', 1)[0])
-        for name in profiles.PROFILE_KEYS:
-            child.pop(name, None)
-        child.update({name: environ[name] for name in automatic if name in environ})
+        profiles.configuration(child, VERSION, model['id'].split('/', 1)[0])
     if submit and config is not None:
         model = profiles.task_configuration(config, model_flag, variant_flag)
     elif submit and (model_flag is not None or variant_flag is not None):
@@ -206,15 +189,11 @@ def main():
         regular(session_lock)
         fcntl.flock(selection_lock, fcntl.LOCK_EX)
         os.set_inheritable(selection_lock, True)
-    child = environment(os.environ, root, settings['runtime_env_allowlist'], profile,
+    child = environment(os.environ, root, profile,
                           settings['workspace_id'], task_arguments, task,
                           submit=tool == 'opencode-task' and arguments[:1] == ['submit'])
     if selection_lock is not None:
         child['OPENCODE_MODULE_SESSION_LOCK'] = str(selection_lock)
-    if tool == 'opencode-task' and arguments == ['recover'] and profile == 'env' and not os.environ.get('OPENCODE_MODULE_CONFIG'):
-        # Recover itself is passive; each queued worker validates its saved Provider.
-        child.update({name: os.environ[name] for name in profiles.PROFILE_KEYS - {'LLM_API_KEY', 'LLM_BASE_URL'}
-                      if name in os.environ})
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')
     if tool == 'opencode':

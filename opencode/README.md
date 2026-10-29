@@ -188,7 +188,6 @@ archives require network on first installation; verified cached reuse is offline
 | `dedicated_volume`      | Null; explicit dedicated-volume root-init output opt-in |
 | `release`               | Null: pinned public release below                       |
 | `runtime_profile`       | `env`; `none` opts out                                  |
-| `runtime_env_allowlist` | `[]`; extra names only                                  |
 | `start_blocks_login`    | `true`                                                  |
 | `install_timeout`       | `1200` seconds                                          |
 
@@ -285,6 +284,17 @@ The only automatic small-model consumer in this pin is **session title generatio
 
 ### Launch environment
 
+所有 launcher 默认继承当前启动进程的环境，无需列变量名。代理（含大小写形式）、自定义变量、
+工具认证、其他 Provider 和 disabled MCP 的变量均保留；`env`、`none`、外部配置和
+help/version 使用相同规则。MCP 开关只决定是否生成服务配置，不删除其环境变量。
+内置 profile 的 Provider/模型策略和变量校验保持，继承其他 Provider 的变量不会启用它。
+
+模块仍覆盖 `HOME`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME`、
+`XDG_STATE_HOME`、`TMPDIR`、`OPENCODE_CONFIG_DIR` 和自动更新控制；原始
+`OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` 及任务内部控制变量不能覆盖模块选择。
+任务回调协议的 `LC_TASK_CALLBACK*`、`OPENCODE_TASK_CALLBACK*`，以及含 `tcb_` bearer
+的值始终过滤，不传给模型子进程。模块不保存环境快照。
+
 | Environment names                                                                                   | Contract                                                         |
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | `CODEX_BASE_URL`, `CODEX_API_KEY`                                                                   | 默认 codex 任务所需；缺少则失败，不回退 |
@@ -296,9 +306,8 @@ The only automatic small-model consumer in this pin is **session title generatio
 Context7 defaults to `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`. The other
 three default to `X-MCP-API-Key: {env:..._MCP_API_KEY}`. An Authorization header
 defaults to Bearer; other headers default to no scheme. Explicit empty scheme is
-allowed. OAuth is disabled. Disabled MCP entries are omitted and their credentials
-are stripped even if explicitly included in extras. Enabled control names survive
-acpx -> OpenCode; unrelated Coder/Git credentials are not automatically forwarded.
+allowed. OAuth is disabled. Disabled MCP entries are omitted from config; their
+environment variables remain inherited. The environment also survives acpx -> OpenCode.
 
 Endpoints/keys remain **`{env:NAME}` references** in generated config; resolved
 values are never put in Terraform, installer settings, argv or module errors.
@@ -316,8 +325,8 @@ is still refused. Install/help/version require no keys. `--module-profile-info`
 reports names and selection without reading credentials or contacting services.
 
 **Precedence:** nonempty `OPENCODE_MODULE_CONFIG` selects an explicit user JSON file
-over the bundled profile. No automatic profile credentials are passed in that case;
-use `runtime_env_allowlist` for the external config's required names. `none` without
+over the bundled profile. External configs inherit the same launch environment and
+can use its `{env:NAME}` references directly. `none` without
 an external file keeps the explicit model/readiness-env contract. acpx keeps
 deny-all/noninteractive-deny defaults; there is no automatic permission escalation.
 OpenCode's own project config merging still applies. Do not print resolved debug

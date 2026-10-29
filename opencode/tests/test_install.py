@@ -86,8 +86,7 @@ class InstallerTests(unittest.TestCase):
             'install_root': str(self.root), 'workspace_id': 'test-workspace',
             'release_tag': 'v2.0.19-ricky.1',
             'release_asset': 'opencode-linux-x64-baseline-v2.0.19-ricky.1.tar.gz',
-            'release_sha256': installer.digest(self.tar), 'runtime_profile': 'none',
-            'runtime_env_allowlist': ['TEST_PROVIDER_KEY']}}
+            'release_sha256': installer.digest(self.tar), 'runtime_profile': 'none'}}
         self.downloads = 0
         self.original_run = subprocess.run
 
@@ -179,7 +178,16 @@ class InstallerTests(unittest.TestCase):
                'VIRTUAL_ENV': '/project/.venv', 'TEST_PROVIDER_KEY': sentinel,
                'CODER_AGENT_TOKEN': sentinel, 'GITHUB_TOKEN': sentinel, 'SSH_AUTH_SOCK': '/secret/socket',
                'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'credential.helper', 'GIT_CONFIG_VALUE_0': sentinel,
-               'OPENCODE_MODULE_CONFIG': str(config), 'OPENCODE_CONFIG_CONTENT': sentinel}
+               'HTTP_PROXY': 'http://proxy.example.invalid:8080', 'https_proxy': 'http://proxy.example.invalid:8443',
+               'ALL_PROXY': 'socks5://proxy.example.invalid:1080', 'NO_PROXY': 'localhost,.example.invalid',
+               'UNLISTED_SERVICE_CREDENTIAL': sentinel, 'UNLISTED_SETTING': 'arbitrary\nvalue 值', 'EMPTY_SETTING': '',
+               'OPENCODE_MODULE_CONFIG': str(config), 'OPENCODE_CONFIG_CONTENT': sentinel,
+               'OPENCODE_CONFIG': '/unused.json', 'OPENCODE_CONFIG_DIR': '/unused-config',
+               'OPENCODE_DISABLE_AUTOUPDATE': 'false', 'OPENCODE_MODULE_TASK_SELECTION': 'untrusted',
+               'OPENCODE_MODULE_TASK_CONFIG': '/unused-task.json', 'OPENCODE_MODULE_TASK_PROFILE': 'env',
+               'OPENCODE_MODULE_SESSION_LOCK': '999'}
+        for name in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'):
+            env[name] = '/unused-directory'
         for tool in ('opencode', 'acpx'):
             args = ['argument with spaces', "'quoted'", '$HOME', '--flag=value']
             result = self.original_run([str(self.root / 'bin' / tool), *args], cwd=project,
@@ -195,9 +203,17 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'fixture/chosen')
             self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'test')
             self.assertEqual(child['OPENCODE_CONFIG'], str(config))
-            for key in ('CODER_AGENT_TOKEN', 'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'GIT_CONFIG_COUNT', 'OPENCODE_CONFIG_CONTENT'):
+            for key in env:
+                if not key.startswith(('OPENCODE_', 'XDG_')) and key not in ('HOME', 'TMPDIR'):
+                    self.assertEqual(child[key], env[key], key)
+            for key, path in {'HOME': 'home', 'XDG_CONFIG_HOME': 'config', 'XDG_DATA_HOME': 'data',
+                              'XDG_CACHE_HOME': 'cache', 'XDG_STATE_HOME': 'state', 'TMPDIR': 'tmp',
+                              'OPENCODE_CONFIG_DIR': 'config/opencode'}.items():
+                self.assertEqual(child[key], str(self.root / 'runtime' / path))
+            self.assertEqual(child['OPENCODE_DISABLE_AUTOUPDATE'], 'true')
+            for key in ('OPENCODE_CONFIG_CONTENT', 'OPENCODE_MODULE_TASK_SELECTION', 'OPENCODE_MODULE_TASK_CONFIG',
+                        'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK'):
                 self.assertNotIn(key, child)
-            self.assertEqual(child['HOME'], str(self.root / 'runtime/home'))
         for path in self.root.rglob('*'):
             if path.is_file():
                 self.assertNotIn(sentinel.encode(), path.read_bytes(), str(path))

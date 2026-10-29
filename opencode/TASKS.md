@@ -59,7 +59,7 @@ copilot 任务的 title 为 copilot/Sol/low，辅助请求使用该任务的 Pro
 请在原 Secret/env 机制独立填写 `COPILOT_BASE_URL`、`COPILOT_API_KEY`、
 `CODEX_BASE_URL`、`CODEX_API_KEY`，迁移步骤见 [PROVIDERS.md](PROVIDERS.md)。
 只需选中 Provider 的完整变量对；另一个完全未填写可跳过，部分填写则按变量名报错。
-缺 codex 默认凭据不会改用 copilot。外部完整配置的优先级和 allowlist 契约保留。
+缺 codex 默认凭据不会改用 copilot。外部完整配置的优先级保留，所需环境变量默认继承。
 
 模型、variant 和不可变配置路径保存于非秘密任务意图并参与去重，`status` 返回 model/variant。
 同 key 改选择会冲突；恢复使用已保存的选择，不重新读取当前默认值。
@@ -70,10 +70,10 @@ ACP 初始化显式选择模型，并核对 agent 确认的模型/effort，再�
 Callback input is capped at 4096 bytes, prompts at 1 MiB. Callback files must be
 regular, current-UID-owned, single-link, and inaccessible to group/other; symlinks
 are refused. Unknown options fail closed. Do not name files with bearer values.
-Prompts containing their callback ID/URL are rejected. The launcher strips callback
-environment names and callback-shaped values, including `LC_*` and extra allowlist
-forwarding; ordinary locale variables remain supported. No callback input reaches
-the ACP child. Existing explicit-config/profile precedence remains unchanged.
+Prompts containing their callback ID/URL are rejected. The launcher strips
+`LC_TASK_CALLBACK*`, `OPENCODE_TASK_CALLBACK*` and any value containing a `tcb_`
+bearer. Ordinary locale variables remain inherited. No callback input reaches the
+ACP child. Existing explicit-config/profile precedence remains unchanged.
 
 ## Persistence and execution
 
@@ -114,6 +114,14 @@ Status/passive watch/outbox recovery needs no provider credentials. Queued execu
 needs the usual launch environment. Startup can recover unsent callbacks without
 keys; supply normal provider configuration and run `recover` to launch queued work
 that could not start. Provider credentials are not stored in task records.
+
+提交 launcher、detached worker、acpx owner 和 OpenCode 子进程默认继承各次启动进程的
+环境，包括代理、自定义认证、其他 Provider 和 disabled MCP 变量。help/version、被动恢复
+和外部配置也不删除这些变量。模块管理的 HOME/XDG/TMPDIR、配置/任务控制变量仍由模块
+覆盖，回调字段和值仍过滤；见 [Launch environment](README.md#launch-environment)。
+环境不写入任务记录。重启后的 `recover` 使用恢复进程当前环境，queued worker 仍校验
+已保存选择所需的 Provider/MCP 配置。
+
 Deny-all/noninteractive-deny remains the default. An already authorized caller may
 explicitly select `--permission-mode deny-all|approve-reads|approve-all` for one
 task. `approve-all` requires existing user scope for that task's edits/commands;
@@ -148,7 +156,7 @@ session and context while each notifies once.
 
 旧记录不增加模型字段、不回写已封存结果，已 dispatch 请求仍按原 request ID 被动恢复/取消。
 旧 named session 无模型绑定，拒绝新选择自动接管。旧 queued 记录未保存选择，
-不能直接套用新的 codex 默认；请在原工具版本环境中，或使用原完整外部配置及 allowlist 恢复。
+不能直接套用新的 codex 默认；请在原工具版本环境中，或使用原完整外部配置及所需启动环境恢复。
 `runtime_profile=none` 且无外部完整配置时，保留原显式 readiness 契约，模型参数需完整配置。
 
 Cancellation always targets the original request ID, including an active request
@@ -219,7 +227,9 @@ preservation and permissions; Terraform mock validation is separate.
 The installed CLI fixture uses the actual wrapper/private Node/acpx path to prove
 task-scoped permission/policy, named-session continuity, callback secrecy, driver
 recovery, and cancellation isolation from another queued run. It also checks that
-the global deny-all config remains unchanged.
+the global deny-all config remains unchanged. Synthetic unlisted proxy, custom
+authentication, other-provider and disabled-MCP variables cross the detached launch
+chain by default; callback names/bearers remain filtered.
 
 双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
 去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用

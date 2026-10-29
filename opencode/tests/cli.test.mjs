@@ -68,7 +68,6 @@ test(
         install_root: root,
         workspace_id: "cli-fixture",
         runtime_profile: "env",
-        runtime_env_allowlist: ["TASK_FIXTURE_LOG", "TASK_FIXTURE_CONTROL_LOG", "TASK_FIXTURE_REFUSE_MODEL"],
       }),
       { mode: 0o600 },
     );
@@ -114,6 +113,17 @@ test(
       OPENCODE_ACP_REQUIRED_MODEL: "fixture/test",
       TASK_FIXTURE_LOG: executions,
       TASK_FIXTURE_CONTROL_LOG: path.join(base, 'controls'),
+      TASK_FIXTURE_ENV_CHECK: '1',
+      HTTP_PROXY: 'http://proxy.example.invalid:8080',
+      https_proxy: 'http://proxy.example.invalid:8443',
+      ALL_PROXY: 'socks5://proxy.example.invalid:1080', NO_PROXY: 'localhost,127.0.0.1',
+      UNLISTED_SERVICE_CREDENTIAL: 'synthetic-custom-auth', UNLISTED_SETTING: 'arbitrary value 值',
+      ANTHROPIC_API_KEY: 'synthetic-other-provider', LLM_API_KEY: 'synthetic-legacy-key',
+      FIRECRAWL_MCP_ENABLED: '0', FIRECRAWL_MCP_API_KEY: 'synthetic-disabled-mcp',
+      FIRECRAWL_MCP_URL: 'ignored invalid endpoint while disabled', LC_ALL: 'C.UTF-8',
+      LC_TASK_CALLBACK_URL: 'https://private.example.invalid/api/agents/task-callbacks',
+      OPENCODE_TASK_CALLBACK_CONTROL: 'private-protocol-field',
+      UNLISTED_CALLBACK_BEARER: `Bearer tcb_${'e'.repeat(43)}`,
       CODEX_BASE_URL: 'https://codex.example.invalid/v1', CODEX_API_KEY: 'synthetic-codex',
       COPILOT_BASE_URL: 'https://copilot.example.invalid/v1', COPILOT_API_KEY: 'synthetic-copilot',
     };
@@ -206,6 +216,8 @@ test(
           "utf8",
         ),
       );
+      assert.equal(stored.resultStatus, 'success');
+      assert.equal(JSON.parse(stored.body).output, 'Pinned ACP result');
       assert.equal(stored.requestId, accepted.request_id);
       const load = (id) =>
         JSON.parse(
@@ -393,6 +405,7 @@ test(
       assert.equal(selection.model, 'copilot/gpt-6-astra'); assert.equal(selection.effort, 'high');
       assert.deepEqual(selection.title, { providerID: 'copilot', model: 'gpt-6.1-sol', variant: 'low' });
       assert.deepEqual(selection.env, ['CODEX_API_KEY', 'COPILOT_API_KEY']);
+      assert.equal(selection.inheritedEnvironment, true);
       assert.deepEqual(JSON.parse(cli(['status', chosen.task_id]).stdout).model, 'copilot/gpt-6-astra');
       assert.equal(JSON.parse(cli(['status', chosen.task_id]).stdout).variant, 'high');
       assert.equal(cli([...modelArgs.slice(0, -1), 'max'], registrationFor('c')).status, 1);

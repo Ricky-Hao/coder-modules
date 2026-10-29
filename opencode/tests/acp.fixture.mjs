@@ -9,6 +9,16 @@ const send = (value) =>
 let active;
 let turns = 0;
 const config = process.env.OPENCODE_CONFIG ? JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, 'utf8')) : {};
+// Check only synthetic fields. Never serialize the child's environment or values.
+const inheritedEnvironment = () => Object.entries({
+  HTTP_PROXY: 'http://proxy.example.invalid:8080', https_proxy: 'http://proxy.example.invalid:8443',
+  ALL_PROXY: 'socks5://proxy.example.invalid:1080', NO_PROXY: 'localhost,127.0.0.1',
+  UNLISTED_SERVICE_CREDENTIAL: 'synthetic-custom-auth', UNLISTED_SETTING: 'arbitrary value 值',
+  ANTHROPIC_API_KEY: 'synthetic-other-provider', LLM_API_KEY: 'synthetic-legacy-key',
+  FIRECRAWL_MCP_ENABLED: '0', FIRECRAWL_MCP_API_KEY: 'synthetic-disabled-mcp',
+  FIRECRAWL_MCP_URL: 'ignored invalid endpoint while disabled', LC_ALL: 'C.UTF-8',
+}).every(([name, value]) => process.env[name] === value) &&
+  !Object.hasOwn(config.mcp?.servers ?? {}, 'firecrawl');
 let model = process.env.TASK_FIXTURE_REFUSE_MODEL ? 'fixture/refused' : process.env.OPENCODE_ACP_REQUIRED_MODEL ?? 'fixture/test';
 let effort = process.env.OPENCODE_ACP_REQUIRED_VARIANT ?? 'default';
 const configOptions = () => [
@@ -57,14 +67,18 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     const text = request.params.prompt.map((part) => part.text ?? "").join("");
     if (
       text.includes("tcb_") ||
-      Object.values(process.env).some((value) =>
-        /tcb_[A-Za-z0-9_-]{43}/.test(value),
+      Object.entries(process.env).some(([name, value]) =>
+        /^(LC_TASK_CALLBACK|OPENCODE_TASK_CALLBACK)/.test(name) || /tcb_[A-Za-z0-9_-]{43}/.test(value),
       )
     ) {
       send({
         id: request.id,
         error: { code: -32602, message: "Callback leaked to ACP fixture" },
       });
+      return;
+    }
+    if (process.env.TASK_FIXTURE_ENV_CHECK === '1' && !inheritedEnvironment()) {
+      send({ id: request.id, error: { code: -32602, message: 'Synthetic launch environment mismatch' } });
       return;
     }
     if (process.env.TASK_FIXTURE_LOG)
@@ -127,7 +141,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         },
       );
     } else if (text === 'model selection') finish(JSON.stringify({ model, effort, title: config.agents?.title?.model,
-      env: ['CODEX_API_KEY', 'COPILOT_API_KEY'].filter((name) => Boolean(process.env[name])) }));
+      env: ['CODEX_API_KEY', 'COPILOT_API_KEY'].filter((name) => Boolean(process.env[name])),
+      inheritedEnvironment: inheritedEnvironment() }));
     else if (text === "continuity") finish(`Session turn ${turns}`);
     else if (text === "wait for cancellation")
       active = { request, timer: setTimeout(() => finish(), 30000) };
