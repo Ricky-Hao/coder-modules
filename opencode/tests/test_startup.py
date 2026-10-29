@@ -266,15 +266,30 @@ class StartupTests(unittest.TestCase):
                                 env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_callback_environment_not_forwarded_even_via_lc_prefix_or_extra(self):
+    def test_callback_environment_filtered_with_full_inheritance_and_managed_path(self):
         self.fixture.install()
         import runtime
         sentinel = 'tcb_' + 'a' * 43
-        environment = runtime.environment({'LC_ALL': 'C.UTF-8', 'LC_TASK_CALLBACK_ID': sentinel,
-                                           'LC_OTHER': sentinel, 'EXTRA': sentinel},
-                                          self.fixture.root, ['EXTRA'])
-        self.assertEqual(environment['LC_ALL'], 'C.UTF-8')
-        self.assertNotIn(sentinel, json.dumps(environment))
+        env = {'LC_ALL': 'C.UTF-8', 'LC_TASK_CALLBACK_URL': 'https://callback.example.invalid',
+               'OPENCODE_TASK_CALLBACK_ID': 'private-id', 'OPENCODE_TASK_CALLBACK_EXTRA': 'private-control',
+               'LC_OTHER': sentinel, 'EXTRA': 'Bearer ' + sentinel, 'UNLISTED_AUTH': 'synthetic-normal-auth',
+               'PATH': '/synthetic/' + sentinel + ':/usr/bin:/bin'}
+        before = dict(env)
+        for profile, args in (('none', []), ('env', ['--help'])):
+            environment = runtime.environment(env, self.fixture.root, profile, arguments=args)
+            self.assertEqual(environment['LC_ALL'], 'C.UTF-8')
+            self.assertEqual(environment['UNLISTED_AUTH'], env['UNLISTED_AUTH'])
+            self.assertEqual(environment['PATH'], '/usr/bin:/bin')
+            for name in ('LC_TASK_CALLBACK_URL', 'OPENCODE_TASK_CALLBACK_ID', 'OPENCODE_TASK_CALLBACK_EXTRA',
+                         'LC_OTHER', 'EXTRA'):
+                self.assertNotIn(name, environment)
+            self.assertNotIn(sentinel, json.dumps(environment))
+        self.assertEqual(env, before)
+
+        # Validating a selected profile must not reinsert a callback-shaped key.
+        with self.assertRaisesRegex(runtime.profiles.ProfileError, 'CODEX_API_KEY'):
+            runtime.environment({'CODEX_BASE_URL': 'https://codex.example.invalid', 'CODEX_API_KEY': sentinel},
+                                self.fixture.root, 'env')
 
     def test_cancelled_queued_task_launcher_needs_no_provider_credentials(self):
         self.fixture.bundle['config']['runtime_profile'] = 'env'

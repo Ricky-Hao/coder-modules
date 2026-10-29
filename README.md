@@ -26,6 +26,8 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
   source candidate; read its publication boundary before selecting a fixed revision.
   内置 copilot、codex 默认使用 codex；四个独立环境变量及单任务选模型见
   [Provider 说明](opencode/PROVIDERS.md)。
+  launcher 默认继承启动进程环境；模块目录覆盖和回调保护见
+  [Launch environment](opencode/README.md#launch-environment)。
 
 e.g.
 

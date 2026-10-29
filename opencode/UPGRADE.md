@@ -38,7 +38,7 @@ binary SHA256 为 `444fdfcef16e7e183071bdefd9620cc9af5c3796a1037cf15ca2bbfb8c43b
 安装保留任务、session、cache、旧工具版本及 toolset 外的目录，不做破坏性迁移。
 已 dispatch 请求按原 request ID 恢复或取消，不重复 dispatch，也不重写已封存结果。
 旧 queued 记录没有模型意图，不能套用新 codex 默认；需在原工具版本环境中，
-或用原完整外部配置与 allowlist 恢复。旧 named session 没有模型绑定时拒绝新选择接管。
+或用原完整外部配置与所需启动环境恢复。旧 named session 没有模型绑定时拒绝新选择接管。
 详见 [TASKS.md](TASKS.md)。
 
 ## 本地验收与数据库疑点

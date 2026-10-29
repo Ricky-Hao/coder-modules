@@ -120,9 +120,9 @@ run "oversized_startup" {
   command = plan
   variables {
     agent_id = "22222222-2222-4222-8222-222222222222"
-    # Valid but deliberately incompressible extra names exercise the actual
-    # rendered script, rather than checking a duplicate compression formula.
-    runtime_env_allowlist = [for index in range(1024) : "EXTRA_${sha256(tostring(index))}"]
+    # A synthetic canonical path grows the actual compressed payload beyond budget.
+    # Plan only: this existing input never reaches installation or the filesystem.
+    install_root = "/mnt/${join("/", [for index in range(1024) : sha256(tostring(index))])}/toolset"
   }
   expect_failures = [coder_script.opencode]
 }

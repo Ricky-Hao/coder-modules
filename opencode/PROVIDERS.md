@@ -26,10 +26,10 @@ loopback 可用 HTTP；禁止 URL 用户信息、query、fragment、控制字符
 ### 从 LLM_* 迁移
 
 1. 在原 Secret/env 管理处，将原服务分别配置到 `COPILOT_BASE_URL`、`COPILOT_API_KEY`。
-   操作者自行在该机制内处理值；模块不会读取或迁移旧 `LLM_BASE_URL`、`LLM_API_KEY`。
+   操作者自行在该机制内处理值；内置 profile 不使用或迁移旧 `LLM_BASE_URL`、`LLM_API_KEY`。
 2. 在同一机制中独立填写 `CODEX_BASE_URL`、`CODEX_API_KEY`，供默认任务使用。
-3. 后续新启动的进程须获得新变量。内置 env profile 自动转发有效变量对和所需 MCP 变量，
-   无需为这四个变量新增 allowlist。未注入 codex 时，可显式提交 copilot 任务。
+3. 后续新启动的进程须获得新变量。launcher 默认继承启动进程的普通环境变量，无需列变量名。
+   未注入 codex 时，可显式提交 copilot 任务。
 4. 确认其他调用方已迁移后，再由操作者移除旧 LLM_*。内置 profile 不静默兼容旧名。
 
 本次源码修改不注入凭据，不更新模板、不重启 Workspace，也不替换当前运行的工具。
@@ -53,7 +53,7 @@ opencode-task submit --key astra-job --model copilot/gpt-6-astra --variant high 
 
 两个模型均保留 context=400000、input=272000、output=128000，以及原完整
 cost、capabilities、settings 和五个 variants。compaction buffer 仍为 13600。
-MCP 开关、header、凭据转发和默认 disabled 行为保持。
+MCP 开关、header 和默认 disabled 行为保持；disabled 只省略服务配置，环境变量仍继承。
 
 提交前会生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider 的
 Sol/low title。任务记录保存非秘密选择与配置路径，纳入去重；恢复不重新解释默认值。
@@ -67,15 +67,16 @@ Sol/low title。任务记录保存非秘密选择与配置路径，纳入去重�
 
 旧记录仍可读取，已 dispatch 的请求只按原 request ID watch/cancel，已封存回调不重写。
 旧 named session 没有模型绑定，不能由新选择自动接管。旧 queued 记录未保存模型意图，
-新 env 默认不会重解释它；需在原安装版本的工具环境中恢复，或显式提供原完整外部配置与 allowlist
-后恢复。原任务/session/cache 均不迁移或删除。
+新 env 默认不会重解释它；需在原安装版本的工具环境中恢复，或显式提供原完整外部配置与所需
+启动环境后恢复。原任务/session/cache 均不迁移或删除。
 
 ## 外部配置优先级
 
 非空 `OPENCODE_MODULE_CONFIG` 仍优先于内置 env profile。原完整 JSON 的 model 作为
-不写参数时的默认值，外部配置所需变量仍须显式列入 `runtime_env_allowlist`；模块不自动注入
-上述四个变量或 MCP 值。旧外部 JSON 若仍引用 LLM_*，须由操作者修改引用和 allowlist，
-也可按原外部契约继续自行维护；这不构成内置 profile 的变量回退。
+不写参数时的默认值，外部配置所需变量默认从启动进程继承，可直接使用 `{env:NAME}`。
+旧外部 JSON 可继续自行维护 LLM_* 引用；这不构成内置 profile 的变量回退。
+代理、自定义认证和其他 Provider/MCP 变量同样继承；模块覆盖及回调保护见
+[Launch environment](README.md#launch-environment)。
 
 任务模型参数会在该完整配置的私有快照中覆盖主模型，并将 title 固定到所选 Provider 的
 同名标题模型/low（没有该标题模型时用所选主模型/low）。不会修改原文件。

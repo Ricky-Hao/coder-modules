@@ -61,7 +61,7 @@ def enabled_servers(environ):
 
 
 def configuration(environ, version, provider='codex'):
-    """Validate only selected credentials; return settings with refs and allowed names."""
+    """Validate configured providers/enabled MCP; return settings with env references."""
     enabled = enabled_servers(environ)
     if provider not in PROVIDERS:
         raise ValueError('unknown env-profile provider')
@@ -77,7 +77,6 @@ def configuration(environ, version, provider='codex'):
         endpoint(environ, name.upper() + '_BASE_URL')
     config = json.loads((version / 'profile-env.json').read_text())
     servers = config['mcp']['servers']
-    allowed = required & set(LLM_KEYS)
     for name in MCP_NAMES:
         prefix = name + '_MCP_'
         server_name = name.lower().replace('_', '-')
@@ -95,9 +94,7 @@ def configuration(environ, version, provider='codex'):
             raise ProfileError('invalid', [prefix + 'AUTH_SCHEME'])
         server['headers'] = {header: (scheme + ' ' if scheme else '') + '{env:' + prefix + 'API_KEY}'}
         server['disabled'] = False
-        # Controls must survive acpx -> opencode so the same profile is reconstructed.
-        allowed.update(prefix + suffix for suffix in ('URL', 'API_KEY', 'ENABLED', 'AUTH_HEADER', 'AUTH_SCHEME'))
-    return config, allowed
+    return config
 
 
 def selection(model, variant=None):
@@ -205,7 +202,7 @@ def materialize(root, workspace_id, config):
 
 
 def harmless(arguments):
-    # Help/version never validate, retain profile credentials, or generate config.
+    # Help/version skip profile validation and config generation; env still inherits.
     # Do not treat arbitrary prompts/arguments containing '--help' as introspection.
     return arguments in (['--version'], ['-v'], ['-V']) or bool(arguments) and arguments[-1] in ('--help', '-h') and all(
         re.fullmatch(r'[a-z][a-z0-9-]*', part) for part in arguments[:-1])

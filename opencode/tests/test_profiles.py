@@ -138,9 +138,9 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'codex/gpt-6.1-sol')
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(child['OPENCODE_ACP_CATALOG_TIMEOUT_MS'], '30000')
-        for name in ('FIRECRAWL_MCP_API_KEY', 'FIRECRAWL_MCP_URL', 'CODER_AGENT_TOKEN',
-                     'GITHUB_TOKEN', 'SSH_AUTH_SOCK', 'OPENCODE_CONFIG_CONTENT'):
-            self.assertNotIn(name, child)
+        for name in self.env.keys() - {'OPENCODE_CONFIG_CONTENT'}:
+            self.assertEqual(child[name], self.env[name], name)
+        self.assertNotIn('OPENCODE_CONFIG_CONTENT', child)
         path = Path(child['OPENCODE_CONFIG'])
         self.assertEqual(path.parent, self.root / 'runtime/module-profiles')
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -156,8 +156,7 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse((self.root / 'runtime/config/opencode/opencode.json').exists())
         self.no_serialized_values()
 
-    def test_explicit_enable_headers_schemes_and_disabled_extras(self):
-        self.fixture.bundle['config']['runtime_env_allowlist'] = ['CONTEXT7_MCP_API_KEY', 'TEST_PROVIDER_KEY']
+    def test_explicit_enable_headers_schemes_and_disabled_environment(self):
         self.fixture.install()
         self.env['TEST_PROVIDER_KEY'] = 'SENTINEL-USER-EXTRA'
         for name in profiles.MCP_NAMES:
@@ -184,8 +183,9 @@ class ProfileTests(unittest.TestCase):
         self.env['CONTEXT7_MCP_ENABLED'] = '0'
         self.env['CONTEXT7_MCP_AUTH_HEADER'] = 'bad header ignored while disabled'
         child = json.loads(self.call().stdout)['env']
-        self.assertNotIn('CONTEXT7_MCP_API_KEY', child)  # Extras cannot undo disabled-service gating.
-        self.assertNotIn('CONTEXT7_MCP_AUTH_HEADER', child)
+        self.assertEqual(child['CONTEXT7_MCP_API_KEY'], self.env['CONTEXT7_MCP_API_KEY'])
+        self.assertEqual(child['CONTEXT7_MCP_AUTH_HEADER'], self.env['CONTEXT7_MCP_AUTH_HEADER'])
+        self.assertNotIn('context7', json.loads(Path(child['OPENCODE_CONFIG']).read_text())['mcp']['servers'])
         self.no_serialized_values()
 
     def test_missing_and_invalid_values_fail_before_exec_with_names_only(self):
@@ -220,12 +220,18 @@ class ProfileTests(unittest.TestCase):
 
     def test_help_version_and_module_info_without_credentials_or_writes(self):
         self.fixture.install()
+        env = {'PATH': '/usr/bin:/bin', 'LLM_API_KEY': 'INVALID\nSECRET',
+               'CODEX_API_KEY': 'SYNTHETIC-HELP-KEY', 'FIRECRAWL_MCP_ENABLED': 'invalid',
+               'UNLISTED_AUTH': 'SYNTHETIC-HELP-AUTH'}
         for tool in ('opencode', 'acpx'):
             for args in (['--version'], ['-v'], ['-V'], ['--help'], ['mcp', '--help']):
-                result = self.call(tool, args, {'PATH': '/usr/bin:/bin', 'LLM_API_KEY': 'INVALID\nSECRET',
-                                              'FIRECRAWL_MCP_ENABLED': 'invalid'})
+                result = self.call(tool, args, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotIn('INVALID', result.stdout)
+                if tool == 'acpx' and args[-1] == '--version' or tool == 'opencode' and args == ['--version']:
+                    continue  # These synthetic executables report only their version.
+                child = json.loads(result.stdout)['env']
+                for name, value in env.items():
+                    self.assertEqual(child[name], value, name)
             result = self.call(tool, ['--module-profile-info'], {'PATH': '/usr/bin:/bin'})
             self.assertEqual(result.returncode, 0, result.stderr)
             info = json.loads(result.stdout)
@@ -237,7 +243,7 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(profiles.harmless(['run', '--', '--help']))
         self.assertFalse(profiles.harmless(['run', 'prompt with spaces', '--help']))
 
-    def test_external_config_overrides_profile_without_automatic_credentials(self):
+    def test_external_config_overrides_profile_and_inherits_environment(self):
         self.fixture.install()
         self.assertEqual(self.call().returncode, 0)  # Leave a prior generated profile to test isolation.
         external = self.base / 'external config.json'
@@ -251,15 +257,11 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(child['OPENCODE_CONFIG'], str(external))
             self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'external/model')
             self.assertNotIn('OPENCODE_ACP_REQUIRED_VARIANT', child)
-            self.assertNotIn('CODEX_API_KEY', child)
-            self.assertNotIn('CONTEXT7_MCP_ENABLED', child)
-        self.fixture.bundle['config']['runtime_env_allowlist'].append('CODEX_API_KEY')
-        self.fixture.install()
-        result = self.call(env=env)
-        self.assertEqual(json.loads(result.stdout)['env']['CODEX_API_KEY'], env['CODEX_API_KEY'])
+            self.assertEqual(child['CODEX_API_KEY'], env['CODEX_API_KEY'])
+            self.assertEqual(child['CONTEXT7_MCP_ENABLED'], env['CONTEXT7_MCP_ENABLED'])
         self.assertEqual(json.loads(self.call(args=['--module-profile-info'], env=env).stdout)['source'], 'external')
 
-    def test_no_profile_legacy_behavior_and_no_stale_native_config(self):
+    def test_no_profile_inherits_environment_without_stale_native_config(self):
         self.fixture.install()
         self.assertEqual(self.call().returncode, 0)
         self.fixture.bundle['config']['runtime_profile'] = 'none'
@@ -267,7 +269,7 @@ class ProfileTests(unittest.TestCase):
         result = self.call(args=['run', 'fixture'])
         self.assertEqual(result.returncode, 0, result.stderr)
         child = json.loads(result.stdout)['env']
-        self.assertNotIn('CODEX_API_KEY', child)
+        self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
         self.assertNotIn('OPENCODE_CONFIG', child)
         self.assertNotIn('OPENCODE_ACP_REQUIRED_MODEL', child)
         self.assertNotEqual(self.call().returncode, 0)
@@ -275,7 +277,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_concurrent_first_launch_serializes_directory_and_marker(self):
         self.fixture.install()
-        config, _ = profiles.configuration(self.env, fixtures.SCRIPTS)
+        config = profiles.configuration(self.env, fixtures.SCRIPTS)
         context = multiprocessing.get_context('fork')
         created, resume = context.Event(), context.Event()
         observations, results = context.Queue(), context.Queue()
@@ -348,7 +350,7 @@ class ProfileTests(unittest.TestCase):
                 self.assertNotEqual(self.call().returncode, 0)
                 if kind == 'changed': self.assertEqual(path.read_text(), 'unmanaged user config')
         path.unlink()
-        cfg, _ = profiles.configuration(self.env, fixtures.SCRIPTS)
+        cfg = profiles.configuration(self.env, fixtures.SCRIPTS)
         with patch.object(profiles.os, 'link', side_effect=OSError('simulated publication failure')):
             with self.assertRaises(OSError): profiles.materialize(self.root, 'test-workspace', cfg)
         self.assertFalse(path.exists())
@@ -371,8 +373,8 @@ else:
     assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
     assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.1-sol'
     assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
-    assert 'CONTEXT7_MCP_API_KEY' not in os.environ
-    assert 'FIRECRAWL_MCP_API_KEY' not in os.environ
+    for name in ('CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY', 'UNLISTED_SERVICE_AUTH', 'HTTPS_PROXY'):
+        assert name in os.environ
     config=json.loads((Path(os.environ['HOME'])/'.acpx/config.json').read_text())
     argv=config['agents']['opencode']['argv']
     os.execve(argv[0], argv, dict(os.environ))
@@ -380,11 +382,11 @@ else:
         fixtures.archive(self.fixture.node, {
             'node-v22.23.4-linux-x64/bin/node': node_program,
             'node-v22.23.4-linux-x64/lib/node_modules/npm/bin/npm-cli.js': 'fixture'})
-        self.fixture.bundle['config']['runtime_env_allowlist'] += [
-            'CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY']
         self.fixture.install()
         self.env.update(CONTEXT7_MCP_ENABLED='0', CONTEXT7_MCP_API_KEY='SENTINEL-DISABLED-CONTEXT7',
-                        FIRECRAWL_MCP_API_KEY='SENTINEL-ABSENT-FLAG-FIRECRAWL')
+                        FIRECRAWL_MCP_API_KEY='SENTINEL-ABSENT-FLAG-FIRECRAWL',
+                        UNLISTED_SERVICE_AUTH='SENTINEL-CUSTOM-AUTH', HTTPS_PROXY='http://proxy.example.invalid:8080',
+                        ANTHROPIC_API_KEY='SENTINEL-OTHER-PROVIDER', LLM_API_KEY='SENTINEL-LEGACY')
         self.enable('GITHUB_ACTIONS')
         self.env['GITHUB_ACTIONS_MCP_AUTH_HEADER'] = 'Authorization'
         self.env['GITHUB_ACTIONS_MCP_AUTH_SCHEME'] = 'Token'
@@ -396,8 +398,8 @@ else:
         self.assertEqual(actual['env']['PATH'], self.env['PATH'])
         self.assertEqual(actual['env']['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(actual['env']['GITHUB_ACTIONS_MCP_AUTH_SCHEME'], 'Token')
-        self.assertNotIn('CONTEXT7_MCP_API_KEY', actual['env'])
-        self.assertNotIn('FIRECRAWL_MCP_API_KEY', actual['env'])
+        for name in self.env.keys() - {'OPENCODE_CONFIG_CONTENT'}:
+            self.assertEqual(actual['env'][name], self.env[name], name)
         cfg = json.loads(Path(actual['env']['OPENCODE_CONFIG']).read_text())
         bundled = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
         for key in ('model', 'providers', 'agents', 'compaction'):
@@ -432,7 +434,7 @@ else:
         self.assertEqual((self.root / 'active').resolve(), previous)
         child = json.loads(self.call(args=['run', 'fixture']).stdout)['env']
         self.assertNotIn('OPENCODE_CONFIG', child)
-        self.assertNotIn('CODEX_API_KEY', child)
+        self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
 
     def test_selected_provider_pair_optional_other_and_no_legacy_fallback(self):
         self.fixture.install()
@@ -440,7 +442,7 @@ else:
                    'COPILOT_API_KEY': 'SYNTHETIC-COPILOT'}
         args = ['submit', '--key', 'fixture', '--prompt-file', 'unused', '--model', 'copilot/gpt-6.1-sol']
         import runtime
-        child = runtime.environment(copilot, self.root, [], 'env', 'test-workspace', args, submit=True)
+        child = runtime.environment(copilot, self.root, 'env', 'test-workspace', args, submit=True)
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
         self.assertNotIn('CODEX_API_KEY', child)
         selected = json.loads(child['OPENCODE_MODULE_TASK_SELECTION'])
@@ -448,12 +450,12 @@ else:
         cfg = json.loads(Path(child['OPENCODE_CONFIG']).read_text())
         self.assertEqual(cfg['agents']['title']['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'})
         task = {'model': selected, 'modelConfig': child['OPENCODE_CONFIG'], 'modelProfile': 'env'}
-        second = runtime.environment(child, self.root, [], 'env', 'test-workspace', ['acp'], task)
+        second = runtime.environment(child, self.root, 'env', 'test-workspace', ['acp'], task)
         self.assertEqual(second['COPILOT_API_KEY'], copilot['COPILOT_API_KEY'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_MODEL'], selected['id'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertNotIn('CODEX_API_KEY', second)
-        astra = runtime.environment(copilot, self.root, [], 'env', 'test-workspace',
+        astra = runtime.environment(copilot, self.root, 'env', 'test-workspace',
                                     [*args[:-1], 'copilot/gpt-6-astra'], submit=True)
         self.assertEqual(json.loads(astra['OPENCODE_MODULE_TASK_SELECTION'])['variant'], 'medium')
         for pair in (copilot, {'LLM_BASE_URL': 'https://old.example.invalid', 'LLM_API_KEY': 'SECRET-OLD'}):
@@ -494,7 +496,7 @@ else:
                 self.assertNotIn('CODEX_API_KEY', child)
             self.assertEqual(filename.read_bytes(), before)
 
-    def test_external_task_snapshot_keeps_allowlist_contract_without_original_path_env(self):
+    def test_external_task_snapshot_inherits_environment_without_original_path_env(self):
         import runtime
         self.fixture.install()
         source = self.base / 'external.json'
@@ -502,22 +504,23 @@ else:
         source.write_text(json.dumps(config))
         source.chmod(0o600)
         before = source.read_bytes()
-        names = ['COPILOT_API_KEY', 'COPILOT_BASE_URL']
         env = {'PATH': '/usr/bin:/bin', 'OPENCODE_MODULE_CONFIG': str(source),
-               'COPILOT_API_KEY': 'SYNTHETIC', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1'}
-        child = runtime.environment(env, self.root, names, 'env', 'test-workspace',
+               'COPILOT_API_KEY': 'SYNTHETIC', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1',
+               'EXTERNAL_AUTH_TOKEN': 'SYNTHETIC-EXTERNAL', 'CONTEXT7_MCP_API_KEY': 'SYNTHETIC-DISABLED'}
+        child = runtime.environment(env, self.root, 'env', 'test-workspace',
                                     ['submit', '--model', 'copilot/gpt-6.1-sol'], submit=True)
         self.assertEqual(child['OPENCODE_MODULE_TASK_PROFILE'], 'external')
         task = {'model': json.loads(child['OPENCODE_MODULE_TASK_SELECTION']),
                 'modelConfig': child['OPENCODE_MODULE_TASK_CONFIG'], 'modelProfile': 'external'}
         del env['OPENCODE_MODULE_CONFIG']
-        restored = runtime.environment(env, self.root, names, 'env', 'test-workspace', ['acp'], task)
-        self.assertEqual(restored['COPILOT_API_KEY'], env['COPILOT_API_KEY'])
+        restored = runtime.environment(env, self.root, 'env', 'test-workspace', ['acp'], task)
+        for name, value in env.items():
+            self.assertEqual(restored[name], value, name)
         self.assertNotIn('CODEX_API_KEY', restored)
         self.assertEqual(restored['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
         self.assertEqual(source.read_bytes(), before)
 
-    def test_payload_allowlist_profile_validation_and_cached_profile_inventory(self):
+    def test_required_payload_profile_validation_and_cached_profile_inventory(self):
         for name in ('profiles.py', 'profile-env.json', 'shell_path.py'):
             bundle = copy.deepcopy(self.fixture.bundle)
             bundle['files'].pop(name)

@@ -60,16 +60,6 @@ variable "runtime_profile" {
   }
 }
 
-variable "runtime_env_allowlist" {
-  description = "Additional child environment variable NAMES, never values. Disabled MCP credentials remain filtered in env profile mode."
-  type        = set(string)
-  default     = []
-  validation {
-    condition     = alltrue([for key in var.runtime_env_allowlist : can(regex("^[A-Za-z_][A-Za-z0-9_]*$", key))])
-    error_message = "Only environment variable names are accepted."
-  }
-}
-
 variable "start_blocks_login" {
   description = "Wait for installation and Bash profile integration. Agent readiness alone does not prove tool readiness."
   type        = bool

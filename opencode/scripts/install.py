@@ -52,9 +52,6 @@ def validate(config):
         raise ValueError('expected an absolute private installation root')
     if root.parts[1] in ('usr', 'etc', 'bin', 'sbin', 'lib', 'lib64', 'boot', 'dev', 'proc', 'sys', 'opt'):
         raise ValueError('system/global installation paths are prohibited')
-    for key in config['runtime_env_allowlist']:
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
-            raise ValueError('invalid runtime environment name')
 
 
 def prerequisites():
