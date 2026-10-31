@@ -5,7 +5,7 @@
 model selection, provider/MCP profile and permission defaults. No acpx patch,
 session migration, parent-volume ownership change, or task dashboard is involved.
 
-The installer bundles/fingerprints/inventories `task.mjs`, `task-read.mjs`, `diagnostics.py`, `task-cli.mjs`,
+The installer bundles/fingerprints/inventories `task.mjs`, `task-read.mjs`, `task-launch.mjs`, `diagnostics.py`, `task-cli.mjs`,
 `task-acp.mjs` and `task-supervisor.mjs`, installs
 `bin/opencode-task`, and invokes `recover` on startup. Terraform exposes the
 shell-quoted `opencode_task_command`. Repeat installation preserves `runtime/tasks`,
@@ -64,6 +64,119 @@ takes both task locks and rechecks that no worker attempted execution before
 sealing a safe setup error. It retains the monitor lock and retries the outbox;
 an existing concurrent monitor keeps ownership.
 An unsent outbox survives for startup or `recover TASK_ID`.
+
+### 高层 launch 入口
+
+Agent 通过现有 Workspace Bash 调用 `opencode-task launch`。不新增 MCP tool、`start`、
+clone、仓库或远端。调用会立即尝试准备和派发，成功的 `accepted: true` 只表示私有请求已持久化、
+monitor 已确认接管，不证明 ACP 或模型已开始。初始化前的 `selection.status` 始终为 `resolved`。
+
+三次调用：
+
+1. Agent 调用已有 `create_task_callback`，取得完整原生注册对象，沿该工具的 schema 和授权范围。
+2. 用现有文件写入工具将任务 JSON 写到仓库外的私有文件。父目录须由当前 UID 拥有、mode 0700；
+   文件须是当前 UID 的普通文件、单链接、mode 0600，无 symlink 路径。注册对象原样放在 `callback`。
+   通过私有文件/stdio 转交；不要将注册对象放进 shell `-c`/heredoc、echo 参数、环境变量或业务 prompt。
+3. Workspace Bash 只传文件路径：
+
+```sh
+opencode-task launch --input-file /private/task-inputs/review-1.json
+# 新一轮修正：先重新注册 callback，再写增量输入。
+opencode-task launch --continue-from task_<原轮64位摘要> --input-file /private/task-inputs/review-2.json
+# 同一运行的传输/准备重试：相同 key、原注册、相同输入，重复原命令。
+```
+
+`/private/task-inputs` 是示意路径，须换成实际满足上述权限的目录。JSON 示例不含真实 bearer：
+
+```json
+{
+  "schema_version": 1,
+  "key": "review-1",
+  "repo_path": "/workspaces/project",
+  "branch": "feat/review-1",
+  "worktree": "project-review-1",
+  "prompt": "在此 worktree 完成已授权修改并报告实际测试。",
+  "callback": {
+    "callback_id": "<原生工具返回的私密值>",
+    "callback_url": "https://chat.example.invalid/api/agents/task-callbacks",
+    "max_output_bytes": 32768
+  },
+  "permissions": { "mode": "approve-reads", "policy": { "autoDeny": ["edit"] } },
+  "provider": "codex",
+  "model": "gpt-6.1-sol",
+  "variant": "max"
+}
+```
+
+新任务必填 `schema_version: 1`、`key`、`repo_path`、`branch`、`worktree`、`prompt`、
+`callback`。只允许这些字段及可选 `permissions/provider/model/variant`；不接受 `base_sha`。
+`key` 为 1～256 字符，不含控制字符或 `tcb_`。prompt 为非空 UTF-8 文本，最多 1 MiB。
+callback 完整对象最多 4096 字节，沿既有 URL/输出上限校验；附带原生 expiry/guidance 字段可保留。
+整个文件最多 1 MiB + 16 KiB。prompt、名称和权限策略不得携带 callback bearer/URL。
+
+`repo_path` 须为无 symlink 的绝对 Git checkout 顶层目录，已有 origin。
+`worktree` 是 1～64 位安全名称，首位为字母或数字，其余只含字母、数字、`_`、`-`；
+实际目录为 `dirname(repo_path)/worktree`，例如 `/workspaces/project-review-1`。
+branch 最长 240 字符，每个 `/` 分段以字母/数字开头，其余允许字母、数字、`.`、`_`、`-`；
+禁止 `HEAD`、`..`、末尾点、`.lock` 和 `tcb_`。输入整体及选择在 Git 修改前校验。
+
+launch 沿当前 HOME、Git SSH 身份、hostkey、PATH 和网络环境执行 Git，清除仓库定位/index/
+对象路由变量，避免 `GIT_DIR` 等改变目标。它不更换认证，不输出 Git stderr 或 remote 值。
+新任务 fetch origin 的 `refs/heads/main` 到本次专用 ref，保存完整 SHA 后创建 branch/worktree；
+不更新原 checkout 的本地 main，不要求无关 checkout 干净。fetch 失败不会使用旧 origin/main。
+已有 branch/目录保留并报冲突，不覆盖、不换目标名称、不 stash/reset/强推或自动删除。
+
+省略选择时，保存当前解析的默认值，内置为 codex/Sol/max、同 Provider title/low。
+provider 和 model 分别表示 Provider ID、模型 ID；variant 单独表示档位。新任务只写 variant
+会调整默认模型；指定 provider/model 且省略 variant 时取目标模型默认档位。
+无效组合明确失败，不回退。外部完整配置优先级及环境过滤保持。
+`permissions` 为 `{mode,policy}`；mode 和 policy 沿低层 submit 的有限 schema。
+省略时新任务用 deny-all，续接沿保存策略；显式覆盖仅对该轮生效。approve-all 须已有任务授权。
+
+续接输入只需 `schema_version/key/prompt/callback`，可带 `permissions/provider/model/variant`；
+不接受 repo/branch/worktree。它读取原 launch 私有记录，复用 repo、branch、worktree、session、
+base_sha 和已解析选择，不再次 fetch。须从最新一轮续接，且原请求已由 canonical result、
+排队取消或未派发 setup failure 确认结束，并已有可信 backend session 身份。
+running、queued、结果未知、监督通知或人工 resolve 均不能授权另一写入者；不从 PID、
+历史 status 或 queueDepth 猜测停止。原请求缺 session 身份时报 `CONTINUE_SESSION_UNCONFIRMED`；
+续接轮在派发前取消/失败时，可沿其保存的上轮可信 session 身份继续，执行前仍须匹配。
+原低层任务没有 launch 元数据时报 `LAUNCH_METADATA_REQUIRED`，不猜目录或自动接管。
+续接执行前再次匹配原 ACP/backend 身份；会话存储缺失/变化会沿原 outbox 报 setup error，
+不新建会话来冒充上下文续接。该检查发生在持久接受后，须读取终态 callback/result。
+
+第一版保留 session 的模型、variant 和 profile 绑定。续接省略选择沿原值，显式相同选择可用；
+切换报 `SESSION_MODEL_CONFLICT`，不自动换 session 或搬迁历史。OpenCode `9291b46` 已原生支持
+ACP `session/set_config_option` 的 model/effort；缺口在 pinned acpx 0.21.1 的公共共享接口：
+`startTurn` 没有请求级 model/configOptions，`setModel/setConfigOption` 修改 session，不能和
+某条排队 prompt 原子绑定。CLI 持久 prompt 的 `--model` 可入队，但没有同等的 effort/profile
+参数；`exec --config-option` 是一次性会话。控制可在原 turn 结束前执行。
+此外本模块的配置路径/选择参与 agent argv/session 身份，title/low 属启动 profile，单改 ACP
+model 不保证 title Provider 随之切换。因此不放开绑定，也不依赖状态快照做控制切换。
+
+key 在 profile/Git 写入前领取，保存在当前私有 tasks 下 `.launches/task_<key摘要>.json`。
+记录只保存输入指纹、有限阶段、Git 对象身份、选择、权限和原 task 关联，不另存业务 prompt 或
+完整 callback；它们仍只沿现有 task.json 和 outbox。原生注册附加字段也参与输入指纹。
+同 key/同输入复用原准备与 task；异输入报 `LAUNCH_CONFLICT`。submit 锁覆盖当前合作进程的
+准备链，Git 子进程继承该锁，CLI 中断后也须等仍在运行的 Git 退出。准备中的 key/session
+不能被当前低层 submit 占用；每个续接链只允许一个最新轮次。
+
+成功 fetch 的专用 ref 固定 base，即使保存 SHA 前中断，重试也从该 ref 恢复，不跟随后续 main。
+branch 用专用 reflog 标记核对。worktree 先在同父目录的私有 `.opencode-launch-<token>` 暂存目录
+保存 inode 身份，再以 Linux/glibc `renameat2(RENAME_NOREPLACE)` 原子发布，最后由 Git 注册。
+这些准备对象不会自动删除。已记录的身份、branch、Git common dir 不符时安全拒绝。
+若刚创建暂存目录、尚未持久保存身份就中断，不能证明目录归属；保留目录并报冲突，需人工核对。
+不要以删除目录或修改元数据来自动绕过。提交响应丢失时核对原 task 的指纹关联，再接管其
+monitor/outbox；不再次提交 prompt。已 accepted 后，即使准备记录补写失败，原终态回调仍继续。
+
+launch 成功 stdout 返回稳定 JSON：`version/key/task_id/request_id/accepted/stage/reused`、
+实际 `repo_path/branch/worktree/base_sha/session/session_id`、已解析 `selection`、权限摘要和
+`durations_ms`（fetch/worktree/input/submit 的本地单调耗时，恢复后保留已有项）。
+成功退出 0；失败退出 1，同样返回安全 JSON，增加 `error:{code,hint}` 和 `outcome_unknown`。
+stage 为 validate、claimed、fetch、branch、worktree_directory、worktree、input、submit、accepted。
+未知位置/标识为 null。输出不含 callback、prompt 或 Git 原始错误。
+`outcome_unknown: true` 表示该准备/提交阶段可能留下部分对象或接管未确认，不可视为 accepted。
+已有 task 的 accepted 只在 monitor 确认或已完成交付时返回；started 仍以原任务事件为准。
+保留原文件和注册重试，按 error/code 与已知对象核对；不另开 key 自动重做未知业务。
 
 ### 只读查询与离线安装自检
 
@@ -512,10 +625,19 @@ is migrated or deleted.
 
 ## Verification and rollout boundary
 
+本轮 launch 定向检查覆盖真实本地 origin 的 main 新于本地 main/缓存、无关 dirty 保留、
+私密输入与名称/对象冲突、同 key 准备恢复和已 submit 响应丢失不重发。
+完整 CLI 用两个并发进程验证同 key 只有一个准备提交者，并验证增量续接、权限继承、
+原 session 的第二轮上下文及会话缺失时不发 prompt。
+隔离的真实发布 OpenCode `9291b46` + acpx 0.21.1 loopback 另验证 launch 默认 codex、
+显式 copilot 的主请求 max/title low，以及返回原 codex session 后携带前轮回答历史。
+均只连接本地 Responses/callback，无真实 Provider/MCP/QQ 或模板/Workspace 上线。
+
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
 python3 -B opencode/build_bundle.py --check
 node --test opencode/tests/task.test.mjs opencode/tests/task-supervisor.test.mjs
+node --test opencode/tests/task-launch.test.mjs
 node --test opencode/tests/task-read.test.mjs
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/runtime.test.mjs

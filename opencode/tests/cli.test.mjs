@@ -33,6 +33,7 @@ test(
       "profile-env.json",
       "task.mjs",
       "task-read.mjs",
+      "task-launch.mjs",
       "task-cli.mjs",
       "task-acp.mjs",
       "task-supervisor.mjs",
@@ -913,7 +914,10 @@ while True:
         try {
           await new Promise((resolve, reject) => { locker.once('error', reject); locker.stdout.once('data', resolve); });
           const beforeFailure = fs.readFileSync(legacyRunner.filename(pending.task_id));
-          assert.equal(readerCli(['_fail_launch', pending.task_id]).status, 1);
+          const refused = readerCli(['_fail_launch', pending.task_id]);
+          assert.equal(refused.status, 1, JSON.stringify({ phase: 'launch-failure-lock', lockName,
+            taskId: pending.task_id, status: refused.status, signal: refused.signal,
+            error: refused.error?.message, stdout: refused.stdout, stderr: refused.stderr }));
           assert.deepEqual(fs.readFileSync(legacyRunner.filename(pending.task_id)), beforeFailure);
         } finally {
           locker.stdin.end();
@@ -942,6 +946,76 @@ while True:
         if (lockName === 'monitor.lock') assert.equal(concurrentRecovery.status, 0, concurrentRecovery.stderr);
         assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
       }
+      phase = 'high-level-launch';
+      const gitAt = (cwd, ...args) => {
+        const value = spawnSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8' });
+        assert.equal(value.status, 0, value.stderr);
+        return value.stdout.trim();
+      };
+      const launchRepo = path.join(base, 'launch-repo'), launchOrigin = path.join(base, 'launch-origin');
+      fs.mkdirSync(launchRepo); fs.mkdirSync(launchOrigin);
+      gitAt(launchOrigin, 'init', '--bare', '--initial-branch=main');
+      gitAt(launchRepo, 'init', '--initial-branch=main');
+      gitAt(launchRepo, 'config', 'user.name', 'Fixture');
+      gitAt(launchRepo, 'config', 'user.email', 'fixture@example.invalid');
+      fs.writeFileSync(path.join(launchRepo, 'tracked'), 'base\n');
+      gitAt(launchRepo, 'add', 'tracked'); gitAt(launchRepo, 'commit', '-m', 'base');
+      gitAt(launchRepo, 'remote', 'add', 'origin', launchOrigin); gitAt(launchRepo, 'push', 'origin', 'main');
+      // 仅调用者 HOME 的 URL rewrite 能解析此 origin；launch 必须保留 Git 配置环境。
+      gitAt(base, 'config', '--file', path.join(base, '.gitconfig'), `url.${base}/.insteadOf`, 'fixture-origin:');
+      gitAt(launchRepo, 'remote', 'set-url', 'origin', 'fixture-origin:launch-origin');
+      const launchBase = gitAt(launchRepo, 'rev-parse', 'HEAD');
+      fs.writeFileSync(path.join(launchRepo, 'dirty'), 'unrelated work');
+      const launchInput = { schema_version: 1, key: 'launch-high', repo_path: launchRepo,
+        branch: 'feat/launch', worktree: 'launch-work', prompt: 'write fixture', permissions: { mode: 'approve-all' },
+        callback: { callback_id: `tcb_${'launch-high'.padEnd(43, 'q')}`, callback_url: JSON.parse(registration).callback_url } };
+      const launchFile = path.join(base, 'launch-input.json');
+      fs.writeFileSync(launchFile, JSON.stringify(launchInput), { mode: 0o600 });
+      const launchArgs = ['launch', '--input-file', launchFile];
+      const parallelLaunch = () => new Promise((resolve, reject) => {
+        const child = spawn(path.join(root, 'bin/opencode-task'), launchArgs, { cwd: base, env, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '', stderr = '';
+        child.stdout.on('data', (data) => { stdout += data; }); child.stderr.on('data', (data) => { stderr += data; });
+        child.once('error', reject); child.once('exit', (status) => resolve({ status, stdout, stderr }));
+      });
+      const beforeLaunch = fs.readFileSync(executions, 'utf8');
+      const concurrent = await Promise.all([parallelLaunch(), parallelLaunch()]);
+      for (const value of concurrent) assert.equal(value.status, 0, value.stdout + value.stderr);
+      const [created, reusedLaunch] = concurrent.map((value) => JSON.parse(value.stdout)).sort((a, b) => Number(a.reused) - Number(b.reused));
+      assert.equal(created.reused, false); assert.equal(reusedLaunch.reused, true);
+      assert.equal(created.task_id, reusedLaunch.task_id); assert.equal(created.request_id, reusedLaunch.request_id);
+      assert.equal(created.base_sha, launchBase); assert.equal(created.accepted, true);
+      const launchDone = await delivered(created.task_id);
+      assert.match(JSON.parse(launchDone.body).output, /Write permitted; turn 1/);
+      assert.equal(fs.readFileSync(path.join(launchRepo, 'dirty'), 'utf8'), 'unrelated work');
+      assert.equal(fs.readFileSync(executions, 'utf8'), beforeLaunch + 'prompt\n');
+      const retryLaunch = cli(launchArgs);
+      assert.equal(retryLaunch.status, 0, retryLaunch.stdout + retryLaunch.stderr);
+      assert.equal(JSON.parse(retryLaunch.stdout).request_id, created.request_id);
+      const incremental = { schema_version: 1, key: 'launch-follow', prompt: 'write fixture',
+        callback: { ...launchInput.callback, callback_id: `tcb_${'launch-follow'.padEnd(43, 'q')}` } };
+      fs.writeFileSync(launchFile, JSON.stringify(incremental));
+      const follow = cli([...launchArgs, '--continue-from', created.task_id]);
+      assert.equal(follow.status, 0, follow.stdout + follow.stderr);
+      const followed = JSON.parse(follow.stdout), followDone = await delivered(followed.task_id);
+      assert.equal(followed.session, created.session); assert.equal(followed.permissions.mode, 'approve-all');
+      assert.equal(followDone.handle.backendSessionId, launchDone.handle.backendSessionId);
+      assert.match(JSON.parse(followDone.body).output, /Write permitted; turn 2/);
+      assert.equal(fs.readFileSync(executions, 'utf8'), beforeLaunch + 'prompt\nprompt\n');
+      assert.equal(JSON.stringify(concurrent).includes(launchInput.callback.callback_id), false);
+      phase = 'launch-missing-session';
+      const sessionRecord = path.join(root, 'runtime/home/.acpx/sessions', `${encodeURIComponent(followDone.handle.acpxRecordId)}.json`);
+      fs.renameSync(sessionRecord, sessionRecord + '.saved');
+      try {
+        fs.writeFileSync(launchFile, JSON.stringify({ ...incremental, key: 'launch-missing',
+          callback: { ...incremental.callback, callback_id: `tcb_${'launch-missing'.padEnd(43, 'q')}` } }));
+        const missing = cli([...launchArgs, '--continue-from', followed.task_id]);
+        assert.equal(missing.status, 0, missing.stdout + missing.stderr);
+        const missingDone = await delivered(JSON.parse(missing.stdout).task_id);
+        assert.equal(missingDone.resultStatus, 'error');
+        assert.equal(missingDone.terminalSource, 'execution_setup_failure');
+        assert.equal(fs.readFileSync(executions, 'utf8'), beforeLaunch + 'prompt\nprompt\n');
+      } finally { fs.renameSync(sessionRecord + '.saved', sessionRecord); }
       // 全部断言完成后才清理 fixture；finally 会等待自有进程退出，再删除临时目录。
       assert.deepEqual(callbacks(load(stalledId)), [stalled.body, stalled.body]);
       assert.equal(peerEvents(stalled).some((event) => event.type === 'cancel'), false);

@@ -75,3 +75,16 @@ Node 22.23.4 满足 acpx 的 `>=22.13.0` 要求。官方 linux-x64 tar.xz SHA256
 注入、首次/重复启动、私有安装状态、真实模型请求与受限 MCP 行为。试点成功后，
 再将该精确模板版本设为 active。其他 Workspace 不在试点范围。
 这些生命周期动作与真实 Provider/MCP 验收尚未由本地源码检查完成。
+## 高层 launch 源码候选
+
+本候选新增 `task-launch.mjs`，通过 payload、fingerprint、inventory、doctor 和生成包安装。
+维护者修改后仍须运行 `build_bundle.py`/`--check` 及真实 Terraform render/65536 字节检查；
+不以压缩估计代替 render。`.launches` 位于原私有 `runtime/tasks`，沿原 UID/workspace owner，
+按需创建为 0700，记录为 0600。doctor 只核该容器的私有属性，不遍历业务历史。
+重复安装、缓存和专用卷 init 不迁移或删除 task/session/cache、其他版本或卷上兄弟目录。
+
+使用契约见 [TASKS.md 高层 launch](TASKS.md#高层-launch-入口)。本轮不替换当前 toolset、
+不改模板或平台 Skill。父会话独立验收后再处理 GitHub/模板与 Skill 阶段。
+续接模型切换保留拒绝；OpenCode 原生支持 model/effort，但 acpx 0.21.1 公共共享 API 无法将
+选择/profile 原子绑定到排队 prompt。新 runtime 和 CLI 检查不能证明真实 Provider/MCP/QQ
+或 Workspace 平台集成，亦不构成发布、上线、更新或重启授权。

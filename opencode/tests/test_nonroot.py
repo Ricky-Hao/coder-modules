@@ -38,3 +38,8 @@ class NonrootTests(unittest.TestCase):
             self.assertEqual(response.returncode, 0, response.stdout + response.stderr)
             self.assertIn('nonroot readonly/startup/cache/trust: passed; uid=65534', response.stdout)
             self.assertEqual(before, (pvc.stat().st_uid, pvc.stat().st_gid, pvc.stat().st_mode))
+            launch = subprocess.run([str(node), '--test', str(source / 'tests/task-launch.test.mjs')], cwd=work,
+                                    env={'PATH': '/usr/bin:/bin', 'HOME': str(work), 'TMPDIR': str(work)},
+                                    user=65534, group=65534, extra_groups=[65533],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(launch.returncode, 0, launch.stdout + launch.stderr)

@@ -18,6 +18,11 @@ the [health policy](TASKS.md#监督策略与边界) defines deadlines, configura
 不能作为业务死亡证明。
 See [TASKS.md](TASKS.md) for the CLI, private-input contract, protocol and focused
 verification.
+`opencode-task launch --input-file PRIVATE_JSON` 提供高层 Git 准备与派发入口，无新增 MCP tool。
+Agent 沿现有 callback 注册、私密文件写入和 Workspace Bash 三次调用完成提交。
+新 branch/worktree 从本次成功 fetch 的 origin/main 创建，worktree 固定落在 repo 的父目录。
+续接复用可信记录、原 session/选择和权限，须有原请求终态；第一版安全拒绝模型/档位切换。
+完整 schema、重试和具体接口缺口见 [launch 契约](TASKS.md#高层-launch-入口)。
 新增 `opencode-task list`、`inspect TASK_ID`、`doctor` 提供有界任务定位、安全历史观测和
 离线安装自检。它们不执行模型、恢复或 callback，也不初始化任务存储。分页、读取预算、
 陈旧/未知时间与失败项的解释见 [只读查询契约](TASKS.md#只读查询与离线安装自检)。
@@ -176,13 +181,19 @@ evidence. No runtime data repair or deletion is needed for this transport failur
 40722 是当时修复版本的历史数据。新增入口仍须通过当前实际 Terraform render；Python 压缩
 预算检查不能替代真实渲染。后续源码或 settings 增长可能触发 plan-time budget 拒绝。
 
-本候选使用相同配置的真实 Terraform mock plan 比较：HOME 从 65331 降为 57861 字节，
+launch 前的只读候选使用相同配置的真实 Terraform mock plan 比较：HOME 从 65331 降为 57861 字节，
 `/mnt/opencode/toolset` 从 65347 降为 57889 字节，含引号路径从 65363 降为 57905 字节。
 本轮全部配置的最大值为 57993/65536，余量 7543 字节（约 7.37 KiB），未达 8 KiB 目标。
 取舍是使用标准 XZ 和一个生成包，不继续增加定制压缩编码。65536 上限保持，超长 settings
 仍由真实 plan 拒绝；余量有限，未来增长仍须实测。真实渲染通过 Linux `env bash -c`、
 HOME/独立目录首次与离线缓存安装、恢复调用和数据保留。另以 UID 65534 验证本候选启动、
 可信 PVC group、缓存及真实 Node 的只读入口；root 只准备 `/tmp` 隔离目录，不修改真实卷。
+
+本轮 launch 的最终真实 Terraform render 为 HOME 64753、`/mnt/opencode/toolset` 64781、
+含引号路径 64797 字节；本轮测试配置最大值为 **64873/65536，余量 663 字节**。
+65536 上限保持，较长 settings 可能使 plan 拒绝，后续源码增长仍须实际 render。
+本轮也通过真实 `env bash -c` 的 HOME/独立目录首次与缓存安装、恢复和数据保留，
+并由 UID 65534 验证安装缓存、可信 PVC group、私有 launch 输入及真实本地 Git 准备。
 
 The helper appends **only the wrapper bin directory** to `.bashrc` and Bash's existing
 preferred login profile (`.bash_profile`, `.bash_login`, otherwise `.profile`). It

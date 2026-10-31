@@ -12,6 +12,7 @@ const args = process.argv.slice(2);
 const command = args.shift();
 const allowed = new Set([
   "submit",
+  "launch",
   "status",
   "result",
   "list",
@@ -25,6 +26,7 @@ const allowed = new Set([
   "_fail_launch",
 ]);
 const help =
+  "opencode-task launch --input-file PRIVATE_JSON [--continue-from TASK_ID]\n" +
   "opencode-task submit --key KEY --prompt-file FILE [OPTIONS]\nopencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task inspect TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20] [--scan-limit 100] [--cursor CURSOR]\nopencode-task doctor [--quick]\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nlist/inspect/doctor 只读，inspect 无 output。list 上限 50/200。doctor 默认完整校验；--quick 不读二进制内容/哈希。提交选项及完整边界见 TASKS.md；权限覆盖须已有授权。";
 
 async function spawnWorker(id, action = "_supervise") {
@@ -106,6 +108,11 @@ async function main() {
   try {
     if (command === "list") {
       console.log(JSON.stringify(listTasks(runner, options(args, ["--state", "--session", "--limit", "--scan-limit", "--cursor"]))));
+    } else if (command === "launch") {
+      const { launchTask } = await import("./task-launch.mjs");
+      const value = await launchTask(runner, options(args, ["--input-file", "--continue-from"]), { version, spawnWorker });
+      console.log(JSON.stringify(value));
+      if (value.error) process.exitCode = 1;
     } else if (command === "submit") {
       const flags = options(args, [
         "--key",

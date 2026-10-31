@@ -196,6 +196,7 @@ function validateHandle(record, handle) {
 export function validateCallback(input) {
   if (
     !input ||
+    typeof input.callback_id !== "string" ||
     !callbackPattern.test(input.callback_id) ||
     typeof input.callback_url !== "string"
   )
@@ -211,6 +212,7 @@ export function validateCallback(input) {
     url.password ||
     url.search ||
     url.hash ||
+    input.callback_url.includes(input.callback_id) ||
     url.pathname !== "/api/agents/task-callbacks"
   )
     throw new Error("INVALID_CALLBACK");
@@ -480,6 +482,29 @@ export class TaskRunner {
   write(record) {
     save(this.filename(record.id), record);
   }
+  bindSession({ cwd, session, model, modelConfig, modelProfile, launch }) {
+    const sessions = path.join(this.root, ".sessions");
+    try {
+      fs.mkdirSync(sessions, { mode: 0o700 });
+      save(path.join(sessions, "owner.json"), { schema: 1, uid: process.getuid() });
+      syncDirectory(this.root);
+    } catch (error) { if (error.code !== "EEXIST") throw error; }
+    directory(sessions);
+    if (JSON.stringify(read(path.join(sessions, "owner.json"))) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
+      throw new Error("INVALID_SESSION_OWNER");
+    const binding = path.join(sessions, `${hash(session)}.json`);
+    const sessionKey = `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
+    if (fs.existsSync(binding)) {
+      const prior = read(binding);
+      if (prior.cwd !== cwd || prior.name !== session || prior.sessionKey !== sessionKey)
+        throw new Error("SESSION_CWD_CONFLICT");
+      if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig ||
+          model && prior.modelProfile !== modelProfile) throw new Error("SESSION_MODEL_CONFLICT");
+      if (prior.launchOrigin !== launch?.origin) throw new Error("SESSION_LAUNCH_REQUIRED");
+    } else save(binding, { version: 1, name: session, cwd, sessionKey,
+      ...(model ? { model, modelConfig, modelProfile } : {}), ...(launch ? { launchOrigin: launch.origin } : {}) });
+    return sessionKey;
+  }
   submit({
     key,
     prompt,
@@ -491,6 +516,8 @@ export class TaskRunner {
     model,
     modelConfig,
     modelProfile = "external",
+    launch,
+    continuationHandle,
   }) {
     if (
       typeof key !== "string" ||
@@ -518,48 +545,21 @@ export class TaskRunner {
       throw new Error("INVALID_SESSION");
     const selected = validateCallback(callback);
     if (
+      /tcb_[A-Za-z0-9_-]{43}/.test(prompt) ||
       prompt.includes(selected.callback_id) ||
+      prompt.includes(callback.callback_url) ||
       prompt.includes(selected.callback_url)
     )
       throw new Error("CALLBACK_IN_PROMPT");
     const id = `task_${hash(key)}`;
-    let sessionKey = id;
-    if (session !== undefined) {
-      const sessions = path.join(this.root, ".sessions");
-      try {
-        fs.mkdirSync(sessions, { mode: 0o700 });
-        save(path.join(sessions, "owner.json"), {
-          schema: 1,
-          uid: process.getuid(),
-        });
-        syncDirectory(this.root);
-      } catch (error) {
-        if (error.code !== "EEXIST") throw error;
-      }
-      directory(sessions);
-      if (
-        JSON.stringify(read(path.join(sessions, "owner.json"))) !==
-        JSON.stringify({ schema: 1, uid: process.getuid() })
-      )
-        throw new Error("INVALID_SESSION_OWNER");
-      const binding = path.join(sessions, `${hash(session)}.json`);
-      sessionKey = `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
-      if (fs.existsSync(binding)) {
-        const prior = read(binding);
-        if (
-          prior.cwd !== cwd ||
-          prior.name !== session ||
-          prior.sessionKey !== sessionKey
-        )
-          throw new Error("SESSION_CWD_CONFLICT");
-        if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig ||
-            model && prior.modelProfile !== modelProfile)
-          throw new Error("SESSION_MODEL_CONFLICT");
-      } else save(binding, {
-        version: 1, name: session, cwd, sessionKey,
-        ...(model ? { model, modelConfig, modelProfile } : {}),
-      });
+    if (fs.existsSync(path.join(this.root, ".launches"))) {
+      const store = directory(path.join(this.root, ".launches"));
+      const claim = readJson(path.join(store, `${id}.json`), undefined, { optional: true });
+      if (claim && (claim.id !== id || JSON.stringify([claim.token, claim.inputHash, claim.origin]) !==
+          JSON.stringify([launch?.token, launch?.inputHash, launch?.origin]))) throw new Error("SUBMIT_CONFLICT");
     }
+    let sessionKey = id;
+    if (session !== undefined) sessionKey = this.bindSession({ cwd, session, model, modelConfig, modelProfile, launch });
     const fingerprint = hash(
       JSON.stringify({
         prompt,
@@ -567,6 +567,8 @@ export class TaskRunner {
         callback: selected,
         sessionKey,
         permissions,
+        ...(launch ? { launch } : {}),
+        ...(continuationHandle ? { continuationHandle } : {}),
         ...(model ? { model, modelConfig, modelProfile } : {}),
       }),
     );
@@ -593,6 +595,8 @@ export class TaskRunner {
         sessionKey,
         ...(session !== undefined ? { sessionName: session } : {}),
         permissions,
+        ...(launch ? { launch } : {}),
+        ...(continuationHandle ? { continuationHandle } : {}),
         ...(model ? { model, modelConfig, modelProfile } : {}),
         cwd,
         prompt,

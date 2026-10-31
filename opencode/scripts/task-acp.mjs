@@ -111,6 +111,9 @@ export function createTaskRuntime(root, record) {
       const fd = Number(process.env.OPENCODE_MODULE_SESSION_LOCK);
       try {
         const existing = await runtime.findSession(input);
+        if (record.continuationHandle && (!existing || ["acpxRecordId", "backendSessionId", "cwd", "sessionKey", "backend"]
+            .some((name) => existing[name] !== record.continuationHandle[name])))
+          throw new Error("SESSION_IDENTITY_CONFLICT");
         if (existing) {
           const proof = JSON.parse(fs.readFileSync(fd, "utf8") || "null");
           if (proof?.acpxRecordId !== existing.acpxRecordId ||
