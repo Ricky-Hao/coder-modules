@@ -62,16 +62,17 @@ export function processBirth(pid) {
 export function recordFixtureSpawns(source, filename) {
   const imported = 'import { spawn } from "node:child_process";';
   if (!source.includes(imported)) throw new Error("fixture spawn instrumentation no longer matches source");
-  // 复制脚本的父 spawn 点立即登记，覆盖 child 尚在 Python 初始化且 submit 已退出的窗口。
+  // 复制脚本的父 spawn 点立即登记；不依赖业务文件的 fs import。
   return source.replace(imported, `import { spawn as fixtureNativeSpawn } from "node:child_process";
+import fixtureFs from "node:fs";
 const spawn = (...args) => {
   const child = fixtureNativeSpawn(...args);
   if (child.pid) {
     try {
-      const ticks = fs.readFileSync('/proc/' + child.pid + '/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19];
+      const ticks = fixtureFs.readFileSync('/proc/' + child.pid + '/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19];
       const role = args[1]?.find((arg) => ['_worker', '_observe', '_supervise', '_fail_launch'].includes(arg)) ?? 'spawned';
       const taskId = args[1]?.find((arg) => /^task_[a-f0-9]{64}$/.test(arg));
-      fs.appendFileSync(${JSON.stringify(filename)}, JSON.stringify({ pid: child.pid, ticks, role, taskId }) + '\\n');
+      fixtureFs.appendFileSync(${JSON.stringify(filename)}, JSON.stringify({ pid: child.pid, ticks, role, taskId }) + '\\n');
     } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
   }
   return child;

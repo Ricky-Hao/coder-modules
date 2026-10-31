@@ -48,7 +48,7 @@ export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = 
 export function readError(error) {
   const known = ["UNSAFE_TASK_FILE", "UNSAFE_TASK_DIRECTORY", "INVALID_TASK_RESULT", "INVALID_TASK_ID",
     "TASK_RECORD_TOO_LARGE", "TASK_READ_BUDGET", "TASK_RECORD_CHANGED", "CURSOR_STALE", "INVALID_CURSOR",
-    "INVALID_ARGUMENTS", "TASK_DIRECTORY_UNREADABLE"];
+    "INVALID_ARGUMENTS", "TASK_DIRECTORY_UNREADABLE", "UNSUPPORTED_TASK_RECORD"];
   if (known.includes(error.message)) return error.message;
   if (error.code === "ENOENT") return "TASK_NOT_FOUND";
   if (["ELOOP", "ENOTDIR"].includes(error.code)) return "UNSAFE_TASK_DIRECTORY";

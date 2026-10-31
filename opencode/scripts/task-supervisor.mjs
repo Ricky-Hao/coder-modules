@@ -1,32 +1,11 @@
-/** One task, one monitor, one replaceable driver. No prompt replay after a lost driver. */
-import fs from "node:fs";
+/** 每任务一个监护和可替换 driver；driver 丢失后不重放 prompt。 */
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { Confirmation, delay, deliveryState, save } from "./task.mjs";
+import { readJson, SNAPSHOT_BYTES } from "./task-read.mjs";
 
 export function readWorkerHeartbeat(filename) {
-  // rename may unlink the inode between lookup and stat. Validate/read one fd;
-  // retry only that replaced private inode, without relaxing link/permission checks.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let fd;
-    try {
-      fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-    } catch (error) {
-      if (error.code === "ENOENT") return;
-      throw error;
-    }
-    try {
-      const info = fs.fstatSync(fd);
-      if (!info.isFile() || info.uid !== process.getuid() || info.mode & 0o077)
-        throw new Error("UNSAFE_TASK_FILE");
-      if (info.nlink === 0) continue;
-      if (info.nlink !== 1) throw new Error("UNSAFE_TASK_FILE");
-      return JSON.parse(fs.readFileSync(fd, "utf8"));
-    } finally {
-      fs.closeSync(fd);
-    }
-  }
-  // No verified sample: retain the original last-progress budget and confirmation.
+  return readJson(filename, SNAPSHOT_BYTES, { optional: true });
 }
 
 export function workerHeartbeat(runner, id, token) {

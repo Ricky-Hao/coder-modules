@@ -440,24 +440,25 @@ else:
         self.fixture.install()
         copilot = {'PATH': '/usr/bin:/bin', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1',
                    'COPILOT_API_KEY': 'SYNTHETIC-COPILOT'}
-        args = ['submit', '--key', 'fixture', '--prompt-file', 'unused', '--model', 'copilot/gpt-6.1-sol']
         import runtime
-        child = runtime.environment(copilot, self.root, 'env', 'test-workspace', args, submit=True)
+        settings = {**self.fixture.bundle['config'], 'install_root': str(self.root)}
+        with patch.dict(os.environ, copilot, clear=True):
+            task = runtime.launch_selection(settings, {'provider': 'copilot'})
+        selected = task['model']
+        child = runtime.environment(copilot, self.root, 'env', 'test-workspace', ['acp'], task)
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
         self.assertNotIn('CODEX_API_KEY', child)
-        selected = json.loads(child['OPENCODE_MODULE_TASK_SELECTION'])
         self.assertEqual(selected, {'id': 'copilot/gpt-6.1-sol', 'variant': 'max'})
         cfg = json.loads(Path(child['OPENCODE_CONFIG']).read_text())
         self.assertEqual(cfg['agents']['title']['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'})
-        task = {'model': selected, 'modelConfig': child['OPENCODE_CONFIG'], 'modelProfile': 'env'}
         second = runtime.environment(child, self.root, 'env', 'test-workspace', ['acp'], task)
         self.assertEqual(second['COPILOT_API_KEY'], copilot['COPILOT_API_KEY'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_MODEL'], selected['id'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertNotIn('CODEX_API_KEY', second)
-        astra = runtime.environment(copilot, self.root, 'env', 'test-workspace',
-                                    [*args[:-1], 'copilot/gpt-6-astra'], submit=True)
-        self.assertEqual(json.loads(astra['OPENCODE_MODULE_TASK_SELECTION'])['variant'], 'medium')
+        with patch.dict(os.environ, copilot, clear=True):
+            astra = runtime.launch_selection(settings, {'provider': 'copilot', 'model': 'gpt-6-astra'})
+        self.assertEqual(astra['model']['variant'], 'medium')
         for pair in (copilot, {'LLM_BASE_URL': 'https://old.example.invalid', 'LLM_API_KEY': 'SECRET-OLD'}):
             with self.assertRaisesRegex(profiles.ProfileError, 'CODEX_API_KEY.*CODEX_BASE_URL'):
                 profiles.configuration(pair, fixtures.SCRIPTS)
@@ -475,27 +476,6 @@ else:
             with self.assertRaises(ValueError):
                 profiles.task_configuration(json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text()), model, variant)
 
-    def test_legacy_worker_passive_recovery_and_unrecorded_queue_do_not_change_default_or_record(self):
-        self.fixture.install()
-        task_id = 'task_' + 'a' * 64
-        tasks = self.root / 'runtime/tasks'
-        task_dir = tasks / task_id
-        task_dir.mkdir(mode=0o700)
-        filename = task_dir / 'task.json'
-        for state in ('queued', 'running', 'outbox', 'delivered'):
-            filename.write_text(json.dumps({'state': state}))
-            filename.chmod(0o600)
-            before = filename.read_bytes()
-            result = self.call('opencode-task', ['_worker', task_id], {'PATH': '/usr/bin:/bin'})
-            if state == 'queued':
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('TASK_MODEL_UNRECORDED', result.stderr)
-            else:
-                self.assertEqual(result.returncode, 0, result.stderr)
-                child = json.loads(result.stdout)['env']
-                self.assertNotIn('CODEX_API_KEY', child)
-            self.assertEqual(filename.read_bytes(), before)
-
     def test_external_task_snapshot_inherits_environment_without_original_path_env(self):
         import runtime
         self.fixture.install()
@@ -507,11 +487,10 @@ else:
         env = {'PATH': '/usr/bin:/bin', 'OPENCODE_MODULE_CONFIG': str(source),
                'COPILOT_API_KEY': 'SYNTHETIC', 'COPILOT_BASE_URL': 'https://copilot.example.invalid/v1',
                'EXTERNAL_AUTH_TOKEN': 'SYNTHETIC-EXTERNAL', 'CONTEXT7_MCP_API_KEY': 'SYNTHETIC-DISABLED'}
-        child = runtime.environment(env, self.root, 'env', 'test-workspace',
-                                    ['submit', '--model', 'copilot/gpt-6.1-sol'], submit=True)
-        self.assertEqual(child['OPENCODE_MODULE_TASK_PROFILE'], 'external')
-        task = {'model': json.loads(child['OPENCODE_MODULE_TASK_SELECTION']),
-                'modelConfig': child['OPENCODE_MODULE_TASK_CONFIG'], 'modelProfile': 'external'}
+        with patch.dict(os.environ, env, clear=True):
+            task = runtime.launch_selection({**self.fixture.bundle['config'], 'install_root': str(self.root)},
+                                            {'provider': 'copilot'})
+        self.assertEqual(task['modelProfile'], 'external')
         del env['OPENCODE_MODULE_CONFIG']
         restored = runtime.environment(env, self.root, 'env', 'test-workspace', ['acp'], task)
         for name, value in env.items():

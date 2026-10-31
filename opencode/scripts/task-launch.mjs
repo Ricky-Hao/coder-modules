@@ -12,7 +12,7 @@ const canonical = (value) => JSON.stringify(value, (_, item) => item && typeof i
 const fail = (code) => { throw new Error(code); };
 const codes = new Set(["INVALID_LAUNCH_INPUT", "LAUNCH_CONFLICT", "LAUNCH_SELECTION_INVALID", "SESSION_MODEL_CONFLICT",
   "LAUNCH_METADATA_REQUIRED", "CONTINUE_BUSY_OR_UNKNOWN", "CONTINUE_NOT_LATEST", "LAUNCH_OBJECT_CONFLICT",
-  "CONTINUE_SESSION_UNCONFIRMED", "SESSION_LAUNCH_REQUIRED",
+  "CONTINUE_SESSION_UNCONFIRMED",
   "GIT_REPOSITORY_INVALID", "GIT_FETCH_FAILED", "GIT_PREPARE_FAILED", "SUBMIT_CONFLICT", "SUPERVISOR_START_FAILED"]);
 
 function safePath(filename, privateParent = false) {
@@ -265,7 +265,7 @@ export async function launchTask(runner, flags, { version, spawnWorker, checkpoi
       if (!record.selection) record.selection = await timed("input", () => selection(version, input,
         record.prior ? readJson(path.join(store, `${record.prior}.json`)) : undefined));
       persist();
-      runner.bindSession({ cwd: record.worktree, session: record.session, ...record.selection, launch: proof(record) });
+      runner.bindSession({ cwd: record.worktree, session: record.session, ...record.selection });
       if (record.origin !== record.id) {
         const originFile = path.join(store, `${record.origin}.json`), origin = readJson(originFile);
         if (origin.tail !== record.id && origin.tail !== record.prior) fail("CONTINUE_NOT_LATEST");

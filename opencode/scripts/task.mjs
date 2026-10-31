@@ -130,10 +130,6 @@ export function save(filename, value) {
   syncDirectory(path.dirname(filename));
 }
 
-function read(filename) {
-  return readJson(filename);
-}
-
 export function taskPermissions(mode = "deny-all", policy = {}) {
   if (
     !["deny-all", "approve-reads", "approve-all"].includes(mode) ||
@@ -171,7 +167,6 @@ export function taskPermissions(mode = "deny-all", policy = {}) {
 }
 
 export function taskModel(model) {
-  if (model === undefined) return undefined;
   if (
     !model || typeof model.id !== "string" || model.id.length > 256 || model.id.includes("tcb_") ||
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:-]+$/.test(model.id) ||
@@ -347,15 +342,13 @@ function resultOutput(record, payload, callback) {
       output_available: false,
     };
   const boundedOutput = boundedInfo(payload.output, limit);
-  const truncated = typeof record.outputTruncated === "boolean"
-    ? record.outputTruncated : null;
   // 先查完整文本，避免裁剪隐藏 bearer。
   const privateOutput = privateResultText(payload.output, callback);
   return {
     output: privateOutput ? null : boundedOutput.text,
     output_bytes: privateOutput ? null : boundedOutput.bytes,
     output_limit_bytes: limit,
-    output_truncated: boundedOutput.truncated ? true : truncated,
+    output_truncated: boundedOutput.truncated || record.outputTruncated,
     output_available: !privateOutput,
     ...(privateOutput ? { output_error: "PRIVATE_CALLBACK_CONTENT" } : {}),
   };
@@ -381,11 +374,11 @@ function evidence(record, payload, callback) {
   return {
     lifecycle: "program_observed",
     terminal_source: payload ? resultChoice(record.terminalSource, [
-      "turn.result", "watchSession.turn_result", "queued_cancellation", "operator_resolution",
+      "turn.result", "watchSession.turn_result", "queued_cancellation",
       "execution_setup_failure", "supervision_failure",
     ]) : null,
     output_source: payload ? resultChoice(record.outputSource, [
-      "assistant_output", "program_generated", "operator_verified",
+      "assistant_output", "program_generated",
     ]) : null,
     callback_receipt: resultReceipt(record.receipt, callback),
   };
@@ -404,12 +397,7 @@ export function appendOutput(record, text, messageId) {
 
 function terminalStatus(result) {
   if (result.status === "completed") return "success";
-  if (
-    result.status === "cancelled" ||
-    result.error?.code === "QUEUE_REQUEST_CANCELLED" ||
-    result.error?.detailCode === "QUEUE_REQUEST_CANCELLED"
-  )
-    return "cancelled";
+  if (result.status === "cancelled") return "cancelled";
   return "error";
 }
 
@@ -476,13 +464,18 @@ export class TaskRunner {
   }
   load(id, options) {
     const record = readJson(this.filename(id), undefined, options);
-    if (!record || record.version !== 1 || record.id !== id) throw new Error("INVALID_TASK_RESULT");
+    if (!record || record.id !== id) throw new Error("INVALID_TASK_RESULT");
+    if (record.version !== 1 || !record.model || !path.isAbsolute(record.modelConfig ?? "") ||
+        !["env", "external"].includes(record.modelProfile) || !record.permissions ||
+        !Number.isSafeInteger(record.createdAt) || record.terminalSource === "operator_resolution" ||
+        record.body !== undefined && typeof record.outputTruncated !== "boolean")
+      throw new Error("UNSUPPORTED_TASK_RECORD");
     return record;
   }
   write(record) {
     save(this.filename(record.id), record);
   }
-  bindSession({ cwd, session, model, modelConfig, modelProfile, launch }) {
+  bindSession({ cwd, session, model, modelConfig, modelProfile }) {
     const sessions = path.join(this.root, ".sessions");
     try {
       fs.mkdirSync(sessions, { mode: 0o700 });
@@ -490,19 +483,18 @@ export class TaskRunner {
       syncDirectory(this.root);
     } catch (error) { if (error.code !== "EEXIST") throw error; }
     directory(sessions);
-    if (JSON.stringify(read(path.join(sessions, "owner.json"))) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
+    if (JSON.stringify(readJson(path.join(sessions, "owner.json"))) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
       throw new Error("INVALID_SESSION_OWNER");
     const binding = path.join(sessions, `${hash(session)}.json`);
     const sessionKey = `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
     if (fs.existsSync(binding)) {
-      const prior = read(binding);
+      const prior = readJson(binding);
       if (prior.cwd !== cwd || prior.name !== session || prior.sessionKey !== sessionKey)
         throw new Error("SESSION_CWD_CONFLICT");
       if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig ||
-          model && prior.modelProfile !== modelProfile) throw new Error("SESSION_MODEL_CONFLICT");
-      if (prior.launchOrigin !== launch?.origin) throw new Error("SESSION_LAUNCH_REQUIRED");
+          prior.modelProfile !== modelProfile) throw new Error("SESSION_MODEL_CONFLICT");
     } else save(binding, { version: 1, name: session, cwd, sessionKey,
-      ...(model ? { model, modelConfig, modelProfile } : {}), ...(launch ? { launchOrigin: launch.origin } : {}) });
+      model, modelConfig, modelProfile });
     return sessionKey;
   }
   submit({
@@ -515,7 +507,7 @@ export class TaskRunner {
     permissionPolicy,
     model,
     modelConfig,
-    modelProfile = "external",
+    modelProfile,
     launch,
     continuationHandle,
   }) {
@@ -533,9 +525,9 @@ export class TaskRunner {
     cwd = fs.realpathSync(cwd);
     const permissions = taskPermissions(permissionMode, permissionPolicy);
     model = taskModel(model);
-    if (model && (typeof modelConfig !== "string" || !path.isAbsolute(modelConfig)))
+    if (typeof modelConfig !== "string" || !path.isAbsolute(modelConfig))
       throw new Error("TASK_MODEL_CONFIG_REQUIRED");
-    if (model && !["env", "external"].includes(modelProfile))
+    if (!["env", "external"].includes(modelProfile))
       throw new Error("INVALID_MODEL_PROFILE");
     if (
       session !== undefined &&
@@ -552,14 +544,8 @@ export class TaskRunner {
     )
       throw new Error("CALLBACK_IN_PROMPT");
     const id = `task_${hash(key)}`;
-    if (fs.existsSync(path.join(this.root, ".launches"))) {
-      const store = directory(path.join(this.root, ".launches"));
-      const claim = readJson(path.join(store, `${id}.json`), undefined, { optional: true });
-      if (claim && (claim.id !== id || JSON.stringify([claim.token, claim.inputHash, claim.origin]) !==
-          JSON.stringify([launch?.token, launch?.inputHash, launch?.origin]))) throw new Error("SUBMIT_CONFLICT");
-    }
     let sessionKey = id;
-    if (session !== undefined) sessionKey = this.bindSession({ cwd, session, model, modelConfig, modelProfile, launch });
+    if (session !== undefined) sessionKey = this.bindSession({ cwd, session, model, modelConfig, modelProfile });
     const fingerprint = hash(
       JSON.stringify({
         prompt,
@@ -569,7 +555,7 @@ export class TaskRunner {
         permissions,
         ...(launch ? { launch } : {}),
         ...(continuationHandle ? { continuationHandle } : {}),
-        ...(model ? { model, modelConfig, modelProfile } : {}),
+        model, modelConfig, modelProfile,
       }),
     );
     const dirname = path.join(this.root, id);
@@ -583,7 +569,7 @@ export class TaskRunner {
     const filename = path.join(dirname, "task.json");
     let record;
     if (fs.existsSync(filename)) {
-      record = read(filename);
+      record = this.load(id);
       if (record.fingerprint !== fingerprint)
         throw new Error("SUBMIT_CONFLICT");
     } else {
@@ -597,7 +583,7 @@ export class TaskRunner {
         permissions,
         ...(launch ? { launch } : {}),
         ...(continuationHandle ? { continuationHandle } : {}),
-        ...(model ? { model, modelConfig, modelProfile } : {}),
+        model, modelConfig, modelProfile,
         cwd,
         prompt,
         callback: selected,
@@ -622,18 +608,15 @@ export class TaskRunner {
     const result = this.resultRecord(record, { output: false });
     return {
       ...result,
-      permission_mode: resultChoice(record.permissions?.mode ?? "deny-all", ["deny-all", "approve-reads", "approve-all"]),
-      ...(record.model ? { model: taskModel(record.model).id, variant: identifier(record.model.variant) } : {}),
-      ...(result.session_name ? { session: result.session_name } : {}),
+      permission_mode: resultChoice(record.permissions.mode, ["deny-all", "approve-reads", "approve-all"]),
+      model: taskModel(record.model).id, variant: identifier(record.model.variant),
       cancel_requested: readJson(this.filename(record.id, "cancel.json"), SNAPSHOT_BYTES, { optional: true }) !== undefined,
       ...(record.deliveryError ? { delivery_error: safeCode(record.deliveryError) } : {}),
       ...(record.executionError ? { execution_error: safeCode(record.executionError) } : {}),
       ...(record.state === "ambiguous"
         ? {
             guidance:
-              record.body
-                ? "Original outcome and side effects are unknown. The supervision notification is sealed; independently verify the original request. Never automatically resubmit the prompt."
-                : "Original request outcome is unknown. Recover watches that request; resolve only with independently verified output. Never automatically resubmit the prompt.",
+              "原请求结果和副作用未知。recover 只观察原请求或投递已封存通知；独立核实结果，不自动重发。",
           }
         : {}),
     };
@@ -667,14 +650,20 @@ export class TaskRunner {
       evidence: evidence(record, payload, callback),
     };
   }
-  pending() {
+  pending(unsupported = []) {
     return fs
       .readdirSync(this.root)
       .filter((id) => taskPattern.test(id))
       .filter(
-        (id) =>
-          fs.existsSync(this.filename(id)) &&
-           !["delivered", "rejected"].includes(deliveryState(this.load(id))),
+        (id) => {
+          try {
+            return fs.existsSync(this.filename(id)) && !["delivered", "rejected"].includes(deliveryState(this.load(id)));
+          } catch (error) {
+            if (error.message !== "UNSUPPORTED_TASK_RECORD") throw error;
+            unsupported.push({ task_id: id, code: error.message });
+            return false;
+          }
+        },
       );
   }
   seal(
@@ -691,7 +680,7 @@ export class TaskRunner {
     record.terminalSource = terminalSource;
     record.outputSource = outputSource;
     const collectedTruncation = outputSource === "assistant_output"
-      ? record.outputTruncated ?? null : false;
+      ? record.outputTruncated ?? false : false;
     record.outputTruncated = body.output !== output ? true : collectedTruncation;
     record.body = JSON.stringify(body);
     record.state = "outbox";
@@ -877,7 +866,7 @@ export class TaskRunner {
     record.health = { ...record.health, lastEventAt: this.now(), lastEventTick: this.tick(), eventClock: this.clock,
       eventSequence: (record.health?.eventSequence ?? 0) + 1, progress, retryUntil, retryTick, retryClock };
   }
-  async journal(record, signal, { collect = true, checkpoint = true } = {}) {
+  async journal(record, signal) {
     while (!signal.aborted && !record.body) {
       try {
         if (!record.handle) {
@@ -895,15 +884,13 @@ export class TaskRunner {
             if (!unknown) {
               this.progress(record, event);
               const update = event.message?.params?.update;
-              if (collect && update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
+              if (update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
                 appendOutput(record, update.content.text, update.messageId);
               if (event.type === "turn_result") return event.result;
             }
           }
-          if (checkpoint) {
-            record.cursor = event.cursor;
-            this.write(record);
-          }
+          record.cursor = event.cursor;
+          this.write(record);
         }
       } catch { /* 沿原 cursor 重连。 */ }
       if (signal.aborted || record.body) return;
@@ -1036,7 +1023,7 @@ export class TaskRunner {
   }
   async setupSession(record) {
     const pending = this.runtime.ensureSession({ sessionKey: record.sessionKey, agent: "opencode",
-      mode: "persistent", cwd: record.cwd, ...(record.model ? { model: record.model } : {}) });
+      mode: "persistent", cwd: record.cwd, model: record.model });
     try {
       return await within(pending, this.policy.setupMs);
     } catch (error) {
@@ -1104,8 +1091,7 @@ export class TaskRunner {
             this.observe(record, "running");
           })
           .catch(() => {});
-        const cancel = () => this.runtime.cancelRequest
-          ? this.runtime.cancelRequest({ handle: record.handle, requestId: record.requestId }) : turn.cancel();
+        const cancel = () => this.runtime.cancelRequest({ handle: record.handle, requestId: record.requestId });
         monitor = this.monitorCancellation(record, cancel);
         if (fs.existsSync(this.filename(id, "cancel.json")))
           Promise.resolve(cancel()).catch(() => {});
@@ -1116,13 +1102,11 @@ export class TaskRunner {
             record.originalObserved = true;
             this.progress(record, event);
             if (event.type === "text_delta" && event.stream !== "thought")
-              appendOutput(this.runtime.journalAuthoritative ? streamOutput : record, event.text, event.messageId);
+              appendOutput(streamOutput, event.text, event.messageId);
           }
         })().catch(() => {});
-        const journal = this.journal(record, controller.signal, {
-          collect: Boolean(this.runtime.journalAuthoritative),
-          checkpoint: Boolean(this.runtime.journalAuthoritative),
-        }).then((result) => result ? { result, source: "watchSession.turn_result" } : new Promise(() => {}))
+        const journal = this.journal(record, controller.signal)
+          .then((result) => result ? { result, source: "watchSession.turn_result" } : new Promise(() => {}))
           .catch(() => new Promise(() => {}));
         const { result, source, reason } = await Promise.race([
           resultPromise.then((result) => ({ result, source: "turn.result" })),
@@ -1137,7 +1121,7 @@ export class TaskRunner {
         } else {
           // 不让输出迭代器或 promptStarted 阻止终态。
           await within(consume, this.policy.drainMs).catch(() => {});
-          if (this.runtime.journalAuthoritative && source === "turn.result") {
+          if (source === "turn.result") {
             await within(journal, this.policy.drainMs).catch(() => {});
             if (streamOutput.output !== undefined) {
               record.output = streamOutput.output;
@@ -1173,17 +1157,5 @@ export class TaskRunner {
         requestId: record.requestId,
       })), this.policy.probeMs);
     }
-  }
-  resolve(id, status, output) {
-    const record = this.load(id);
-    if (record.state !== "ambiguous" || record.body)
-      throw new Error("TASK_NOT_AMBIGUOUS");
-    this.seal(
-      record,
-      status,
-      output,
-      "operator_resolution",
-      "operator_verified",
-    );
   }
 }

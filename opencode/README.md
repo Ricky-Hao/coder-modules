@@ -9,404 +9,207 @@ tags: [helper, ide, ai]
 
 # OpenCode and acpx
 
-The module also installs **`opencode-task`** for detached tasks, durable callback
-delivery, recovery and bounded terminal-result reads using the pinned acpx runtime.
-Each task has a monitor for worker exit and callback delivery. Unknown execution
-outcomes retain `ambiguous` and send an explicit supervision-failure notification;
-the [health policy](TASKS.md#监督策略与边界) defines deadlines, configuration and limits.
-监督阈值先进入怀疑，再连续确认；原请求的新进展可撤销怀疑。静默和观察失败仍有未知边界，
-不能作为业务死亡证明。
-See [TASKS.md](TASKS.md) for the CLI, private-input contract, protocol and focused
-verification.
-`opencode-task launch --input-file PRIVATE_JSON` 提供高层 Git 准备与派发入口，无新增 MCP tool。
-Agent 沿现有 callback 注册、私密文件写入和 Workspace Bash 三次调用完成提交。
-新 branch/worktree 从本次成功 fetch 的 origin/main 创建，worktree 固定落在 repo 的父目录。
-续接复用可信记录、原 session/选择和权限，须有原请求终态；第一版安全拒绝模型/档位切换。
-完整 schema、重试和具体接口缺口见 [launch 契约](TASKS.md#高层-launch-入口)。
-新增 `opencode-task list`、`inspect TASK_ID`、`doctor` 提供有界任务定位、安全历史观测和
-离线安装自检。它们不执行模型、恢复或 callback，也不初始化任务存储。分页、读取预算、
-陈旧/未知时间与失败项的解释见 [只读查询契约](TASKS.md#只读查询与离线安装自检)。
-`doctor` 默认完整校验；日常可用 `doctor --quick`，跳过二进制内容读取和哈希，并明确列为未检。
+本模块为现有 Workspace 用户安装固定版本的 OpenCode、私有 Node、acpx 和
+`opencode-task`。任务通过 `launch` 准备 Git worktree、自动建立 session 并尝试派发，
+支持可信续接、持久回调和原请求恢复。API、权限和未知结果边界见 [TASKS.md](TASKS.md)。
+无需新增 MCP tool；Agent 沿已有 callback 注册、私有文件写入和 Workspace Bash 调用。
 
-Install pinned OpenCode and acpx as the existing workspace user. Only `agent_id` is
-required. For persistent use, a dedicated writable PVC is recommended:
-
-```tf
+```hcl
 module "opencode" {
-  # Pin the module source version to a reviewed, published 40-character commit.
   source       = "git::https://github.com/Ricky-Hao/coder-modules.git//opencode?ref=<FIXED_COMMIT>"
   agent_id     = coder_agent.example.id
-  install_root = "/mnt/opencode/toolset" # Optional; mount must already be writable.
+  install_root = "/mnt/opencode/toolset"
 }
 ```
 
-Replace `<FIXED_COMMIT>` with the actual commit containing this module **after it
-is published**; it is not a usable revision as written. This module is not claimed
-to be published in the Coder Registry. Git sources do not accept a registry `version`
-argument. For local review use `source = "./opencode"` from the repository root.
+`<FIXED_COMMIT>` 须替换为已审阅并可获取的完整 commit。Git source 不接受 registry
+`version` 参数。此 fork 不自动发布到 Coder Registry；合并源码也不会更新模板或运行环境。
+本地审阅可用 `source = "./opencode"`。
 
-## Storage and startup
+## 存储与启动
 
-Omit `install_root` to use **`$HOME/.coder-opencode`**, resolved from the agent user's
-HOME by the startup program, never Terraform's HOME or `pathexpand`. Both root and
-nonroot users are supported. HOME must be canonical, user-owned and not group/world
-writable; HOME and installation paths cannot traverse symlinks.
+只需 `agent_id`。省略 `install_root` 时，启动程序使用 Agent 用户的
+`$HOME/.coder-opencode`，不使用 Terraform 的 HOME 或 `pathexpand`。支持 root 和非 root。
+HOME 须是规范绝对路径、由当前 UID 拥有且不可被 group/other 写入；路径不穿越 symlink。
 
-**Recommended persistence:** the template owns a dedicated PVC mounted at
-`/mnt/opencode`; the module owns only its private `toolset` child. See
-[examples/kubernetes.tf.example](examples/kubernetes.tf.example) for PVC/mount wiring.
-An existing mount can be user-owned or root-owned with a suitable writable filesystem
-group. Infrastructure must supply the correct UID/fsGroup/volume permissions for the
-image. A root-owned, unwritable volume does not work for an arbitrary nonroot UID.
-By default the module never changes parent permissions or silently adopts an existing
-unmarked directory, even an empty one. No special init container or copied parent
-preparation script is needed **when the mount already satisfies this contract**.
+持久使用建议由模板提供专用、可写 PVC，挂到 `/mnt/opencode`，模块只管理其私有
+`toolset` 子目录。挂载示例见 [examples/kubernetes.tf.example](examples/kubernetes.tf.example)。
+基础设施负责 UID/fsGroup 和卷权限。模块不递归 chown/chmod，不接管已有的无标记目录，
+即使目录为空。没有持久 HOME 或显式持久挂载时，不保证重启后数据仍在。
 
-**Ancestor trust:** every installation and HOME/profile ancestor must be a real
-directory owned by root or the current UID. World-writable nonsticky directories
-are rejected anywhere in the chain, even when root-owned. Sticky shared ancestors
-such as `/tmp` are allowed; the private HOME itself must still have no group/other
-write permission. Nonsticky group-writable ancestors are rejected too, with one
-explicit exception: the installation root's **immediate parent** may be a writable
-PVC whose group includes the process. All members of that group must be trusted.
-This exception does not extend to higher ancestors or to HOME/profile ancestry;
-mount the dedicated PVC directly above the module's private child.
+安装路径及 HOME/profile 的祖先须是 root 或当前 UID 拥有的真实目录。拒绝 nonsticky
+world-writable 祖先；允许 `/tmp` 这类 sticky 共享祖先。nonsticky group-writable 祖先也拒绝，
+只有安装根的直接父目录可为进程所属可信 group 可写的 PVC。此例外不用于更高祖先或 HOME。
+HOME/profile 沿 fd 访问且不跟随链接；安装在祖先校验后使用绝对路径，依赖上述信任边界。
+锁只串行合作进程，不能对抗 root、同 UID 或可信 PVC group 的恶意替换。
 
-Advisory locks serialize cooperating module processes; they cannot prevent malicious
-rename/replacement by the PVC group, root or the same UID. The shared-mount policy
-is a trust boundary, not race-safe support for an arbitrary untrusted writable PVC.
-HOME/profile access walks descriptors with no symlink following. Installation still
-uses absolute paths after ancestor validation and relies on that declared boundary.
-The module fails closed on an unsafe ancestor instead of changing its permissions.
+一个 `coder_script` 完成安装和 Bash PATH 集成，默认阻塞登录。模块自行取得 Workspace ID，
+内含所需 helper；调用方无需复制源码、传 `file()` 或让 Agent 配置依赖模块输出。
+同 UID、Workspace ID 和文件系统上的重复启动会核验并复用缓存。实际源码/settings 变化
+生成新 fingerprint 版本；失败回退原 active。已有版本、任务、session、cache 和卷上兄弟目录
+全部保留，不迁移、不自动删除。记录支持边界见 [TASKS.md](TASKS.md#当前持久格式边界)。
 
-### Opt-in preparation for a root-owned 0777 dedicated PVC
+### 专用 root-owned 0777 PVC 的显式准备
 
-Some provisioners present `/mnt/opencode` as root-owned 0777 without the sticky bit.
-The installer correctly refuses that unsafe parent, even when the workspace user is
-root. For this specific case, set `dedicated_volume = { mount_path = "/mnt/opencode",
-workspace_id = data.coder_workspace.me.id }` together with
-`install_root = "/mnt/opencode/toolset"`. The new `volume_prepare_script` output is
-a Python program for a **root init container before any workspace process**. The
-output depends only on inputs/module files, not agent/script/data-resource attributes;
-it can be used in a Pod/Deployment init command without a module/agent cycle.
+若 provisioner 将专用 `/mnt/opencode` 挂成 root-owned 0777 nonsticky，设置：
 
-The init command is `["python3", "-B", "-c", module.opencode.volume_prepare_script]`
-(index the module when the caller uses count). Mount only the dedicated PVC at
-`/mnt/opencode` in that init container. Use an image with Python 3.11+ and Linux
-procfs (`/proc/self/fdinfo`, `/proc/self/mountinfo`); BusyBox alone is insufficient.
-Preparation requires UID/EUID 0 to change a root-owned volume's mode. It does not
-force the final workspace user to root and never uses sudo, chown or recursive chmod.
-Templates must explicitly wire and order the init container; setting the input alone
-does not execute preparation. With null/default input the output is null.
+```hcl
+install_root = "/mnt/opencode/toolset"
+dedicated_volume = {
+  mount_path   = "/mnt/opencode"
+  workspace_id = data.coder_workspace.me.id
+}
+```
 
-Scope is intentionally fixed: only the actual mounted `/mnt/opencode`, with private
-child `toolset`. `/`, system/HOME/project/shared roots and non-mount directories are
-refused. No symlinks are followed. Root-owned safe ancestors are required; fdinfo's
-mount ID must match that exact mountpoint in mountinfo. Only `toolset` is managed by
-this module; other volume-root entries, such as `tasks`, are allowed and are not
-opened, traversed or modified. A missing `toolset` is left for the installer to create.
-An existing `toolset` must be a valid private directory with the supplied workspace's
-owner marker and recognized private installation entries. An unmarked directory,
-unexpected files inside `toolset`, unsafe links or inconsistent ownership fail closed.
-Existing `active` is allowed only in its module-managed relative-version form; the
-installer separately verifies the cached inventory. No session data is migrated or
-recursively inspected/changed.
+模板须在 Workspace 进程启动前，以 root init container 执行
+`["python3", "-B", "-c", module.opencode.volume_prepare_script]`。有 count 时索引模块。
+设置输入本身不执行准备。此输出只依赖输入和模块文件，避免 Agent/Pod 依赖环；默认输出 null。
+需要 Python 3.11+ 及 Linux procfs 的 fdinfo/mountinfo，BusyBox 不够。
 
-Only mode **0777 → 1777** is changed, using `fchmod` on the validated open directory
-descriptor; existing 1777 and supported safe modes are respected. The managed
-`toolset` child is checked before and after the change. A detected concurrent change
-to that child fails init; if the sticky bit was already added, it is retained rather
-than weakened back to 0777.
-Mount ownership and all child bytes/modes remain untouched. The volume must be
-exclusively assigned to this workspace, with preparation before its users start;
-checks and advisory locks do not establish lifetime exclusivity or prevent malicious
-root/same-UID/trusted-group interference. Sticky protects against other UIDs replacing
-existing children, not against those trusted actors or arbitrary future file creation.
+准备只接受实际挂载点 `/mnt/opencode` 和其私有 `toolset`。校验 root-owned 安全祖先、
+无链接路径及 mount ID。已有 toolset 须有本 Workspace owner 标记、私有属性和已知安装项；
+active 只接受模块管理的相对 versions 链接。安装者另验缓存 inventory。其他卷根目录项
+不打开、不遍历、不修改；已有 session 数据也不扫描。只在验证后的目录 fd 上将
+**0777 改为 1777**，保留已有安全模式；不拓宽 0755 卷供非 root 写入。
+修改前后均核 toolset 身份，发现并发变化则失败；已加的 sticky 不回退。卷须专属本 Workspace，
+准备先于使用者。sticky 不能约束 root、同 UID、可信 group 或任意未来文件创建。
 
-This API is a local candidate until its new source commit is reviewed and published.
-The earlier zero-init interface applied only to preprepared mounts. Safe-mode mounts
-remain an infrastructure writability contract; preparation does not broaden a 0755
-mount for nonroot users. Default HOME mode, strict ancestor checks and agent-only
-invocation remain unchanged.
+### Bash 与自动化输出
 
-Without a persisted HOME or explicit persisted mount, there is **no persistence
-guarantee**. Repeated startup with the same UID, workspace identity and filesystem
-reuses verified cached versions. UID changes, another workspace's files and old
-session-state migration are not automatic: use a fresh module-owned path or a
-separately reviewed migration. Do not change ownership recursively as an upgrade.
+只在 `.bashrc` 和现有首选登录文件（`.bash_profile`、`.bash_login`、否则 `.profile`）末尾
+追加 wrapper bin 目录，保留原字节、权限和 PATH 顺序。修改过的托管块、不安全链接、外来文件
+和并发编辑会被拒绝。原文件提前 return/exit 可能跳过追加块，须由负责人检查。
+只对新 shell 生效；不改父 Agent 环境、全局 PATH 或项目 Node。
 
-One `coder_script` runs installation and Bash PATH integration, blocking login by
-default. The module derives identity with `data.coder_workspace.me.id`. It contains
-all helpers; the caller supplies no `file()` helpers, startup snippets or dependency
-from agent configuration back to module outputs. This avoids agent/module cycles.
+`opencode_command`、`acpx_command`、`opencode_task_command` 是经过 shell quoting 的调用表达式，
+不是裸文件名。HOME 模式在执行时展开 `"$HOME"`；显式根返回带引号绝对路径。
+`status_path` 在显式根模式为绝对路径，HOME 模式为 null，此时读取
+`$HOME/.coder-opencode/status.json`。`script_id` 标识启动脚本。
+检查新启动的 `state: ready` 和实际命令；Agent ready 或旧 status 不代表此次安装完成。
 
-### Startup execution budget
+<a id="startup-execution-budget"></a>
+## 启动传输与预算
 
-启动脚本内嵌随源码提交的 [source.json](scripts/source.json)。其中 `data` 是标准 XZ 压缩后
-的 base64，`sha256` 是解压原文摘要。源码原文交替存放 NUL 分隔的文件名和 UTF-8 原字节。
-动态 settings 单独以 base64 JSON 传入，不进入生成包。Terraform 从当前各源码文件计算摘要，
-拒绝过期包和非法 NUL 分隔；Python 标准库 `lzma` 在内存解包，先核对原文摘要，再执行 installer。
-损坏包在安装及 status 写入前失败，保留已有 active。需要 Python 自带的 `lzma` 模块；
-不新增外部工具、远程 bootstrap、下载地址或信任源。
+源码保留在模块内。[source.json](scripts/source.json) 使用标准 XZ + base64，无自定义编码。
+解压原文是 NUL 分隔的文件名与 UTF-8 原字节；动态 settings 单独传递。Terraform 根据当前
+源码核摘要和格式，拒绝过期包；Python 标准库 `lzma` 在内存解包并核原文 SHA256 后才执行。
+包损坏时不安装或写 status，已有 active 保留。生成包本身不安装到 runtime。
 
-维护者修改运行源码后执行 `python3 -B opencode/build_bundle.py`，将源码和生成包一起审阅提交。
-`python3 -B opencode/build_bundle.py --check` 检查所有恢复原字节及摘要，不改文件，也不要求
-压缩库产出逐字节相同的压缩流。固定 Git source 已带生成包，安装者无需预生成或运行构建命令。
-生成包不安装到 runtime。installer 仍按恢复后的原始文件和 settings 计算 fingerprint、inventory
-及缓存 key；仅改变压缩流不使有效缓存失效。实际源码变化会创建新版本，旧 task/session/cache
-不迁移、不删除。wrapper、权限、owner、缓存验证和失败回退保持原契约。
+修改运行源码后运行并一同提交：
 
-Coder launches scripts through execution arguments. On a Linux host with 4096-byte
-pages, one argument may occupy at most 131072 bytes including its terminator.
-The rendered script is ASCII and has a **65536-byte plan-time budget**, leaving
-headroom for the launch wrapper. If payload/settings growth exceeds that budget,
-Terraform rejects the plan; maintainers must reduce the embedded payload before
-publication. Passing `bash -n` or executing a script file does not verify this
-boundary. Regression tests pass the actual rendered script as one `env bash -c`
-argument, then verify first installation, offline cache reuse, startup recovery
-invocation, private modes and preservation of runtime and sibling data.
+```sh
+python3 -B opencode/build_bundle.py
+python3 -B opencode/build_bundle.py --check
+```
 
-The 2026-10-20 gate rollout of source
-`6516ad1f2242a46dce9ed42f834542a34e525121` exposed the missing execution-boundary
-check: its dedicated-mount script was 153559 bytes, and the Agent failed with
-`argument list too long` before the installer ran. Coder's build could succeed
-while the script log stayed empty and the old installation status remained on disk.
-That transport revision reduced the same rendered configuration to 40722 bytes.
-The negative control reproduces `E2BIG` for the original script size; the bounded
-positive cases execute on Linux, including a nonroot fixture. These are local
-source/fixture results; a repaired fixed template still needs operator review,
-publication and rollout verification. Check the requested source/version and
-installed command as well as readiness; an old status file is not fresh startup
-evidence. No runtime data repair or deletion is needed for this transport failure.
-40722 是当时修复版本的历史数据。新增入口仍须通过当前实际 Terraform render；Python 压缩
-预算检查不能替代真实渲染。后续源码或 settings 增长可能触发 plan-time budget 拒绝。
+`--check` 核对恢复后的每个原字节，不要求不同 lzma 库生成相同压缩流。缓存身份仍基于
+原始源码和 settings。固定 source 的安装者无需构建。没有远程 bootstrap 或额外下载信任源。
+不嵌入 OpenCode/acpx 二进制、测试或文档；依赖 lock 和 provenance 保留。
 
-launch 前的只读候选使用相同配置的真实 Terraform mock plan 比较：HOME 从 65331 降为 57861 字节，
-`/mnt/opencode/toolset` 从 65347 降为 57889 字节，含引号路径从 65363 降为 57905 字节。
-本轮全部配置的最大值为 57993/65536，余量 7543 字节（约 7.37 KiB），未达 8 KiB 目标。
-取舍是使用标准 XZ 和一个生成包，不继续增加定制压缩编码。65536 上限保持，超长 settings
-仍由真实 plan 拒绝；余量有限，未来增长仍须实测。真实渲染通过 Linux `env bash -c`、
-HOME/独立目录首次与离线缓存安装、恢复调用和数据保留。另以 UID 65534 验证本候选启动、
-可信 PVC group、缓存及真实 Node 的只读入口；root 只准备 `/tmp` 隔离目录，不修改真实卷。
+实际渲染脚本的 plan-time 上限为 **65536 字节**，不调整此预算。Linux 4096 字节页环境下，
+单参数含终止符上限为 131072 字节，须为 Coder wrapper 留空间。`bash -n` 或执行脚本文件
+不能代替真实 `env bash -c` 参数边界检查。源码/settings 增长后须重新运行真实 Terraform render，
+同时验证首次/缓存启动、恢复和数据保留。历史 E2BIG 及旧体积记录见 [UPGRADE.md](UPGRADE.md)。
 
-本轮 launch 的最终真实 Terraform render 为 HOME 64753、`/mnt/opencode/toolset` 64781、
-含引号路径 64797 字节；本轮测试配置最大值为 **64873/65536，余量 663 字节**。
-65536 上限保持，较长 settings 可能使 plan 拒绝，后续源码增长仍须实际 render。
-本轮也通过真实 `env bash -c` 的 HOME/独立目录首次与缓存安装、恢复和数据保留，
-并由 UID 65534 验证安装缓存、可信 PVC group、私有 launch 输入及真实本地 Git 准备。
+当前清理候选原文 payload 为 196129 字节，标准 XZ 为 46160、base64 为 61548 字节。
+实际 Terraform HOME/固定专用根/含引号路径分别为 62741/62769/62785 字节；
+本轮全部配置最大 **62869/65536，余量 2667 字节**。余量仍有限，较长 settings 可被 plan 拒绝。
 
-The helper appends **only the wrapper bin directory** to `.bashrc` and Bash's existing
-preferred login profile (`.bash_profile`, `.bash_login`, otherwise `.profile`). It
-preserves existing bytes, modes and PATH order. Modified managed blocks, unsafe links,
-foreign files and concurrent profile edits are refused. Profiles that return/exit
-before the appended block can prevent it running; review such profiles explicitly.
-No global PATH or Node installation is changed.
+## 固定工具与输入
 
-Profile edits apply to **fresh shells**; they cannot modify the already-running
-parent agent's environment. Existing terminals and non-Bash programs may need a new
-process or absolute commands. `opencode_command`, `acpx_command` and
-`opencode_task_command` are shell-quoted
-absolute invocations for automation. In HOME mode these expand `"$HOME"` at execution
-time; Terraform cannot know that absolute HOME path. Treat outputs as shell command
-expressions, not executable filenames. Explicit-PVC mode returns a quoted absolute
-path. `status_path` is absolute for an explicit root and null in HOME mode; there
-the status file is `$HOME/.coder-opencode/status.json`. `script_id` identifies the
-startup script. Read `state: ready` in status; agent readiness alone is insufficient.
+需要 Linux x86-64 glibc、Bash、Python 3.11+、curl、tar 和 xz。不编译源码或安装系统前置包。
+首次安装需网络下载经过校验的发行包；核验后的缓存可离线使用。npm 禁用 lifecycle scripts。
 
-## Pinned tools and inputs
+| 输入 | 默认值 |
+| --- | --- |
+| `agent_id` | 必填，现有 Agent ID |
+| `install_root` | 空，启动时使用 `$HOME/.coder-opencode` |
+| `dedicated_volume` | null，显式启用专用卷 root-init 输出 |
+| `release` | null，使用下列固定发行包 |
+| `runtime_profile` | `env`，可选 `none` |
+| `start_blocks_login` | `true` |
+| `install_timeout` | 1200 秒 |
 
-Linux **x86-64 glibc**, Bash, Python **3.11+**, curl, tar and xz are required. No source
-build or package-manager installation of prerequisites occurs. Release and Node
-archives require network on first installation; verified cached reuse is offline.
+OpenCode 固定为公开 prerelease
+[v2.2.0-ricky.1](https://github.com/Ricky-Hao/opencode/releases/tag/v2.2.0-ricky.1)，
+asset `opencode-linux-x64-baseline-v2.2.0-ricky.1.tar.gz`，SHA256
+`09ed8c564754413a7296c12ce147c4b60d98456dc3815db71b399e093ad7ddcd`。
+tag 源码为 `9291b46db483415e1c9bdaa72f8e48637e3f7b49`，基于 upstream v2.2.0
+`1097e2668b1e08ad63bdf0b1c4860b9bc01e420c`。私有 Node 为 **22.23.4**，acpx 为 **0.21.1**。
+不使用 dirty 构建或 moving latest。完整 provenance 见 [UPGRADE.md](UPGRADE.md)。
 
-| Input                   | Default                                                 |
-| ----------------------- | ------------------------------------------------------- |
-| `agent_id`              | Required existing agent ID                              |
-| `install_root`          | Empty: runtime `$HOME/.coder-opencode`                  |
-| `dedicated_volume`      | Null; explicit dedicated-volume root-init output opt-in |
-| `release`               | Null: pinned public release below                       |
-| `runtime_profile`       | `env`; `none` opts out                                  |
-| `start_blocks_login`    | `true`                                                  |
-| `install_timeout`       | `1200` seconds                                          |
+覆盖 OpenCode 须提供完整 `release = { tag, asset, sha256 }` 并先审阅发行物。
+安装核 tag/asset、摘要、metadata、属主和缓存 inventory；不覆盖 Node/acpx 的 pin。
+接口按上述当前版本维护，覆盖发行物不意味着旧协议受支持。
 
-OpenCode is pinned to the published fork release
-[v2.2.0-ricky.1](https://github.com/Ricky-Hao/opencode/releases/tag/v2.2.0-ricky.1),
-asset `opencode-linux-x64-baseline-v2.2.0-ricky.1.tar.gz`, SHA256
-`09ed8c564754413a7296c12ce147c4b60d98456dc3815db71b399e093ad7ddcd`.
-Its clean tagged source is `9291b46db483415e1c9bdaa72f8e48637e3f7b49`,
-based on upstream v2.2.0 (`1097e2668b1e08ad63bdf0b1c4860b9bc01e420c`).
-Do not substitute a dirty local validation build or a moving latest asset.
-Private Node **22.23.4** and acpx **0.21.1** use fixed checksums/dependency lock.
-Node follows the current Node 22 LTS maintenance release; acpx requires Node >=22.13.0.
-该 Release 是 prerelease，非 latest；已核 archive、metadata、tag 与源码 commit。
-发布证据、旧记录恢复限制和负责人试点顺序见 [UPGRADE.md](UPGRADE.md)。
-Node stays off project PATH. npm lifecycle scripts are disabled.
+## Provider、模型和 MCP
 
-To override OpenCode, supply the complete `release = { tag = ..., asset = ...,
-sha256 = ... }` object after reviewing the public artifact. Tag/asset consistency,
-digest, metadata, ownership and cached inventory are checked. Overrides do not
-override Node/acpx. Payload or settings changes create a new fingerprinted version;
-failed installation restores the previous active selection. Old versions are not
-edited or automatically removed. A profile-write failure reports failed installation;
-already-appended safe PATH blocks may remain and are idempotent on retry.
+内置 `env` profile 恰好包含 **copilot、codex**，两者模型定义完整相同，使用 OpenAI Responses，
+不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.1-sol / max**，title 为同 Provider
+Sol/low。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择及外部配置见
+[PROVIDERS.md](PROVIDERS.md)。catalog 不证明服务访问权、价格或可用性。
 
-## Environment-only provider and MCP configuration
+| 模型 | context | input | output | 默认 reasoning |
+| --- | ---: | ---: | ---: | --- |
+| `gpt-6.1-sol` | 400000 | 272000 | 128000 | max |
+| `gpt-6-astra` | 400000 | 272000 | 128000 | medium |
 
-内置 `env` profile 恰好包含 **copilot、codex**，两者均完整提供
-**`gpt-6.1-sol`、`gpt-6-astra`**。默认主模型为 **`codex/gpt-6.1-sol` / max**，
-标题为同 Provider 的 Sol/low。两者使用相同 OpenAI Responses 实现和模型元数据；
-完整一致性回归防止定义漂移，其余 Provider 仍被原策略禁止。
-它们是本地别名，不启用官方 Copilot/Codex 登录。单任务参数、四变量及迁移方法见
-[PROVIDERS.md](PROVIDERS.md)。用户自行提供兼容的端点、密钥和模型访问权。
-catalog 不证明服务可用或官方定价；其中的 settings/cost/limits/variants 是随源码维护的
-非秘密默认值，不会自动同步实际服务。
+保留完整 cost/capabilities/settings 和 low/medium/high/xhigh/max variants。
+固定 fork 的 `SessionCompaction.calculateCeiling` 在显式 buffer 下取 input-buffer，
+不再减 output。input=272000、buffer=13600 时，估算 prompt 258400 触发压缩，
+上下文留 141600=128000+13600 tokens。`SessionModelRequest.outputLimit` 另按剩余上下文
+和未测 input 的 15% 余量拟合 output。这是预算阈值，不能保证大 turn 或估算误差不会溢出。
 
-### Context and input budgeting
+此 pin 的自动 small-model 消费者是 title。使用原生
+`agents.title.model = { providerID, model: "gpt-6.1-sol", variant: "low" }`；主请求仍为 max。
+title 失败可能按主模型重试。压缩使用 session model/agent；普通生成和继承选择的子任务
+不受 title 低档位影响。无需第三模型、全局 small-model 选项或 fork 修改。
 
-| Model         | Context tokens | Input tokens       | Output tokens      | Default reasoning    |
-| ------------- | -------------- | ------------------ | ------------------ | -------------------- |
-| `gpt-6.1-sol`  | 400000         | 272000             | 128000             | `max`                |
-| `gpt-6-astra`  | 400000         | 272000 (unchanged) | 128000 (unchanged) | `medium` (unchanged) |
+<a id="launch-environment"></a>
+## 启动环境
 
-Both retain their existing costs, capabilities and `low`/`medium`/`high`/`xhigh`/`max`
-variants. Compatibility follows **v2.2.0-ricky.1**, commit
-`9291b46db483415e1c9bdaa72f8e48637e3f7b49`, including its
-[`ConfigProvider` model limit/variant schema](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/provider.ts#L75-L114):
+launcher 默认继承启动进程的普通环境，包括代理、自定义认证、其他 Provider 和 disabled MCP
+的变量。disabled 只省略服务配置，不删除环境。模块覆盖 HOME/XDG/TMPDIR、配置和自动更新控制，
+屏蔽原 `OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` 和任务内部控制变量。
+`LC_TASK_CALLBACK*`、`OPENCODE_TASK_CALLBACK*` 以及含 `tcb_` bearer 的值始终过滤。
+不保存环境快照；恢复使用恢复进程当前环境，执行前重新校验已保存选择所需的变量。
 
-- [`SessionCompaction.calculateCeiling`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/compaction.ts#L1133-L1141)
-  uses `(limit.input || limit.context) - compaction.buffer` when the buffer is explicit.
-  It does **not** subtract the output limit. Sol's explicit **272000 = 400000 - 128000**
-  input budget preserves room for the existing full output allowance. The unchanged
-  **13600** buffer then triggers compaction at **258400** estimated prompt tokens,
-  leaving **141600 = 128000 + 13600** tokens in the context window. The buffer is not
-  deducted twice from the configured input limit. Astra keeps the same input cap.
-- [`SessionModelRequest.outputLimit`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/model-request.ts#L85-L90)
-  independently fits output to the remaining context, adding 15% to the unmeasured
-  input estimate. These are
-  local budgeting thresholds, not a hard prompt truncation or a guarantee against
-  provider overflow. An oversized turn or estimation error can still reduce output
-  or invoke the fork's overflow recovery.
+MCP 前缀为 CONTEXT7、FIRECRAWL、GITHUB、GITHUB_ACTIONS。各 `_MCP_ENABLED` 仅接受 1/0，
+缺省关闭。开启时要求 `_MCP_URL`、`_MCP_API_KEY`，可选 `_MCP_AUTH_HEADER`、`_MCP_AUTH_SCHEME`。
+Context7 默认 `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`；其余默认 X-MCP-API-Key、
+空 scheme。Authorization 默认 Bearer，显式空 scheme 可用。OAuth 关闭。
 
-### Auxiliary model and reasoning isolation
+配置只保存 `{env:NAME}`，不将实际值放入 Terraform、settings、argv 或错误。
+拒绝控制/非 ASCII、JSON 插值字符、URL 用户信息/query/fragment/坏端口。
+Provider 须用 HTTPS，loopback 可 HTTP；MCP 支持 HTTP(S)，需要传输保密时使用 HTTPS。
+错误只列变量名。0600 内容寻址配置位于 `runtime/module-profiles`，在自动发现目录外；
+安全父目录锁覆盖首次目录和 owner 创建，已有无标记/外来状态拒绝接管。
 
-The only automatic small-model consumer in this pin is **session title generation**:
+非空 `OPENCODE_MODULE_CONFIG` 优先于内置 profile。`none` 无外部配置时保留显式
+ACP readiness 模型/环境契约；任务 launch 仍须有完整模型配置。help/version 不要求凭据。
+`--module-profile-info` 只报告来源、选择和变量名，不读取凭据或联系服务。
+acpx 默认 deny-all/noninteractive-deny；OpenCode 项目配置合并仍按原生规则。
 
-- [`Model.small`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/model.ts#L306-L318)
-  searches active text models in the primary provider by family (`gpt-luna`,
-  `gemini-flash-lite`, `gemini-flash`, `claude-haiku`). Neither retained model is one
-  of those families; the title selector can use a lower primary-model variant instead.
-- The native override is **`agents.title.model = { providerID: "codex", model:
-  "gpt-6.1-sol", variant: "low" }`**. The pinned
-  [`ConfigAgent.Info`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/agent.ts#L11-L26)
-  and [`ConfigModel.Selection`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/schema/src/config/model.ts#L12-L28)
-  accept this shape. Legacy `small_model` only migrates to the title agent; it is
-  not a global auxiliary setting and is not added to this profile.
-- [`SessionContext.selectTitle`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/context.ts#L94-L124)
-  resolves that model/variant separately from the session (its automatic minimal
-  variant order is `none`, `minimal`, `low`).
-  [`ModelResolver.withVariant`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/model-resolver.ts#L160-L184)
-  overlays settings on a request-local copy, leaving Sol's catalog default and main
-  selection at **max**.
-  [`OpenResponses.lowerGeneration`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/ai/src/protocols/open-responses.ts#L752-L780)
-  lowers `reasoningEffort` to `reasoning.effort`.
-  [`SessionTitle.generate`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/title.ts#L105-L139)
-  handles initial titles and regeneration without coding tools. If the low title
-  request fails, it may retry with the unchanged primary model/variant (normally max).
-- Compaction uses the loaded **session model/agent**, not the hidden `compaction`
-  or `summary` agent's model
-  ([`SessionCompaction.prepare`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/compaction.ts#L833-L850)).
-  Generic [`SessionGenerate.generate`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/generate.ts#L26-L68)
-  also resolves the current session model. Subagents use explicit selections or
-  inherit their parent, not `Model.small`. These paths keep main reasoning; no
-  unsupported global small-model reasoning option, third model or fork change is needed.
+<a id="validation-and-publication-boundary"></a>
+## 验证与交付边界
 
-### Launch environment
+运行 [CONTRIBUTING.md](../CONTRIBUTING.md#fork-local-validation) 的 fork 检查。
+任务、pinned acpx、完整 CLI 和正式包 Responses/回调隔离 fixture 命令见
+[TASKS.md](TASKS.md#verification-and-rollout-boundary)。均使用合成凭据、mock ACP 或 loopback，
+不调用真实 Provider/MCP/QQ 或付费推理。
 
-所有 launcher 默认继承当前启动进程的环境，无需列变量名。代理（含大小写形式）、自定义变量、
-工具认证、其他 Provider 和 disabled MCP 的变量均保留；`env`、`none`、外部配置和
-help/version 使用相同规则。MCP 开关只决定是否生成服务配置，不删除其环境变量。
-内置 profile 的 Provider/模型策略和变量校验保持，继承其他 Provider 的变量不会启用它。
+真实 Terraform 检查命令：
 
-模块仍覆盖 `HOME`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME`、
-`XDG_STATE_HOME`、`TMPDIR`、`OPENCODE_CONFIG_DIR` 和自动更新控制；原始
-`OPENCODE_CONFIG`/`OPENCODE_CONFIG_CONTENT` 及任务内部控制变量不能覆盖模块选择。
-任务回调协议的 `LC_TASK_CALLBACK*`、`OPENCODE_TASK_CALLBACK*`，以及含 `tcb_` bearer
-的值始终过滤，不传给模型子进程。模块不保存环境快照。
+```sh
+python3 -B opencode/tests/validate_terraform.py --terraform /path/to/terraform --provider-dir /path/to/mirror --scratch /new/private/directory
+```
 
-| Environment names                                                                                   | Contract                                                         |
-| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| `CODEX_BASE_URL`, `CODEX_API_KEY`                                                                   | 默认 codex 任务所需；缺少则失败，不回退 |
-| `COPILOT_BASE_URL`, `COPILOT_API_KEY`                                                               | 显式 copilot 任务所需；另一个完整未配置可跳过 |
-| `CONTEXT7_MCP_ENABLED`, `FIRECRAWL_MCP_ENABLED`, `GITHUB_MCP_ENABLED`, `GITHUB_ACTIONS_MCP_ENABLED` | Only literal `1` enables; absent/`0` disables; other values fail |
-| Each enabled prefix's `_MCP_URL`, `_MCP_API_KEY`                                                    | Required endpoint/key, child env only                            |
-| Each prefix's `_MCP_AUTH_HEADER`, `_MCP_AUTH_SCHEME`                                                | Optional validated nonsecret header/scheme                       |
-
-Context7 defaults to `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`. The other
-three default to `X-MCP-API-Key: {env:..._MCP_API_KEY}`. An Authorization header
-defaults to Bearer; other headers default to no scheme. Explicit empty scheme is
-allowed. OAuth is disabled. Disabled MCP entries are omitted from config; their
-environment variables remain inherited. The environment also survives acpx -> OpenCode.
-
-Endpoints/keys remain **`{env:NAME}` references** in generated config; resolved
-values are never put in Terraform, installer settings, argv or module errors.
-Header names/schemes are literal nonsecret settings; enable flags select entries.
-Validation rejects control/non-ASCII characters, JSON interpolation delimiters,
-URL credentials/query/fragment/invalid ports. Provider endpoints require HTTPS except loopback HTTP;
-MCP allows HTTP(S), so supply HTTPS when transport confidentiality is needed.
-Errors identify missing/invalid **variable names only**.
-
-Content-addressed configs are written atomically at mode 0600 under
-`runtime/module-profiles`, outside automatic config discovery. A safe parent lock
-covers first directory and marker creation; simultaneous first launches cannot
-mistake an in-progress directory for foreign state. Existing unmarked/foreign state
-is still refused. Install/help/version require no keys. `--module-profile-info`
-reports names and selection without reading credentials or contacting services.
-
-**Precedence:** nonempty `OPENCODE_MODULE_CONFIG` selects an explicit user JSON file
-over the bundled profile. External configs inherit the same launch environment and
-can use its `{env:NAME}` references directly. `none` without
-an external file keeps the explicit model/readiness-env contract. acpx keeps
-deny-all/noninteractive-deny defaults; there is no automatic permission escalation.
-OpenCode's own project config merging still applies. Do not print resolved debug
-config, verbose service logs or environment values as a credential check.
-
-内置 profile 不再使用 `LLM_BASE_URL`、`LLM_API_KEY`，迁移由操作者在原 Secret/env
-机制中完成。另一个 Provider 部分填写或已填写的值无效时，只报告变量名。
-`opencode-task submit --model copilot/gpt-6.1-sol --variant max` 可显式选择；省略参数
-默认 codex。任务配置与 ACP 选择共同固定主请求、title 和辅助请求的 Provider，
-不修改全局默认。named session 固定选择，冲突须换新 session；见 [TASKS.md](TASKS.md)。
-
-## Validation and publication boundary
-
-HOME setup、dedicated-mount startup 和 PATH 设置已通过离线 fixtures；
-正式 v2.2.0-ricky.1 包另通过隔离首次/缓存安装与真实 ACP loopback。
-这些检查不代表新 Workspace 的 live 验收或 registry 发布。
-
-Run self-contained fixtures: `python3 -B -m unittest discover -s opencode/tests -v`.
-They use synthetic archives/keys and mocked downloads, never real tools or services.
-For actual Terraform validation/rendering use `tests/validate_terraform.py --terraform
-<binary> --provider-dir <cached-provider-mirror> --scratch <new-directory>`. This
-requires Terraform 1.7+ for mock-provider tests; no apply or cluster is used.
-It also enforces the script budget, rejects an oversized plan, and executes the
-rendered HOME/dedicated startup through the real Linux argument path using local
-synthetic archives. The installer, cache and startup recovery paths run; no model
-or live provider is invoked.
-
-当前正式包回环使用私有 Node 22.23.4、acpx 0.21.1，验证默认 codex、显式 copilot、
-各自 Provider 的主请求 max/title low，并在 copilot 之后返回原 codex named session
-成功追问、保留历史。上轮恢复取消队列证据保留，旧 SQLite 疑点的定向结论见
-[UPGRADE.md](UPGRADE.md)。所有 Responses/回调均为本地 fixture，MCP disabled；
-真实 Provider/MCP 与 Workspace 试点尚需环境管家执行。
-
-Before publication, review the added files and fixed source revision, then separately
-verify first/repeat startup on root/nonroot images, mount persistence, fresh Bash and
-absolute automation commands, model/variant and bounded read-only MCP operations.
-Use a module-hosted process with the real launch env. Status-only or direct external
-service probes do not establish end-to-end integration. No permissions should be
-broadened or agent toolsets changed to make acceptance tests pass.
+需要 Terraform 1.7+ 和缓存 provider；执行 init、validate、mock plan/render、超预算拒绝、
+真实 Linux `env bash -c` 首次/缓存启动及恢复/数据保留，不 apply 或使用集群。
+Python fixtures 另核 root/UID65534、安全 PVC group、PATH 和私有文件边界。
+本地检查不证明真实服务健康，也不发布、激活模板或重启 Workspace。
 
 ## License
 
-Module code follows this repository's Apache-2.0 framework license. The installed
-OpenCode distribution retains its MIT notice in [LICENSE.opencode](LICENSE.opencode)
-and its verified release package; acpx/npm dependencies retain their upstream notices.
+模块沿用仓库 Apache-2.0 许可。安装的 OpenCode 保留
+[MIT notice](LICENSE.opencode) 及已校验发行包中的许可；acpx/npm 依赖保留上游 notice。

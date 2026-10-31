@@ -37,12 +37,15 @@ const runtime = {
     };
   },
   async *watchSession() {
+    yield { type: 'message', requestId, cursor: '0', message: { params: { update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Module result accepted across repositories.' } } } } };
     yield { type: 'turn_result', requestId, cursor: '1', result: { status: input.result ?? 'completed' } };
   },
 };
 try {
   const runner = new TaskRunner({ root, runtime });
   const accepted = runner.submit({
+    model: { id: 'fixture/test' }, modelConfig: path.join(root, 'config.json'), modelProfile: 'external',
     key: "protocol-integration",
     prompt: "Complete the fixture task.",
     cwd: root,

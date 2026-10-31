@@ -9,14 +9,15 @@ import { TaskRunner, HEALTH_DEFAULTS, save } from "../scripts/task.mjs";
 import { inspectTask, listTasks, readJson, RECORD_BYTES, PAGE_BYTES } from "../scripts/task-read.mjs";
 
 const callback = { callback_id: `tcb_${"q".repeat(43)}`, callback_url: "http://localhost:1/api/agents/task-callbacks" };
+const intent = { model: { id: 'codex/gpt-6.1-sol', variant: 'max' }, modelConfig: '/fixture/config.json', modelProfile: 'env' };
 function fixture(t, count = 1) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-read-"));
   fs.chmodSync(root, 0o700);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const runner = new TaskRunner({ root, now: () => 100000 });
-  const ids = Array.from({ length: count }, (_, index) => runner.submit({ key: `key-${index}`, cwd: root,
+  const ids = Array.from({ length: count }, (_, index) => runner.submit({ ...intent, key: `key-${index}`, cwd: root,
     prompt: "PRIVATE-PROMPT", callback, ...(index % 2 ? { session: "shared" } : {}) }).task_id);
-  for (const method of ["execute", "cancel", "deliver", "resolve", "write", "observe"])
+  for (const method of ["execute", "cancel", "deliver", "write", "observe"])
     runner[method] = () => { throw new Error(`unexpected mutation: ${method}`); };
   return { root, runner, ids, id: ids[0] };
 }
@@ -82,23 +83,24 @@ test("small limits never parse all historical records; cursors bind filters and 
     assert.throws(() => listTasks(runner, flags));
 });
 
-test("empty, missing, legacy, malformed and unsafe records have explicit bounded coverage", (t) => {
+test("empty, missing, unsupported, malformed and unsafe records have explicit bounded coverage", (t) => {
   const { root, runner, id } = fixture(t, 0);
   assert.deepEqual(listTasks(runner).items, []);
   assert.equal(listTasks(runner).coverage.complete, true);
   assert.throws(() => inspectTask(runner, `task_${"0".repeat(64)}`), { code: "ENOENT" });
   const ids = [];
-  for (let index = 0; index < 7; index++) {
+  for (let index = 0; index < 8; index++) {
     const key = `task_${String(index).repeat(64)}`;
     ids.push(key);
     fs.mkdirSync(path.join(root, key), { mode: 0o700 });
-    save(path.join(root, key, "task.json"), { version: 1, id: key, requestId: "old-request", state: "queued", callback });
+    save(path.join(root, key, "task.json"), { ...intent, version: 1, id: key, requestId: "request", state: "queued", callback,
+      createdAt: 10000, permissions: { mode: 'deny-all', policy: {} } });
   }
-  const legacy = inspectTask(runner, ids[0]);
-  assert.equal(legacy.health, null);
-  assert.equal(legacy.timing.started_at, null);
-  assert.equal(legacy.durations.accepted_to_started.ms, null);
-  assert.equal(legacy.callback.retry_count, null);
+  const pending = inspectTask(runner, ids[0]);
+  assert.equal(pending.health, null);
+  assert.equal(pending.timing.started_at, null);
+  assert.equal(pending.durations.accepted_to_started.ms, null);
+  assert.equal(pending.callback.retry_count, null);
   for (const bad of [[], null, "PRIVATE-RAW-ERROR"]) {
     save(runner.filename(ids[0], "worker.json"), bad);
     assert.throws(() => inspectTask(runner, ids[0]), /INVALID_TASK_RESULT/);
@@ -112,9 +114,11 @@ test("empty, missing, legacy, malformed and unsafe records have explicit bounded
   fs.unlinkSync(runner.filename(ids[5]));
   spawnSync("mkfifo", ["-m", "600", runner.filename(ids[5])]);
   fs.unlinkSync(runner.filename(ids[6]));
+  save(runner.filename(ids[7]), { version: 1, id: ids[7], state: 'ambiguous', callback });
   const page = listTasks(runner);
   assert.equal(page.items.length, 1);
-  assert.equal(page.errors.length, 6);
+  assert.equal(page.errors.length, 7);
+  assert.ok(page.errors.some((entry) => entry.code === 'UNSUPPORTED_TASK_RECORD'));
   assert.equal(page.coverage.exhausted, true);
   assert.equal(page.coverage.complete, false);
   assert.equal(page.coverage.records_checked, 1);
@@ -194,6 +198,7 @@ test("inspect separates stale observations, wall-clock differences and unknown b
   const { runner, id } = fixture(t);
   const record = runner.load(id);
   Object.assign(record, { state: "ambiguous", createdAt: 10000, startedAt: 9000,
+    outputTruncated: false,
     supervisionFailedAt: 20000, callbackDeliveredAt: 30000, attempts: 2,
     notificationKind: "supervision_failure", notificationState: "delivered", resultStatus: "success",
     body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "error", output: "PRIVATE-OUTPUT" }),
@@ -257,9 +262,9 @@ test("installed launcher queries do not initialize storage, materialize profiles
   fs.mkdirSync(tasks, { mode: 0o700 });
   save(path.join(tasks, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "readonly-fixture" });
   const runner = new TaskRunner({ root: tasks });
-  const accepted = runner.submit({ key: "readonly", prompt: "PRIVATE-PROMPT", callback, cwd: base });
+  const accepted = runner.submit({ ...intent, key: "readonly", prompt: "PRIVATE-PROMPT", callback, cwd: base });
   const record = runner.load(accepted.task_id);
-  Object.assign(record, { state: "outbox", resultStatus: "success", attempts: 0, nextAttemptAt: 0,
+  Object.assign(record, { state: "outbox", resultStatus: "success", attempts: 0, nextAttemptAt: 0, outputTruncated: false,
     body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "success", output: "SEALED RESULT" }) });
   save(runner.filename(accepted.task_id), record);
   before = snapshot(root);
