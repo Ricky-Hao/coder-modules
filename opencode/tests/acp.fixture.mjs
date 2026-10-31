@@ -29,13 +29,31 @@ const configOptions = () => [
     options: ['low', 'medium', 'high', 'xhigh', 'max', 'default'].map((value) => ({ value, name: value })) },
 ];
 const pending = new Map();
-if (process.env.TASK_FIXTURE_PROCESS_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_PROCESS_LOG,
-  JSON.stringify({ agent: process.pid, owner: process.ppid,
-    startTicks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\s+/)[19],
-    ownerStartTicks: fs.readFileSync(`/proc/${process.ppid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19] }) + "\n");
+let fixtureOwner = process.ppid;
+if (process.env.TASK_FIXTURE_PROCESS_LOG) {
+  const ticks = (pid) => fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19];
+  const identity = { agent: process.pid, startTicks: ticks(process.pid),
+    owner: null, ownerStartTicks: null, invalidOwner: true, observedParent: process.ppid };
+  try {
+    const parent = identity.observedParent;
+    if (parent > 1) {
+      const birth = ticks(parent);
+      const command = fs.readFileSync(`/proc/${parent}/cmdline`, 'utf8').split('\0');
+      const toolset = path.join(path.dirname(process.env.TASK_FIXTURE_PROCESS_LOG), 'toolset');
+      if (command.some((arg) => [path.join(toolset, 'versions/fixture/node/bin/node'),
+        path.join(toolset, 'active/node/bin/node')].includes(arg)) &&
+          process.ppid === parent && ticks(parent) === birth) {
+        identity.owner = parent; identity.ownerStartTicks = birth; identity.invalidOwner = false;
+      }
+    }
+  } catch (error) { identity.ownerObservationError = error.code ?? 'UNAVAILABLE'; }
+  fixtureOwner = identity.owner;
+  // 即使在启动时已被收养，agent 自身出生身份也必须独立登记；不能把 PID 1 当 owner。
+  fs.appendFileSync(process.env.TASK_FIXTURE_PROCESS_LOG, JSON.stringify(identity) + "\n");
+}
 const fixtureEvent = (type, sessionId) => {
   if (process.env.TASK_FIXTURE_EVENT_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_EVENT_LOG,
-    JSON.stringify({ type, sessionId, agent: process.pid, owner: process.ppid, at: Date.now() }) + "\n");
+    JSON.stringify({ type, sessionId, agent: process.pid, owner: fixtureOwner, at: Date.now() }) + "\n");
 };
 function call(method, params, receive) {
   const id = randomUUID();
@@ -91,6 +109,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }
     if (process.env.TASK_FIXTURE_LOG)
       fs.appendFileSync(process.env.TASK_FIXTURE_LOG, "prompt\n");
+    fixtureEvent("prompt_received", request.params.sessionId);
     const finish = (text = "Pinned ACP result") => {
       send({
         method: "session/update",
@@ -111,20 +130,35 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         data: { service: "session", errorName: "provider.internal" } } });
     } else if (text === "agent exit") process.exit(23);
     else if (text === "silent forever") {
-      // 保持 ACP 连接/进程存活，已开始的请求不再发送事件，也永不完成。
-      fixtureEvent("silent_started", request.params.sessionId);
-      active = { request };
+      // 先保持进展，待同 session 跟随请求排队后再注入永久静默，终态永不返回。
+      active = { request, timer: setInterval(() => {
+        if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.stall`))) {
+          clearInterval(active.timer);
+          fixtureEvent("silent_started", request.params.sessionId);
+        } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+          update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault progress." } } } });
+      }, 100) };
     } else if (text === "recover thought progress") {
-      fixtureEvent("quiet_started", request.params.sessionId);
+      fixtureEvent("thought_ready", request.params.sessionId);
+      let quiet = false;
       let resumed;
       active = { request, timer: setInterval(() => {
+        if (!quiet) {
+          if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.quiet`))) {
+            quiet = true;
+            fixtureEvent("quiet_started", request.params.sessionId);
+          } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+            update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault thought." } } } });
+          return;
+        }
         // 测试观察到 suspected 后，仅解除合成 peer 的静默，不改任务状态。
         if (!fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, request.params.sessionId))) return;
         if (resumed === undefined) {
           resumed = performance.now();
           fixtureEvent("thought_resumed", request.params.sessionId);
         }
-        if (performance.now() - resumed >= 1600) {
+        if (performance.now() - resumed >= 1600 &&
+            fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.finish`))) {
           clearInterval(active.timer);
           fixtureEvent("thought_completed", request.params.sessionId);
           reply({ stopReason: "end_turn" }); // 全程没有 assistant 文字。

@@ -2,7 +2,32 @@
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { Confirmation, delay, deliveryState, privateFile, save } from "./task.mjs";
+import { Confirmation, delay, deliveryState, save } from "./task.mjs";
+
+export function readWorkerHeartbeat(filename) {
+  // rename may unlink the inode between lookup and stat. Validate/read one fd;
+  // retry only that replaced private inode, without relaxing link/permission checks.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let fd;
+    try {
+      fd = fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    try {
+      const info = fs.fstatSync(fd);
+      if (!info.isFile() || info.uid !== process.getuid() || info.mode & 0o077)
+        throw new Error("UNSAFE_TASK_FILE");
+      if (info.nlink === 0) continue;
+      if (info.nlink !== 1) throw new Error("UNSAFE_TASK_FILE");
+      return JSON.parse(fs.readFileSync(fd, "utf8"));
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  // No verified sample: retain the original last-progress budget and confirmation.
+}
 
 export function workerHeartbeat(runner, id, token) {
   let phase = "starting";
@@ -37,20 +62,25 @@ async function driver(runner, id, launch, observe, report) {
     if (!child || checking) return;
     checking = true;
     try {
-      const filename = runner.filename(id, "worker.json");
-      if (fs.existsSync(filename)) {
-        const beat = JSON.parse(fs.readFileSync(privateFile(filename), "utf8"));
+      let beat;
+      let unreadable = false;
+      try { beat = readWorkerHeartbeat(runner.filename(id, "worker.json")); }
+      catch { unreadable = true; } // Untrusted/unreadable samples never renew the lease.
+      if (beat) {
         if (beat.token === token && Number.isSafeInteger(beat.sequence) && beat.sequence !== sequence) {
           sequence = beat.sequence;
           observedAt = runner.tick();
         }
       }
-      const reason = runner.tick() - observedAt > runner.policy.workerMs ? "WORKER_UNRESPONSIVE" : undefined;
+      // Once the last valid heartbeat expires, changing read failures cannot renew confirmation.
+      const reason = runner.tick() - observedAt > runner.policy.workerMs ? "WORKER_UNRESPONSIVE" :
+        unreadable ? "WORKER_HEARTBEAT_UNREADABLE" : undefined;
       const previousSuspicion = confirmation.since;
+      if (confirmation.reason && reason && confirmation.reason !== reason) confirmation.update(undefined);
       const confirmed = confirmation.update(reason);
       report(reason, confirmed, previousSuspicion !== confirmation.since);
       if (confirmed) {
-        stopReason = "WORKER_UNRESPONSIVE";
+        stopReason = reason;
         // Only this unreaped child is signalled. Never act on a persisted PID.
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       }
