@@ -58,6 +58,7 @@ elif sys.argv[1].endswith('npm-cli.js'):
     assert sys.argv[2:] == ['ci','--ignore-scripts','--no-audit','--no-fund']
     dest=Path('node_modules/acpx/dist');dest.mkdir(parents=True)
     (dest/'cli.js').write_text('fixture only')
+    (dest.parent/'package.json').write_text('{"version":"0.21.1"}')
 elif sys.argv[-1] == '--version':
     print('0.21.1')
 elif sys.argv[1].endswith('task-cli.mjs') and sys.argv[2:] == ['recover']:

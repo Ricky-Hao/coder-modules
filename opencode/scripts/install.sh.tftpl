@@ -8,6 +8,7 @@ exec python3 -B - <<'OPENCODE_BOOTSTRAP'
 import base64, gzip, json, sys
 if sys.version_info < (3, 11):
     sys.exit("OpenCode requires Python 3.11+")
-BUNDLE = json.loads(gzip.decompress(base64.b64decode('${bundle}')))
+parts = gzip.decompress(base64.b64decode('${bundle}')).decode().split('\0')
+BUNDLE = {'config': json.loads(parts[0]), 'files': dict(zip(parts[1::2], parts[2::2], strict=True))}
 exec(compile(BUNDLE['files']['install.py'], '<opencode-installer>', 'exec'))
 OPENCODE_BOOTSTRAP

@@ -16,11 +16,11 @@ run "agent_only" {
     error_message = "Default startup must own blocking installation and PATH setup."
   }
   assert {
-    condition     = jsondecode(base64decode(local.bundle)).config.install_root == ""
+    condition     = jsondecode(split("\u0000", local.bundle)[0]).install_root == ""
     error_message = "HOME must be resolved at runtime."
   }
   assert {
-    condition     = jsondecode(base64decode(local.bundle)).config.workspace_id == data.coder_workspace.me.id
+    condition     = jsondecode(split("\u0000", local.bundle)[0]).workspace_id == data.coder_workspace.me.id
     error_message = "Workspace identity must be derived internally."
   }
   assert {
@@ -36,7 +36,7 @@ run "agent_only" {
     error_message = "Automation must not rely on agent PATH."
   }
   assert {
-    condition     = output.opencode_task_command == "\"$HOME\"/.coder-opencode/bin/opencode-task" && contains(keys(jsondecode(base64decode(local.bundle)).files), "task.mjs")
+    condition     = output.opencode_task_command == "\"$HOME\"/.coder-opencode/bin/opencode-task" && alltrue([for name in ["task.mjs", "task-read.mjs", "diagnostics.py"] : contains(keys(local.bundle_files), name)])
     error_message = "Detached task wrapper and runtime must be bundled together."
   }
 }

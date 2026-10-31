@@ -214,7 +214,8 @@ def information(profile, external, environ, version):
         return {'source': 'external' if external else 'none', 'automatic_environment_names': []}
     if profile != 'env':
         raise ValueError('unknown runtime profile')
-    selected = json.loads((version / 'profile-env.json').read_text())['model']
+    from diagnostics import read_json
+    selected = read_json(version / 'profile-env.json')['model']
     enabled = enabled_servers(environ)
     return {'source': 'env', 'model': selected,
             'enabled_mcp': [name.lower().replace('_', '-') for name in enabled],

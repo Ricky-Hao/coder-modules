@@ -5,7 +5,7 @@
 model selection, provider/MCP profile and permission defaults. No acpx patch,
 session migration, parent-volume ownership change, or task dashboard is involved.
 
-The installer bundles/fingerprints/inventories `task.mjs`, `task-cli.mjs`,
+The installer bundles/fingerprints/inventories `task.mjs`, `task-read.mjs`, `diagnostics.py`, `task-cli.mjs`,
 `task-acp.mjs` and `task-supervisor.mjs`, installs
 `bin/opencode-task`, and invokes `recover` on startup. Terraform exposes the
 shell-quoted `opencode_task_command`. Repeat installation preserves `runtime/tasks`,
@@ -40,6 +40,9 @@ opencode-task submit --key astra-123 --model copilot/gpt-6-astra --variant high 
 opencode-task submit --key ticket-123-fix --session ticket-123 --permission-mode approve-all --prompt-file ./fix.txt < /private/fix-registration.json
 opencode-task status task_<64-hex-digest-from-submit>
 opencode-task result task_<64-hex-digest-from-submit>
+opencode-task list --state ambiguous --limit 10
+opencode-task inspect task_<64-hex-digest-from-submit>
+opencode-task doctor
 opencode-task recover
 # Recover only the original task when inspecting an interruption:
 opencode-task recover task_<64-hex-digest-from-submit>
@@ -60,6 +63,112 @@ takes both task locks and rechecks that no worker attempted execution before
 sealing a safe setup error. It retains the monitor lock and retries the outbox;
 an existing concurrent monitor keeps ownership.
 An unsent outbox survives for startup or `recover TASK_ID`.
+
+### 只读查询与离线安装自检
+
+`list`、`inspect`、`doctor`、`status`、`result` 不启动模型、执行、observer、恢复、取消或
+callback，不依赖 Provider key，不创建目录、锁文件、配置或任务，也不迁移、补写旧 schema。
+没有安装或 tasks 存储时报告缺失，不能用查询来初始化。只有 `result` 返回封存业务 output；
+其他入口不返回 prompt、output、callback 注册、cwd、原始错误或凭据。
+
+```sh
+opencode-task list
+opencode-task list --state running --session ticket-123 --limit 5 --scan-limit 50
+opencode-task list --state ambiguous --cursor '<上页 next_cursor>'
+opencode-task inspect task_<64-hex-digest-from-submit>
+opencode-task doctor
+# 稳定入口或 active 缺失时，在已审阅的源码 checkout 中直接检查：
+python3 -B opencode/scripts/diagnostics.py --root /mnt/opencode/toolset
+```
+
+`list` 的 `--state` 精确匹配 `queued|dispatching|running|ambiguous|outbox|delivered|rejected`。
+这是记录的执行器状态，不是实时健康；监督通知已 delivered 的任务仍可为 ambiguous。
+`--session` 精确匹配提交时的 session name，不按 backend session ID 匹配。两项可组合。
+默认 `--limit 20`、`--scan-limit 100`，上限分别为 50 和 200，均为正整数。
+
+列表行复用 result 的安全元数据：`task_id`、`request_id`、`session_name`、`session_key`、
+`session_id`、`acpx_record_id`、`state`、`result_status`、`callback_status/state/kind`、`timing`。
+未知标识和时间为 null。列表不读心跳、journal 或业务日志，不计算全库总数。
+每条 task.json 最多读取 8 MiB，每页最多读取 32 MiB 记录；超限不解析。各字符串有类型和
+长度限制，最多返回 50 行及 200 条安全错误，不把历史原文拼入响应。
+
+`coverage` 必须和 `items` 一起读取：
+
+- `directory_entries_read` 是本页 helper 取出的目录项数，最多 scan-limit；包括隐藏的非任务项。
+  libc 可在内部预读固定大小目录块，不加载整个目录。小 limit 仍可能预取本页剩余目录项。
+- `entries_scanned` 是实际处理并推进游标的目录项数；`records_checked` 是成功投影的任务数，
+  包括被筛选掉的记录；`records_failed` 对应 `errors`。未检、失败和未匹配不是同一回事。
+- `record_bytes_read`、`record_limit_bytes`、`page_read_limit_bytes` 说明读取预算。
+  字节预算不足时停在未检项之前；单条超限、坏记录或 unsafe 项会返回 task_id 和安全 code。
+- `stop_reason` 为 `limit|scan_limit|read_budget|end`。`next_cursor` 为 null 才表示目录采样到结尾；
+  `exhausted` 不证明采样后没有新增。`remaining_records` 始终为 null，不能从空 items 推断空库。
+- `complete` 只表示本页已到目录结尾且本页无记录错误，不代表前页无错或整个历史已核验。
+  调用者须保留各页错误，合并所有页后才能讨论覆盖范围。
+
+顺序使用 Linux x86-64 glibc 的目录 cookie，不排序，不新增索引或扫描服务。游标直接续读，
+不从头跳过所有旧记录。续页须保持筛选条件。目录 inode、mtime/ctime 等身份变化会报
+`CURSOR_STALE`；目录内新增 task、锁或 session 元数据都可能使它失效。此时不带 cursor 重查，
+按 task_id 去重。游标是 opaque 值，不能修改或跨存储复用。每页只验证枚举期间的目录身份；
+记录逐条采样，状态变化不会产生一个跨任务或跨页的事务快照。并发更新可影响筛选结果。
+
+`inspect TASK_ID` 复用 result/status 投影，省略所有 output 字段，保留终态来源、receipt 和
+安全 health、model/variant、权限 mode 和 cancel_requested。`execution` 增加已保存的 `worker_attempted_at`、`dispatched_at`、
+`original_request_observed`；队列成员、agent 存活和真正死锁均为 unknown。`health` 中的
+phase/progress 可说明初始化、dispatch、执行、工具活动和 Provider retry；这是最后保存的样本。
+`health.policy_ms` 只取当时保存的实际策略，不套用当前环境或给旧记录补生产默认值。
+
+`durations` 每项为 `{ms,basis}`：接受到 worker attempt、attempt 到 dispatch、dispatch 到
+started、接受到 started、started 到 terminal、terminal 到最近 callback attempt/确认投递，
+以及监督通知封存到确认投递。接受到 started 包括排队与初始化，不能证明 acpx 队列成员关系。
+terminal 到 attempt 使用最近一次尝试，不是首次投递延迟。缺任一端点为
+`missing_timestamp`/null；反向时间为 `wall_clock_reversed`/null；其余为
+`wall_clock_difference`，不是 CPU time 或原始远端事件的精确耗时。正向时钟跳变仍可能影响差值。
+
+`observations` 返回 health、owner_probe、last_event、monitor、worker、owner 的
+`at/age_ms/freshness/stale_after_ms`。未来时间的 age 为 null，freshness 为 future_timestamp；
+无时间或无可用陈旧阈值为 unknown。health/owner probe 阈值取保存策略的 `2*(poll+probe)`，
+monitor 为 `2*poll`，worker 为 workerMs，owner 为已有 lease 的 15000 ms。超过阈值为 stale，
+其余为 recent。recent 也只是墙钟较近，不证明请求、进程或服务实时健康。last_event 不推断
+陈旧阈值。journal availability 没有独立读取时间，只能结合历史 health 样本解释；查询不读 journal。
+这些采样文件与 task.json 不是同时读取，不能据其组合猜测当前启动 token 或 agent 状态。
+
+`callback` 返回 state/kind/status、`retry_count`、`next_attempt_at` 和安全 delivery_error。
+retry_count 是已有 attempts 字段记录的重试安排次数：成功或最终拒绝那次不增加它，进程中断
+也可能早于计数持久化，不能当作完整 POST 次数。旧计数缺失为 null。只有 outbox 返回下一次
+已保存的尝试时间；过期 deadline 不证明 monitor 正在工作。receipt/202 仍只证明存储及 handoff。
+inspect 不改 sealed body，也不因陈旧 health 改业务 result_status。
+
+`doctor` 是本机安装自检。它核对实际 active 绑定、稳定 wrapper 的精确脚本、私有目录/owner、
+安装 inventory、启动链文件、OpenCode/私有 Node 二进制摘要及可执行 mode、release metadata、
+acpx package version、status task capability，并复用 `--module-profile-info` 的 profile 说明。
+版本以 `installed_inventory_and_metadata` 为证据且 `executed: false`；不运行 `--version`、
+OpenCode、acpx、Node/agent 或任何任务。固定检查项中，二进制最多读取 352+160 MiB，
+manifest 最多 8 MiB，其余文件各最多 1 MiB；不递归遍历依赖树或任务历史。
+它沿用当前 UID/root/可信 PVC group 的信任边界，不是对抗同 UID 改写 inventory 的远程证明。
+
+doctor 遇首个失败即停，`checks` 区分 ok、failed、not_checked，返回安全 code；不能把后续项
+算作通过。`runtime/features/profile` 在对应阶段未完成时为 null。none/external profile 保留原
+边界，external 文件不打开，环境仅用于既有 profile 选择和 MCP enable flag；不读取或打印认证值。
+`not_checked` 明列 Provider/MCP 健康、外部配置内容、agent 执行、任务历史、全依赖 inventory 和
+运行时版本执行。静态 ready、文件存在及版本匹配都不证明实际 Provider 健康。
+
+只读错误为安全 JSON `{error:{code,hint}}`，不附原始异常、路径或记录原文。
+命令/存储级失败及 doctor failed 退出 1；成功退出 0。list 可退出 0 并带逐记录 errors，须检查
+coverage。常见 code：`TASK_STORE_MISSING`（先核对安装和任务是否存在）、`TASK_NOT_FOUND`
+（核对原 task_id）、`INVALID_ARGUMENTS/INVALID_CURSOR`（核对参数和筛选）、`CURSOR_STALE`
+（重新分页）、`TASK_RECORD_TOO_LARGE/TASK_READ_BUDGET`（有界读取停止）、
+`TASK_RECORD_CHANGED`（三次原子替换均无稳定样本，或同 inode 读取期间增长）、`INVALID_TASK_RESULT`（坏投影记录）、
+`UNSAFE_TASK_FILE/UNSAFE_TASK_DIRECTORY`（保留记录并核对私有权限/属主/类型/链接）。
+Node 查询依赖缺失时返回 TASK_MODULE_UNAVAILABLE；若 Python launcher 本身已不完整而无法启动，
+使用上面的源码 doctor 入口检查，不把无法启动当作服务健康结论。
+doctor/launcher 另用 `MISSING|READ_LIMIT|FILE_CHANGED|UNSAFE_FILE|OWNER_MISMATCH|INVALID_RECORD|
+INSTALLATION_MISMATCH|READ_FAILED` 定位检查阶段；未知内部读错误只报 TASK_READ_FAILED。
+未知历史 reason/error 映射为 UNKNOWN_RECORDED_CODE，不能把原始错误当安全 code 输出。
+
+task.json、心跳和取消标记均通过 O_NOFOLLOW/O_NONBLOCK 打开，在同一 fd 上校验普通文件、
+当前 UID、私有 mode、单链接再有界读取。只有其他属性安全的 nlink=0 才重开，最多三次；
+不会把合法原子替换误报为非法链接。真正 unsafe 或坏记录失败关闭。health 小文件上限 16 KiB。
+旧的 worker 心跳确认策略保持，读取查询不会启动监护或覆盖旧失败事实。
 
 ### 有界结果读取与时间
 
@@ -386,6 +495,7 @@ is migrated or deleted.
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
 node --test opencode/tests/task.test.mjs opencode/tests/task-supervisor.test.mjs
+node --test opencode/tests/task-read.test.mjs
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/runtime.test.mjs
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs

@@ -27,10 +27,12 @@ test(
       fs.chmodSync(dir, 0o700);
     for (const name of [
       "runtime.py",
+      "diagnostics.py",
       "safety.py",
       "profiles.py",
       "profile-env.json",
       "task.mjs",
+      "task-read.mjs",
       "task-cli.mjs",
       "task-acp.mjs",
       "task-supervisor.mjs",
@@ -39,7 +41,7 @@ test(
     // Only this synthetic fixture may expose diagnostics from its copied worker.
     const copiedCli = path.join(version, 'task-cli.mjs');
     fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
-      '} catch (error) {\n  // No raw', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // No raw`).replace(
+      '} catch (error) {\n  // 仅输出安全码。', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // 仅输出安全码。`).replace(
       'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise', '_fail_launch'].includes(command)) {
         process.on('uncaughtExceptionMonitor', (error) => {
           try { fs.appendFileSync(${JSON.stringify(path.join(base, 'driver-errors.ndjson'))}, JSON.stringify({

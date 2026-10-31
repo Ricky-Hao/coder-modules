@@ -22,7 +22,7 @@ NODE_SHA256 = '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce'
 NODE_URL = 'https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz'
 ACPX_VERSION = '0.21.1'
 TARGET = 'opencode-linux-x64-baseline'
-PAYLOAD_FILES = {'install.py', 'runtime.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
+PAYLOAD_FILES = {'install.py', 'runtime.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}
 
 

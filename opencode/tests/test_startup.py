@@ -248,7 +248,7 @@ class StartupTests(unittest.TestCase):
         self.fixture.bundle['config']['install_root'] = str(root)
         self.fixture.install()
         manifest = json.loads((root / 'active/installed.json').read_text())
-        for name in ('task.mjs', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs'):
+        for name in ('task.mjs', 'task-read.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs'):
             self.assertIn(name, manifest['files'])
         self.assertIn('opencode-task', {p.name for p in (root / 'bin').iterdir()})
         task = root / 'runtime/tasks' / ('task_' + 'a' * 64)
