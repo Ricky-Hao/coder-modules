@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Workspace-private launcher. Inherit the caller environment with module overrides."""
+"""私有 launcher；继承环境并应用模块覆盖。"""
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ import fcntl
 import hashlib
 import signal
 
-# The active symlink resolves once: a concurrent upgrade cannot mix version files.
+# 固定本次版本。
 VERSION = Path(__file__).resolve().parent
 sys.path.insert(0, str(VERSION))
 from safety import ancestors, directory, owner, regular
@@ -25,7 +25,7 @@ RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_S
 def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
-    # Callback capability fields are private to the task protocol, never model input.
+    # 回调不进入模型环境。
     child = {k: value for k, value in environ.items() if k not in RESERVED
              and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
              and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
@@ -118,6 +118,32 @@ def follow_monitor():
 
 def main():
     os.umask(0o077)
+    tool, arguments = sys.argv[1], sys.argv[2:]
+    readonly = tool == 'opencode-task' and (arguments[:1] in (['list'], ['inspect'], ['status'], ['result'], ['doctor'])
+                                           or not arguments or arguments == ['help'] or profiles.harmless(arguments))
+    if readonly:
+        from diagnostics import ReadError, doctor, error_code, read_json, task_root
+        try:
+            settings = read_json(VERSION / 'settings.json')
+            root = Path(settings['install_root'])
+            if arguments == ['doctor']:
+                value = doctor(root, VERSION)
+                print(json.dumps(value, ensure_ascii=False))
+                return 0 if value['ok'] else 1
+            if arguments[:1] == ['doctor']:
+                raise ReadError('INVALID_ARGUMENTS')
+            if arguments[:1] in (['list'], ['inspect'], ['status'], ['result']):
+                task_root(root, settings)
+            # 查询没有初始化、锁文件或 profile materialize；Node 只运行命令投影。
+            binary = VERSION / 'node/bin/node'
+            regular(binary)
+            child = environment(os.environ, root, arguments=['--help'])
+            os.execve(binary, [str(binary), str(VERSION / 'task-cli.mjs'), *arguments], child)
+        except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
+            code = error_code(error)
+            print(json.dumps({'error': {'code': code,
+                                       'hint': '核对安装及任务存储；查询不会创建目录、恢复或改写旧记录。'}}, ensure_ascii=False), file=sys.stderr)
+            return 1
     settings = json.loads((VERSION / 'settings.json').read_text())
     root = Path(settings['install_root'])
     ancestors(root)
@@ -126,7 +152,6 @@ def main():
     directory(root / 'runtime')
     for name in ('home', 'config', 'data', 'cache', 'state', 'tmp'):
         directory(root / 'runtime' / name)
-    tool, arguments = sys.argv[1], sys.argv[2:]
     task = None
     if tool == 'opencode' and arguments[:1] == ['--module-task']:
         if len(arguments) != 6 or arguments[-1] != 'acp' or arguments[4] not in ('env', 'external'):
@@ -146,7 +171,7 @@ def main():
     session_lock = None
     if tool == 'opencode-task':
         tasks = root / 'runtime/tasks'
-        # Serialize first marker creation and submit dedupe on a trusted directory.
+        # 锁覆盖 owner 创建与 submit 去重。
         runtime_fd = os.open(root / 'runtime', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             fcntl.flock(runtime_fd, fcntl.LOCK_EX)
@@ -185,12 +210,12 @@ def main():
             if arguments[0] != '_supervise':
                 follow_monitor()
             if arguments[0] != '_worker' or task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
-                task_arguments = ['--help']  # Passive watch/outbox needs no provider credentials.
+                task_arguments = ['--help']  # 被动观察免凭据。
             elif task_state.get('model'):
                 task = task_state
                 session_lock = tasks / ('.model-' + hashlib.sha256(task_state['sessionKey'].encode()).hexdigest() + '.lock')
             elif profile == 'env' and not os.environ.get('OPENCODE_MODULE_CONFIG'):
-                # Old records did not snapshot model intent. Never reinterpret one as the new default.
+                # 旧记录不套用新模型默认。
                 print('TASK_MODEL_UNRECORDED: use the original installed launcher or original external config for this queued task.', file=sys.stderr)
                 raise SystemExit(1)
         elif arguments[:1] != ['submit']:
@@ -211,7 +236,7 @@ def main():
                     raise SystemExit(75)
                 raise
             os.set_inheritable(task_lock, True)
-    # Serialize only initialization/selection, not execution or the session queue.
+    # 只锁初始化与选择。
     selection_lock = None
     if session_lock is not None:
         selection_lock = os.open(session_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -230,7 +255,7 @@ def main():
     if tool == 'opencode':
         binary, argv = VERSION / 'opencode', arguments
     elif tool == 'acpx':
-        # Do not prepend private Node to PATH: project subprocesses retain their own Node.
+        # 私有 Node 不进 PATH。
         binary, argv = VERSION / 'node/bin/node', [str(VERSION / 'node_modules/acpx/dist/cli.js'), *acpx_arguments(arguments)]
     else:
         binary, argv = VERSION / 'node/bin/node', [str(VERSION / 'task-cli.mjs'), *arguments]
@@ -240,7 +265,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        sys.exit(main())
     except profiles.ProfileError as error:
         print(str(error) + '; supply valid values at launch (values hidden).', file=sys.stderr)
         sys.exit(1)

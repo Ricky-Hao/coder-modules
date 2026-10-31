@@ -119,7 +119,7 @@ run "executable_dedicated_startup" {
         sizes.append({'script': number, 'bytes': size, 'budget': SCRIPT_BUDGET})
         configs.append(bundle['config'])
         assert set(bundle['files']) == {'install.py', 'runtime.py', 'safety.py', 'profiles.py',
-                                        'profile-env.json', 'shell_path.py', 'task.mjs', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
+                                        'profile-env.json', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
                                         'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():
             assert text == (module / 'scripts' / name).read_text()

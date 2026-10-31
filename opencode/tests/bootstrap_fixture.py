@@ -23,13 +23,15 @@ def unpack(script):
     encoded = re.search(r"base64\.b64decode\('([A-Za-z0-9+/=]+)'\)", script)
     if encoded is None:
         raise AssertionError('rendered bootstrap payload missing')
-    return json.loads(gzip.decompress(base64.b64decode(encoded.group(1))))
+    parts = gzip.decompress(base64.b64decode(encoded.group(1))).decode().split('\0')
+    return {'config': json.loads(parts[0]), 'files': dict(zip(parts[1::2], parts[2::2], strict=True))}
 
 
 def render(bundle):
     """Unit fixture; validate_terraform uses the actual Terraform-rendered script."""
     template = (Path(__file__).resolve().parents[1] / 'scripts/install.sh.tftpl').read_text()
-    encoded = base64.b64encode(gzip.compress(json.dumps(bundle).encode(), mtime=0)).decode()
+    parts = [json.dumps(bundle['config'])] + [part for pair in sorted(bundle['files'].items()) for part in pair]
+    encoded = base64.b64encode(gzip.compress('\0'.join(parts).encode(), mtime=0)).decode()
     return template.replace('${bundle}', encoded)
 
 

@@ -1,7 +1,7 @@
-/** Module-owned task records and outbox. No callback data enters ACP. */
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { readJson, SNAPSHOT_BYTES } from "./task-read.mjs";
 
 export const OUTPUT_BYTES = 32768;
 export const HEALTH_DEFAULTS = Object.freeze({
@@ -30,7 +30,7 @@ export function healthPolicy(env = {}) {
 }
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const monotonic = () => Number(process.hrtime.bigint()) / 1e6;
-// 同一 boot/time namespace 内跨 worker 复用单调时间，避免 wall clock 跳变重算静默。
+// 同 boot/time namespace 才复用单调时间。
 const clockId = (() => {
   try {
     return createHash("sha256").update(fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8") +
@@ -45,7 +45,7 @@ export class Confirmation {
   }
   update(reason) {
     const at = this.tick();
-    // 监测自身长时间未获调度时，先重新观察；暂停不能代替连续确认。
+    // 长暂停后重新确认。
     if (!reason || this.lastCheck !== undefined && at - this.lastCheck > 2 * (this.policy.pollMs + this.policy.probeMs)) {
       this.since = undefined;
       this.samples = 0;
@@ -131,7 +131,7 @@ export function save(filename, value) {
 }
 
 function read(filename) {
-  return JSON.parse(fs.readFileSync(privateFile(filename), "utf8"));
+  return readJson(filename);
 }
 
 export function taskPermissions(mode = "deny-all", policy = {}) {
@@ -171,9 +171,9 @@ export function taskPermissions(mode = "deny-all", policy = {}) {
 }
 
 export function taskModel(model) {
-  if (model === undefined) return undefined; // Pre-selection records retain their original shape.
+  if (model === undefined) return undefined;
   if (
-    !model || typeof model.id !== "string" || model.id.length > 256 ||
+    !model || typeof model.id !== "string" || model.id.length > 256 || model.id.includes("tcb_") ||
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:-]+$/.test(model.id) ||
     (model.variant !== undefined && (typeof model.variant !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(model.variant)))
   )
@@ -266,6 +266,20 @@ function identifier(value) {
   return value;
 }
 
+const safeCodes = new Set([
+  "SETUP_SLOW", "MODEL_OR_SESSION_SETUP_FAILED", "WORKER_LOST_BEFORE_DISPATCH", "WORKER_START_FAILED",
+  "WORKER_EXITED", "WORKER_UNRESPONSIVE", "WORKER_HEARTBEAT_UNREADABLE", "SUPERVISOR_START_FAILED",
+  "ORIGINAL_SESSION_UNAVAILABLE", "OWNER_CHANGED", "OWNER_UNAVAILABLE", "JOURNAL_UNAVAILABLE",
+  "PROGRESS_UNCONFIRMED", "REQUEST_UNOBSERVABLE", "REQUEST_OUTCOME_UNKNOWN", "TURN_FAILED_UNCONFIRMED",
+  "REQUEST_FAILED", "AGENT_DISCONNECTED", "TURN_TRANSPORT_INTERRUPTED", "REDIRECT_REFUSED",
+  "CALLBACK_REJECTED", "DELIVERY_UNCONFIRMED",
+]);
+
+function safeCode(value) {
+  if (value == null) return null;
+  return safeCodes.has(value) ? value : "UNKNOWN_RECORDED_CODE";
+}
+
 function resultChoice(value, choices) {
   if (value == null) return null;
   if (!choices.includes(value)) throw new Error("INVALID_TASK_RESULT");
@@ -333,7 +347,7 @@ function resultOutput(record, payload, callback) {
   const boundedOutput = boundedInfo(payload.output, limit);
   const truncated = typeof record.outputTruncated === "boolean"
     ? record.outputTruncated : null;
-  // Inspect the sealed text before clipping, so a clipped bearer is not printable.
+  // 先查完整文本，避免裁剪隐藏 bearer。
   const privateOutput = privateResultText(payload.output, callback);
   return {
     output: privateOutput ? null : boundedOutput.text,
@@ -375,7 +389,6 @@ function evidence(record, payload, callback) {
   };
 }
 
-/** Keep the last assistant message, including bounded chunks; thoughts/tools are omitted. */
 export function appendOutput(record, text, messageId) {
   if (messageId && messageId !== record.outputMessageId) {
     record.outputMessageId = messageId;
@@ -459,8 +472,10 @@ export class TaskRunner {
     if (!taskPattern.test(id)) throw new Error("INVALID_TASK_ID");
     return path.join(directory(path.join(this.root, id)), name);
   }
-  load(id) {
-    return read(this.filename(id));
+  load(id, options) {
+    const record = readJson(this.filename(id), undefined, options);
+    if (!record || record.version !== 1 || record.id !== id) throw new Error("INVALID_TASK_RESULT");
+    return record;
   }
   write(record) {
     save(this.filename(record.id), record);
@@ -502,7 +517,6 @@ export class TaskRunner {
     )
       throw new Error("INVALID_SESSION");
     const selected = validateCallback(callback);
-    // Callback bytes cannot accidentally be copied from registration into the executor prompt.
     if (
       prompt.includes(selected.callback_id) ||
       prompt.includes(selected.callback_url)
@@ -597,24 +611,19 @@ export class TaskRunner {
   }
   status(id) {
     const record = this.load(id);
+    return this.statusRecord(record);
+  }
+  safeCode(value) { return safeCode(value); }
+  statusRecord(record) {
+    const result = this.resultRecord(record, { output: false });
     return {
-      version: 1,
-      task_id: id,
-      request_id: record.requestId,
-      state: record.state,
-      permission_mode: record.permissions?.mode ?? "deny-all",
-      ...(record.model ? { model: record.model.id, variant: record.model.variant ?? null } : {}),
-      ...(record.sessionName ? { session: record.sessionName } : {}),
-      cancel_requested: fs.existsSync(this.filename(id, "cancel.json")),
-      ...(record.notificationKind === "supervision_failure" ? { result_status: null }
-        : record.resultStatus ? { result_status: record.resultStatus } : {}),
-      ...(record.deliveryError ? { delivery_error: record.deliveryError } : {}),
-      ...(record.executionError ? { execution_error: record.executionError } : {}),
-      timing: timing(record),
-      health: this.health(record),
-      callback_state: record.body ? deliveryState(record) : null,
-      callback_kind: record.body ? resultChoice(record.notificationKind, ["supervision_failure"]) ?? "request_result" : null,
-      callback_status: record.body ? record.notificationKind === "supervision_failure" ? "error" : record.resultStatus ?? null : null,
+      ...result,
+      permission_mode: resultChoice(record.permissions?.mode ?? "deny-all", ["deny-all", "approve-reads", "approve-all"]),
+      ...(record.model ? { model: taskModel(record.model).id, variant: identifier(record.model.variant) } : {}),
+      ...(result.session_name ? { session: result.session_name } : {}),
+      cancel_requested: readJson(this.filename(record.id, "cancel.json"), SNAPSHOT_BYTES, { optional: true }) !== undefined,
+      ...(record.deliveryError ? { delivery_error: safeCode(record.deliveryError) } : {}),
+      ...(record.executionError ? { execution_error: safeCode(record.executionError) } : {}),
       ...(record.state === "ambiguous"
         ? {
             guidance:
@@ -626,21 +635,16 @@ export class TaskRunner {
     };
   }
   result(id) {
-    let record;
-    try {
-      record = this.load(id);
-    } catch (error) {
-      if (error instanceof SyntaxError) throw new Error("INVALID_TASK_RESULT");
-      throw error;
-    }
-    if (!record || record.version !== 1 || record.id !== id)
-      throw new Error("INVALID_TASK_RESULT");
+    return this.resultRecord(this.load(id));
+  }
+  resultRecord(record, { output = true, health = true } = {}) {
+    if (record.state == null) throw new Error("INVALID_TASK_RESULT");
     const callback = resultCallback(record);
     const payload = sealedResult(record, callback);
     const session = record.handle ?? {};
     return {
       version: 1,
-      task_id: id,
+      task_id: identifier(record.id),
       request_id: identifier(record.requestId),
       session_name: identifier(record.sessionName),
       session_key: identifier(record.sessionKey),
@@ -653,9 +657,9 @@ export class TaskRunner {
       callback_status: payload?.status ?? null,
       callback_state: payload ? deliveryState(record) : null,
       callback_kind: payload ? resultChoice(record.notificationKind, ["supervision_failure"]) ?? "request_result" : null,
-      health: this.health(record),
+      health: health ? this.health(record) : null,
       timing: timing(record),
-      ...resultOutput(record, payload, callback),
+      ...(output ? resultOutput(record, payload, callback) : {}),
       evidence: evidence(record, payload, callback),
     };
   }
@@ -690,20 +694,25 @@ export class TaskRunner {
     record.attempts = 0;
     record.nextAttemptAt = this.now();
     delete record.output;
-    // The exact result/body is fsync'd before even the first HTTP attempt.
     this.observe(record, "terminal", { assessment: "settled", suspectedAt: undefined, suspectedReason: undefined });
   }
   health(record) {
-    const value = record.health;
-    if (!value) return null;
+    const value = record.health ?? {};
     const observed = (name) => {
       const filename = this.filename(record.id, name);
-      return fs.existsSync(filename) ? read(filename) : null;
+      const sample = readJson(filename, SNAPSHOT_BYTES, { optional: true });
+      if (sample === null) throw new Error("INVALID_TASK_RESULT");
+      return sample;
     };
     const worker = observed("worker.json");
     const monitor = observed("monitor.json");
+    for (const sample of [record.health, worker, monitor]) {
+      if (sample != null && (typeof sample !== "object" || Array.isArray(sample))) throw new Error("INVALID_TASK_RESULT");
+    }
+    if (!record.health && !worker && !monitor) return null;
     return {
-      phase: identifier(value.phase),
+      phase: resultChoice(value.phase, ["setup", "setup_failed", "dispatching", "running", "watching", "unknown",
+        "recovering", "terminal", "supervision_failed"]),
       observed_at: time(value.observedAt),
       last_event_at: time(value.lastEventAt),
       last_probe_at: time(value.lastProbeAt),
@@ -717,18 +726,18 @@ export class TaskRunner {
       owner: resultChoice(value.owner, ["lease_current", "unavailable", "unknown"]),
       owner_process: resultChoice(value.ownerProcess, ["alive", "gone", "unknown"]),
       owner_heartbeat_at: time(value.ownerHeartbeatAt),
-      agent: "unknown", // Shared acpx exposes no agent process exit/heartbeat witness.
+      agent: "unknown",
       progress: resultChoice(value.progress, ["active", "quiet", "tool_running", "provider_retry", "unknown"]),
       journal: resultChoice(value.journal, ["available", "unavailable"]),
       assessment: resultChoice(value.assessment, ["observing", "suspected", "unavailable", "settled"]),
       suspected_since: time(value.suspectedAt),
-      suspected_reason: identifier(value.suspectedReason),
-      reason: identifier(record.executionError),
+      suspected_reason: safeCode(value.suspectedReason),
+      reason: safeCode(record.executionError),
       outcome: record.notificationKind === "supervision_failure" ? "unknown"
         : resultChoice(record.resultStatus, ["success", "error", "cancelled"]),
       automatic_retry: false,
       policy_ms: value.policy ? Object.fromEntries(Object.keys(HEALTH_DEFAULTS).map((key) => {
-        if (value.policy[key] === undefined) return [key, null]; // 旧记录不补写新策略。
+        if (value.policy[key] === undefined) return [key, null];
         if (!Number.isSafeInteger(value.policy[key]) || value.policy[key] < 10 || value.policy[key] > 86400000)
           throw new Error("INVALID_TASK_RESULT");
         return [key, value.policy[key]];
@@ -775,8 +784,7 @@ export class TaskRunner {
   }
   finish(record, result, source = "turn.result") {
     const status = terminalStatus(result);
-    // Shared result.failed also represents lost ACK/completion replies. A matching
-    // journal terminal confirms failure; WATCH_OUTCOME_UNKNOWN confirms only loss.
+    // failed 可能仅为丢失回复；业务失败须核对原 journal。
     if (status === "error" && (source === "turn.result" || result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN")) {
       record.executionError = result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN"
         ? "REQUEST_OUTCOME_UNKNOWN" : "TURN_FAILED_UNCONFIRMED";
@@ -893,7 +901,7 @@ export class TaskRunner {
             this.write(record);
           }
         }
-      } catch { /* 单次读取失败只表示观察中断；按原 cursor 重连，不重派 prompt。 */ }
+      } catch { /* 沿原 cursor 重连。 */ }
       if (signal.aborted || record.body) return;
       record.health = { ...record.health, journal: "unavailable" };
       await delay(this.policy.pollMs);
@@ -903,7 +911,7 @@ export class TaskRunner {
     const began = this.tick();
     let missingSince = began;
     let previousEvent = record.health?.eventSequence;
-    // 记住已由有效 owner 证据配对的进展；lease 中断期间的新事件留待恢复后核对。
+    // lease 恢复后再配对新进展。
     record.ownerEventSequence ??= previousEvent ?? 0;
     let lastProgress = began - this.elapsed(record.health?.lastEventAt, record.health?.lastEventTick, record.health?.eventClock);
     const waitingSince = began - this.elapsed(record.dispatchedAt, record.dispatchTick, record.dispatchClock);
@@ -915,7 +923,7 @@ export class TaskRunner {
       if (record.handle && this.runtime.observeOwner) {
         try {
           proof = await within(this.runtime.observeOwner({ handle: record.handle }), this.policy.probeMs);
-        } catch { /* 超时/缺 lease 不是业务死亡证据。 */ }
+        } catch { /* 证据未知。 */ }
       }
       if (signal.aborted) return;
       const at = this.tick();
@@ -924,15 +932,14 @@ export class TaskRunner {
         previousEvent = record.health?.eventSequence;
         lastProgress = Number.isFinite(record.health.lastEventTick) ? Math.min(at, record.health.lastEventTick) : at;
       }
-      // 新进展可撤销旧 owner 的怀疑；只有共享 owner 换代本身不能续期。
+      // 只有原请求新进展可为换代配对。
       const ownerCurrent = proof?.owner === "lease_current";
       if (ownerCurrent && (!record.ownerGeneration || (record.health?.eventSequence ?? 0) !== record.ownerEventSequence)) {
         record.ownerGeneration = proof.generation;
         record.ownerEventSequence = record.health?.eventSequence ?? 0;
       }
       const generationChanged = record.ownerGeneration && proof?.generation && record.ownerGeneration !== proof.generation;
-      // journal 重新连接后可能正常静默。相同 owner 与已见原请求只保留普通进展预算，
-      // 不把一次读取失败变成较短的 owner 失联期限，也不刷新原请求静默时间。
+      // 重连不刷新静默时间，也不缩短原预算。
       const available = ownerCurrent && !generationChanged && record.originalObserved;
       if (progressed || available) missingSince = at;
       const healthyWait = ownerCurrent && !generationChanged && !record.originalObserved;
@@ -944,7 +951,7 @@ export class TaskRunner {
       const health = record.health ?? {};
       if (health.retryUntil !== retryUntil) {
         retryUntil = health.retryUntil;
-        // 未识别时钟只信本次换算；过去的 retry 不能重新获得 progress 宽限。
+        // 过期 retry 不再获宽限。
         retryTick = this.clock && health.retryClock === this.clock && Number.isFinite(health.retryTick)
           ? health.retryTick : Number.isFinite(retryUntil) ? at + retryUntil - this.now() : undefined;
       }
@@ -953,7 +960,6 @@ export class TaskRunner {
       if (record.originalObserved && at - lastProgress >= quietLimit && !retryWaiting)
         reason ??= health.journal === "unavailable" ? "JOURNAL_UNAVAILABLE" : "PROGRESS_UNCONFIRMED";
       if (healthyWait && at - waitingSince >= this.policy.progressMs) reason = "REQUEST_UNOBSERVABLE";
-      // 同一次 probe 期间的新原请求事件优先，先撤销怀疑再重新计时。
       if (progressed) reason = undefined;
       const previousSuspicion = confirmation.since;
       const confirmed = confirmation.update(reason);
@@ -964,7 +970,7 @@ export class TaskRunner {
         ...this.assessment(record, reason, previousSuspicion !== confirmation.since),
       });
       if (confirmed) {
-        // 先处理本轮已就绪的进展/终态，避免同一次 probe 的完成顺序抢占 callback。
+        // 先处理已就绪终态。
         await delay(0);
         if (signal.aborted) return;
         if (record.health?.eventSequence !== previousEvent) continue;
@@ -1001,7 +1007,6 @@ export class TaskRunner {
       else if (outcome.reason) record.executionError = outcome.reason;
     } catch {
       record.executionError = "JOURNAL_UNAVAILABLE";
-      /* Journal/owner uncertainty never authorizes prompt replay. */
     } finally {
       controller.abort();
       clearInterval(monitor);
@@ -1054,7 +1059,6 @@ export class TaskRunner {
         this.fail(record, "WORKER_LOST_BEFORE_DISPATCH");
         return;
       }
-      // Persist the attempt while holding worker.lock, before setup or dispatch.
       record.workerAttemptedAt ??= this.now();
       this.observe(record, "setup", { assessment: "observing" });
       try {
@@ -1104,8 +1108,7 @@ export class TaskRunner {
         const consume = (async () => {
           for await (const event of turn.events) {
             if (!active || record.body) break;
-            // Live tool updates precede the journal's checkpoint. Keep their
-            // liveness evidence even when raw journal metadata supplies retries.
+            // 工具事件可能先于 journal，仍计为进展。
             record.originalObserved = true;
             this.progress(record, event);
             if (event.type === "text_delta" && event.stream !== "thought")
@@ -1128,8 +1131,7 @@ export class TaskRunner {
           record.executionError = reason;
           this.observe(record, "unknown", { assessment: "unavailable" });
         } else {
-          // Result is authoritative. Give already-buffered output a bounded drain;
-          // neither a stuck events iterator nor promptStarted can veto completion.
+          // 不让输出迭代器或 promptStarted 阻止终态。
           await within(consume, this.policy.drainMs).catch(() => {});
           if (this.runtime.journalAuthoritative && source === "turn.result") {
             await within(journal, this.policy.drainMs).catch(() => {});

@@ -3,20 +3,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { TaskRunner, deliveryState, healthPolicy, privateFile, within } from "./task.mjs";
-import { launchDriver, supervise, workerHeartbeat } from "./task-supervisor.mjs";
+let TaskRunner, deliveryState, healthPolicy, privateFile, within;
+let launchDriver, supervise, workerHeartbeat, inspectTask, listTasks, readError, readJson;
 
 const version = path.dirname(fileURLToPath(import.meta.url));
-const settings = JSON.parse(
-  fs.readFileSync(path.join(version, "settings.json"), "utf8"),
-);
-const root = settings.install_root;
+let root, loaded = false;
 const args = process.argv.slice(2);
 const command = args.shift();
 const allowed = new Set([
   "submit",
   "status",
   "result",
+  "list",
+  "inspect",
   "cancel",
   "recover",
   "resolve",
@@ -26,7 +25,7 @@ const allowed = new Set([
   "_fail_launch",
 ]);
 const help =
-  "opencode-task submit --key KEY --prompt-file FILE [--callback-file PRIVATE_FILE] [--session NAME] [--model PROVIDER/MODEL] [--variant VARIANT] [--permission-mode deny-all|approve-reads|approve-all] [--permission-policy-file PRIVATE_FILE]\nopencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task cancel TASK_ID\nopencode-task recover\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nResult output is bounded assistant text; timing is local Unix epoch milliseconds. It does not verify Git, tests or other claims in that text. Env profile defaults to codex/gpt-6.1-sol, max. A named session fixes model/variant/config; conflicts require a new session. Callback registration JSON is read from stdin unless --callback-file is supplied. No callback values in arguments or environment. Permission overrides require existing user authorization for this task; no automatic escalation.";
+  "opencode-task submit --key KEY --prompt-file FILE [OPTIONS]\nopencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task inspect TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20] [--scan-limit 100] [--cursor CURSOR]\nopencode-task doctor\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nlist/inspect/doctor 只读，inspect 无 output。list 上限 50/200。提交选项及完整边界见 TASKS.md；权限覆盖须已有授权。";
 
 async function spawnWorker(id, action = "_supervise") {
   const child = spawn("python3", ["-B", path.join(version, "runtime.py"), "opencode-task", action, id, "--ready"], {
@@ -98,13 +97,16 @@ async function main() {
     return;
   }
   if (!allowed.has(command)) throw new Error("INVALID_COMMAND");
+  root = readJson(path.join(version, "settings.json"), 65536).install_root;
   let runtime;
   const runner = new TaskRunner({
     root: path.join(root, "runtime/tasks"),
-    policy: healthPolicy(process.env),
+    policy: ["list", "inspect", "status", "result"].includes(command) ? undefined : healthPolicy(process.env),
   });
   try {
-    if (command === "submit") {
+    if (command === "list") {
+      console.log(JSON.stringify(listTasks(runner, options(args, ["--state", "--session", "--limit", "--scan-limit", "--cursor"]))));
+    } else if (command === "submit") {
       const flags = options(args, [
         "--key",
         "--prompt-file",
@@ -147,7 +149,7 @@ async function main() {
           await spawnWorker(accepted.task_id);
         } catch (error) {
           await spawnWorker(accepted.task_id, "_fail_launch").catch(() => {});
-          throw error; // No accepted:true without a monitor acknowledgement.
+          throw error;
         }
       }
       console.log(JSON.stringify(accepted));
@@ -158,6 +160,12 @@ async function main() {
       console.log(JSON.stringify({ version: 1, recovering: pending.length }));
     } else {
       const id = args.shift();
+      if (["status", "result", "inspect"].includes(command)) {
+        if (args.length) throw new Error("INVALID_ARGUMENTS");
+        const value = command === "inspect" ? inspectTask(runner, id) : runner[command](id);
+        console.log(JSON.stringify(value));
+        return;
+      }
       const stored = runner.load(id);
       let beat;
       if (["_worker", "_observe"].includes(command)) {
@@ -203,14 +211,11 @@ async function main() {
           flags["--status"],
           readBounded(flags["--output-file"], 32768),
         );
-        // The durable outbox is complete. Release both locks before monitor handoff.
+        // 交给 monitor 前释放两把锁。
         for (const lock of JSON.parse(process.env.OPENCODE_MODULE_TASK_LOCKS ?? "[]")) fs.closeSync(lock);
         delete process.env.OPENCODE_MODULE_TASK_LOCKS;
         await spawnWorker(id);
         console.log(JSON.stringify(runner.status(id)));
-      } else if (command === "result") {
-        if (args.length) throw new Error("INVALID_ARGUMENTS");
-        console.log(JSON.stringify(runner.result(id)));
       } else if (command !== "_supervise") {
         if (args.length) throw new Error("INVALID_ARGUMENTS");
         if (command === "cancel") {
@@ -230,15 +235,19 @@ async function main() {
 }
 
 try {
+  ({ inspectTask, listTasks, readError, readJson } = await import("./task-read.mjs"));
+  ({ TaskRunner, deliveryState, healthPolicy, privateFile, within } = await import("./task.mjs"));
+  ({ launchDriver, supervise, workerHeartbeat } = await import("./task-supervisor.mjs"));
+  loaded = true;
   await main();
 } catch (error) {
-  // No raw exception, request, environment, response body, or callback is printable.
-  console.error(
-    ["SESSION_MODEL_CONFLICT", "SUBMIT_CONFLICT", "SESSION_CWD_CONFLICT"].includes(error.message)
-      ? `${error.message}: use the original intent or a new key/session.`
-      : "opencode-task failed; check command syntax and private module task state.",
-  );
+  // 仅输出安全码。
+  const conflicts = ["SESSION_MODEL_CONFLICT", "SUBMIT_CONFLICT", "SESSION_CWD_CONFLICT"];
+  const code = !loaded ? "TASK_MODULE_UNAVAILABLE" : conflicts.includes(error.message) || error.message === "INVALID_COMMAND" ? error.message : readError(error);
+  const hint = conflicts.includes(code) ? "使用原意图或新的 key/session。"
+    : code === "CURSOR_STALE" ? "不带 cursor 重查，按 task_id 去重。"
+    : "核对 --help、TASKS.md 及私有状态；保留历史，不自动重发。";
+  console.error(JSON.stringify({ error: { code, hint } }));
   process.exitCode = 1;
 }
-// Pending transport/iterator promises cannot keep a finished driver alive.
 if (["_worker", "_observe"].includes(command)) process.exit(process.exitCode ?? 0);

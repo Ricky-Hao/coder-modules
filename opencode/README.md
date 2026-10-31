@@ -18,6 +18,9 @@ the [health policy](TASKS.md#监督策略与边界) defines deadlines, configura
 不能作为业务死亡证明。
 See [TASKS.md](TASKS.md) for the CLI, private-input contract, protocol and focused
 verification.
+新增 `opencode-task list`、`inspect TASK_ID`、`doctor` 提供有界任务定位、安全历史观测和
+离线安装自检。它们不执行模型、恢复或 callback，也不初始化任务存储。分页、读取预算、
+陈旧/未知时间与失败项的解释见 [只读查询契约](TASKS.md#只读查询与离线安装自检)。
 
 Install pinned OpenCode and acpx as the existing workspace user. Only `agent_id` is
 required. For persistent use, a dedicated writable PVC is recommended:
@@ -135,7 +138,10 @@ from agent configuration back to module outputs. This avoids agent/module cycles
 
 The startup script embeds a gzip-compressed, base64-encoded bundle using Terraform's
 `base64gzip`. Python's standard-library `gzip` decoder restores the exact source
-files and settings in memory before invoking the existing installer. This adds no
+files and settings in memory before invoking the existing installer. 源码采用 NUL 分隔的原始文本，
+首段为 settings JSON，之后交替为文件名和源码；plan 校验分隔数量。这样避免 JSON 对源码的
+引号、换行及 HTML 字符再转义。解包逐文件字节、inventory 和 fingerprint 契约保持。
+This adds no
 remote bootstrap, download, prerequisite, or trust source. Installed-file inventory,
 payload fingerprints, ownership checks, wrapper commands and persistent state keep
 their existing contracts; transport-only changes do not invalidate a verified cache.
@@ -155,13 +161,15 @@ The 2026-10-20 gate rollout of source
 check: its dedicated-mount script was 153559 bytes, and the Agent failed with
 `argument list too long` before the installer ran. Coder's build could succeed
 while the script log stayed empty and the old installation status remained on disk.
-The compact transport reduces that same rendered configuration to 40722 bytes.
+That transport revision reduced the same rendered configuration to 40722 bytes.
 The negative control reproduces `E2BIG` for the original script size; the bounded
 positive cases execute on Linux, including a nonroot fixture. These are local
 source/fixture results; a repaired fixed template still needs operator review,
 publication and rollout verification. Check the requested source/version and
 installed command as well as readiness; an old status file is not fresh startup
 evidence. No runtime data repair or deletion is needed for this transport failure.
+40722 是当时修复版本的历史数据。新增入口仍须通过当前实际 Terraform render；Python 压缩
+预算检查不能替代真实渲染。后续源码或 settings 增长可能触发 plan-time budget 拒绝。
 
 The helper appends **only the wrapper bin directory** to `.bashrc` and Bash's existing
 preferred login profile (`.bash_profile`, `.bash_login`, otherwise `.profile`). It

@@ -28,6 +28,7 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
   [Provider 说明](opencode/PROVIDERS.md)。
   launcher 默认继承启动进程环境；模块目录覆盖和回调保护见
   [Launch environment](opencode/README.md#launch-environment)。
+  有界任务列表、单任务诊断与离线安装自检见 [只读入口](opencode/TASKS.md#只读查询与离线安装自检)。
 
 e.g.
 
