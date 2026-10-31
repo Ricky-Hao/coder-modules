@@ -15,6 +15,7 @@ import {
   healthPolicy,
   delay,
   deliveryState,
+  Confirmation,
 } from "../scripts/task.mjs";
 import { supervise } from "../scripts/task-supervisor.mjs";
 import { EventEmitter } from "node:events";
@@ -23,6 +24,8 @@ const callback = {
   callback_id: `tcb_${"x".repeat(43)}`,
   callback_url: "http://127.0.0.1:1/api/agents/task-callbacks",
 };
+const shortPolicy = { ...HEALTH_DEFAULTS, pollMs: 10, probeMs: 20, discoveryMs: 90,
+  setupMs: 60, workerMs: 120, confirmMs: 40, progressMs: 500, drainMs: 20 };
 function fixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "module-task-"));
   fs.chmodSync(root, 0o700);
@@ -81,7 +84,7 @@ function fixture(t, options = {}) {
     runtime,
     now: () => clock,
     fetcher: options.fetcher,
-    policy: options.policy,
+    policy: options.policy ?? shortPolicy,
   });
   const accepted = runner.submit({
     key: "local-submit-key",
@@ -568,6 +571,7 @@ test("journal recovery matches original requestId and saves output with cursor; 
   let cursor;
   f.runtime.watchSession = async function* (input) {
     cursor = input.cursor;
+    if (input.cursor === "2") throw new Error("still unavailable");
     yield {
       type: "turn_result",
       requestId: "someone-else",
@@ -705,8 +709,6 @@ test("refuses unsafe task file and preserves unrelated sibling/session content",
   assert.equal(retryDelay(99, "1", 0), 300000);
 });
 
-const shortPolicy = { ...HEALTH_DEFAULTS, pollMs: 10, probeMs: 20, discoveryMs: 90,
-  setupMs: 60, workerMs: 120, progressMs: 500, drainMs: 20 };
 const never = () => new Promise(() => {});
 const connected = async () => ({ owner: "lease_current", process: "alive", generation: 1 });
 
@@ -1019,3 +1021,289 @@ test("progress arriving during an owner probe resets quiet time before evaluatio
   assert.equal(f.runner.result(f.id).result_status, 'success');
   assert.equal(f.runner.result(f.id).output, 'Recent progress');
 });
+
+test("new original-request progress after an owner change restores observation", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: shortPolicy });
+  f.runner.now = Date.now;
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.ownerGeneration = 1;
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.write(record);
+  let generation = 1;
+  f.runtime.observeOwner = async () => ({ ...(await connected()), generation });
+  f.runtime.watchSession = async function* () {
+    yield { type: "turn_started", requestId: record.requestId, cursor: "start" };
+    for (let index = 0; index < 8; index++) {
+      await delay(30);
+      generation = 2;
+      yield { type: "message", requestId: record.requestId, cursor: `progress-${index}`,
+        message: { params: { update: { sessionUpdate: "agent_thought_chunk" } } } };
+    }
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+  assert.equal(f.runner.load(f.id).ownerGeneration, 2);
+  assert.equal(f.executions(), 0);
+});
+
+for (const fault of ["probe", "lease", "journal", "find"]) {
+  test(`transient ${fault} interruption reconnects to the original request without consuming its callback`,
+    { timeout: 2500 }, async (t) => {
+      const f = fixture(t, { policy: shortPolicy });
+      const record = f.runner.load(f.id);
+      record.state = "running";
+      record.originalObserved = true;
+      const handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+      if (fault !== "find") record.handle = handle;
+      f.runner.write(record);
+      let probes = 0;
+      f.runtime.observeOwner = async () => {
+        if (++probes <= 2 && fault === "probe") return never();
+        if (probes <= 3 && fault === "lease") return { owner: "unavailable", process: "alive" };
+        return connected();
+      };
+      let finds = 0;
+      f.runtime.findSession = async () => {
+        if (++finds === 1) return never();
+        return handle;
+      };
+      let watches = 0;
+      f.runtime.watchSession = async function* ({ cursor }) {
+        if (fault === "journal" && ++watches === 1) {
+          yield { requestId: record.requestId, type: "turn_started", cursor: "saved" };
+          throw new Error("synthetic temporary journal read failure");
+        }
+        if (fault === "journal") assert.equal(cursor, "saved");
+        await delay(160);
+        yield { requestId: record.requestId, type: "turn_result", cursor: "done", result: { status: "completed" } };
+      };
+      await f.runner.execute(f.id);
+      assert.equal(f.runner.result(f.id).result_status, "success");
+      assert.equal(f.runner.result(f.id).callback_kind, "request_result");
+      assert.equal(f.runner.load(f.id).notificationKind, undefined);
+      assert.equal(f.executions(), 0);
+    });
+}
+
+test("cold setup finishing in the confirmation grace uses the same pending setup", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: { ...shortPolicy, setupMs: 40, confirmMs: 150 } });
+  const ensure = f.runtime.ensureSession;
+  let setups = 0;
+  f.runtime.ensureSession = async (input) => {
+    setups++;
+    await delay(85);
+    assert.equal(f.runner.status(f.id).health.assessment, "suspected");
+    return ensure(input);
+  };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+  assert.equal(f.runner.result(f.id).health.suspected_since, null);
+  assert.equal(setups, 1);
+  assert.equal(f.executions(), 1);
+});
+
+test("unstarted queue wait with a healthy owner can outlast discovery, then start normally", { timeout: 2000 }, async (t) => {
+  const f = fixture(t);
+  f.runtime.observeOwner = connected;
+  f.runtime.startTurn = () => ({ promptStarted: delay(220), events: (async function* () { await never(); })(),
+    result: delay(270).then(() => ({ status: "completed" })) });
+  f.runtime.watchSession = async function* () { await never(); };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+});
+
+test("new progress retracts suspicion even across a wall-clock jump; terminal beats the next confirmation",
+  { timeout: 2500 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, progressMs: 55, confirmMs: 100 } });
+    f.runtime.observeOwner = connected;
+    let assessed = false;
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () {
+      await delay(100);
+      assert.equal(f.runner.status(f.id).health.assessment, "suspected");
+      f.advance(86400000);
+      yield { type: "text_delta", stream: "thought", text: "Synthetic progress" };
+      await delay(20);
+      assert.equal(f.runner.status(f.id).health.assessment, "observing");
+      assert.equal(f.runner.status(f.id).health.suspected_since, null);
+      assessed = true;
+    })(), result: delay(230).then(() => ({ status: "completed" })) });
+    f.runtime.watchSession = async function* () { await never(); };
+    await f.runner.execute(f.id);
+    assert.equal(assessed, true);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+    assert.equal(f.runner.result(f.id).health.assessment, "settled");
+  });
+
+test("another request cannot confirm a replacement owner or hide a persistently missing original request",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { fetcher: async () => ok() });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.ownerGeneration = 1;
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    f.runtime.observeOwner = async () => ({ ...(await connected()), generation: 2 });
+    f.runtime.watchSession = async function* ({ signal }) {
+      for (let index = 0; !signal.aborted; index++) {
+        await delay(10);
+        yield { type: "turn_started", requestId: "other-request", cursor: `other-${index}` };
+      }
+    };
+    const began = performance.now();
+    await f.runner.execute(f.id);
+    const elapsed = performance.now() - began;
+    assert.ok(elapsed >= shortPolicy.discoveryMs + shortPolicy.confirmMs && elapsed < 1000);
+    assert.equal(f.runner.load(f.id).executionError, "OWNER_CHANGED");
+    assert.equal(f.runner.load(f.id).ownerGeneration, 1);
+    f.runner.fail(f.runner.load(f.id), "OWNER_CHANGED");
+    await f.runner.deliver(f.runner.load(f.id));
+    assert.equal(f.runner.result(f.id).callback_kind, "supervision_failure");
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.runner.result(f.id).health.assessment, "unavailable");
+    assert.equal(f.executions(), 0);
+  });
+
+test("recovery uses the same boot clock for silence despite wall-clock corrections", { timeout: 2000 }, async (t) => {
+  const f = fixture(t);
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.cursor = "saved";
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.progress(record, { type: "prompt_started" });
+  f.runner.write(record);
+  f.advance(86400000);
+  const resumed = new TaskRunner({ root: f.root, runtime: f.runtime, now: f.runner.now, policy: shortPolicy });
+  f.runtime.observeOwner = connected;
+  f.runtime.watchSession = async function* () {
+    await delay(150);
+    assert.equal(resumed.status(f.id).health.assessment, "observing");
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await resumed.execute(f.id);
+  assert.equal(resumed.result(f.id).result_status, "success");
+  assert.equal(f.executions(), 0);
+});
+
+test("confirmation requires fresh repeated observations after a monitor scheduling pause", () => {
+  let tick = 0;
+  const confirmation = new Confirmation(shortPolicy, () => tick);
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 15;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 500; // 超过连续观察允许的间隔，即使已过 confirm，也须重新确认。
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 520;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 545;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), true);
+  assert.equal(confirmation.update(undefined), false);
+});
+
+test("original tool progress during a lease outage still confirms the owner when its lease recovers",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, discoveryMs: 60, toolMs: 700 } });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.ownerGeneration = 1;
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    let broken = false;
+    let generation = 1;
+    f.runtime.observeOwner = async () => broken ? { owner: "unavailable", process: "unknown" }
+      : { ...(await connected()), generation };
+    f.runtime.watchSession = async function* () {
+      yield { type: "turn_started", requestId: record.requestId, cursor: "start" };
+      await delay(30);
+      broken = true;
+      generation = 2;
+      yield { type: "message", requestId: record.requestId, cursor: "tool", message: { params: { update:
+        { sessionUpdate: "tool_call", status: "in_progress", toolCallId: "continuing-tool" } } } };
+      await delay(45);
+      broken = false;
+      await delay(190);
+      yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+    };
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+    assert.equal(f.runner.load(f.id).ownerGeneration, 2);
+    assert.equal(f.executions(), 0);
+  });
+
+for (const clock of ["legacy", "unidentified"]) {
+  test(`recovery does not renew an expired retry grace with ${clock} clock evidence`, { timeout: 2000 }, async (t) => {
+    const f = fixture(t);
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.cursor = "saved";
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    record.health = { lastEventAt: 1000, retryUntil: -86400000, progress: "provider_retry",
+      ...(clock === "unidentified" ? { retryClock: null, retryTick: f.runner.tick() + 100000 } : {}) };
+    f.runner.write(record);
+    f.advance(2000);
+    if (clock === "unidentified") f.runner.clock = null;
+    f.runtime.observeOwner = connected;
+    f.runtime.watchSession = async function* () { await never(); };
+    const began = performance.now();
+    await f.runner.execute(f.id);
+    assert.ok(performance.now() - began < 350);
+    assert.equal(f.runner.load(f.id).executionError, "PROGRESS_UNCONFIRMED");
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.executions(), 0);
+  });
+}
+
+test("a future retry retains its monotonic deadline through recovery and wall-clock jumps", { timeout: 2000 }, async (t) => {
+  const policy = { ...shortPolicy, progressMs: 40 };
+  const f = fixture(t, { policy });
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.cursor = "retry";
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.progress(record, { message: { params: { update: { sessionUpdate: "session_info_update",
+    _meta: { "opencode/retry": { nextRetryAt: new Date(1300).toISOString() } } } } } });
+  f.runner.write(record);
+  f.advance(86400000);
+  const resumed = new TaskRunner({ root: f.root, runtime: f.runtime, now: f.runner.now, policy });
+  f.runtime.observeOwner = connected;
+  f.runtime.watchSession = async function* () {
+    await delay(180);
+    assert.equal(resumed.status(f.id).health.assessment, "observing");
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await resumed.execute(f.id);
+  assert.equal(resumed.result(f.id).result_status, "success");
+});
+
+test("a canonical terminal queued by the confirming probe wins over the supervision notification",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, pollMs: 20, progressMs: 50, confirmMs: 10 } });
+    let release;
+    const ready = new Promise((resolve) => { release = resolve; });
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () { await never(); })(), result: never() });
+    f.runtime.watchSession = async function* () {
+      yield { type: "turn_started", requestId: f.accepted.request_id, cursor: "start" };
+      await ready;
+      yield { type: "turn_result", requestId: f.accepted.request_id, cursor: "done", result: { status: "failed" } };
+    };
+    let queued = false;
+    f.runtime.observeOwner = async () => {
+      if (!queued && f.runner.load(f.id).health?.assessment === "suspected") {
+        queued = true;
+        setTimeout(release, 0); // 与确认同一轮已就绪，不能先封存监督通知。
+      }
+      return connected();
+    };
+    await f.runner.execute(f.id);
+    assert.equal(queued, true);
+    assert.equal(f.runner.result(f.id).result_status, "error");
+    assert.equal(f.runner.result(f.id).callback_kind, "request_result");
+    assert.equal(f.runner.result(f.id).evidence.terminal_source, "watchSession.turn_result");
+  });

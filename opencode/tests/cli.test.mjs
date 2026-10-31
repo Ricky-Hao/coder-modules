@@ -132,7 +132,7 @@ test(
       COPILOT_BASE_URL: 'https://copilot.example.invalid/v1', COPILOT_API_KEY: 'synthetic-copilot',
       OPENCODE_TASK_POLL_MS: '100', OPENCODE_TASK_PROBE_MS: '1000', OPENCODE_TASK_DISCOVERY_MS: '5000',
       OPENCODE_TASK_WORKER_MS: '5000', OPENCODE_TASK_SETUP_MS: '15000', OPENCODE_TASK_PROGRESS_MS: '10000',
-      OPENCODE_TASK_DRAIN_MS: '30',
+      OPENCODE_TASK_DRAIN_MS: '30', OPENCODE_TASK_CONFIRM_MS: '600',
     };
     const cli = (args, input) =>
       spawnSync(path.join(root, "bin/opencode-task"), args, {
@@ -280,7 +280,12 @@ test(
       const until = async (condition) => {
         const end = Date.now() + 10000;
         while (!condition()) {
-          if (Date.now() > end) throw new Error("CLI fixture timed out");
+          if (Date.now() > end) {
+            const tasks = fs.readdirSync(path.join(root, 'runtime/tasks')).filter((name) => /^task_[a-f0-9]{64}$/.test(name))
+              .map((id) => { const { state, executionError, health, workerExit } = load(id); return { id, state, executionError, health, workerExit }; });
+            throw new Error(JSON.stringify({ message: 'CLI fixture timed out', tasks,
+              fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+          }
           await pause(40);
         }
       };
@@ -503,6 +508,33 @@ test(
       assert.equal(slow.resultStatus, 'success');
       assert.equal(JSON.parse(slow.body).output, 'Slow tool completed');
       env.OPENCODE_TASK_PROGRESS_MS = '10000';
+      env.OPENCODE_TASK_WORKER_MS = '300';
+      env.OPENCODE_TASK_CONFIRM_MS = '1200';
+      const pausedId = faultSubmit('paused-worker', 'long tool');
+      await until(() => load(pausedId).state === 'running');
+      const pausedPid = Number(fs.readFileSync(pidfile(pausedId), 'utf8'));
+      const pausedToken = JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', pausedId, 'worker.json'), 'utf8')).token;
+      process.kill(pausedPid, 'SIGSTOP');
+      try {
+        await pause(800); // 超过 worker 阈值，低于阈值加连续确认，正常恢复应保留该 child。
+        assert.equal(JSON.parse(readerCli(['status', pausedId]).stdout).health.worker_assessment, 'suspected');
+      } finally { process.kill(pausedPid, 'SIGCONT'); }
+      const pausedRecord = await delivered(pausedId);
+      assert.equal(pausedRecord.resultStatus, 'success');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', pausedId, 'worker.json'), 'utf8')).token, pausedToken);
+      assert.equal(pausedRecord.workerExit.reason, 'WORKER_EXITED');
+      env.OPENCODE_TASK_CONFIRM_MS = '600';
+      const beforeStopped = fs.readFileSync(executions, 'utf8').trim().split('\n').length;
+      const stoppedId = faultSubmit('stopped-worker', 'long tool');
+      await until(() => load(stoppedId).state === 'running');
+      const stoppedPid = Number(fs.readFileSync(pidfile(stoppedId), 'utf8'));
+      process.kill(stoppedPid, 'SIGSTOP');
+      const stoppedRecord = await delivered(stoppedId); // 监护结束自有 child，observer 接续原请求。
+      assert.equal(stoppedRecord.resultStatus, 'success');
+      assert.equal(stoppedRecord.terminalSource, 'watchSession.turn_result');
+      assert.notEqual(Number(fs.readFileSync(pidfile(stoppedId), 'utf8')), stoppedPid);
+      assert.equal(fs.readFileSync(executions, 'utf8').trim().split('\n').length, beforeStopped + 1);
+      env.OPENCODE_TASK_WORKER_MS = '5000';
       const lostId = faultSubmit('owner-exit', 'wait for cancellation');
       await until(() => load(lostId).state === 'running');
       const owned = JSON.parse(fs.readFileSync(path.join(base, 'processes'), 'utf8').trim().split('\n').at(-1));
@@ -596,7 +628,7 @@ test(
         }),
       });
       try {
-        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle, failed.handle, exited.handle, slow.handle])
+        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle, failed.handle, exited.handle, slow.handle, pausedRecord.handle, stoppedRecord.handle])
           await runtime.close({ handle, reason: "CLI fixture cleanup" });
       } finally {
         await runtime.shutdown();

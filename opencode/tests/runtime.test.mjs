@@ -117,7 +117,7 @@ test(
       second.observeOwner = ({ handle }) => observeOwner(handle.acpxRecordId);
       second.journalAuthoritative = true;
       const slowRunner = new TaskRunner({ root: taskRoot, runtime: second,
-        policy: { ...runner.policy, pollMs: 100, discoveryMs: 5000, probeMs: 500, progressMs: 500, toolMs: 5000 } });
+        policy: { ...runner.policy, pollMs: 100, discoveryMs: 5000, probeMs: 500, confirmMs: 200, progressMs: 500, toolMs: 5000 } });
       const slow = slowRunner.submit({ key: 'real-slow-tool', cwd: base, prompt: 'long tool', callback: {
         callback_id: `tcb_${'a'.repeat(43)}`, callback_url: 'http://127.0.0.1:1/api/agents/task-callbacks' } });
       await slowRunner.execute(slow.task_id);
@@ -161,6 +161,7 @@ test('owner observation is read-only, rejects stale heartbeat and reused PID bir
     };
     assert.equal((await inspect(owner)).owner, 'lease_current');
     assert.equal((await inspect({ ...owner, heartbeatAt: new Date(Date.now() - 60000).toISOString() })).owner, 'unavailable');
+    assert.equal((await inspect({ ...owner, heartbeatAt: new Date(Date.now() + 60000).toISOString() })).owner, 'unavailable');
     const reused = await inspect({ ...owner, processIdentity: { ...proof, startTicks: String(BigInt(startTicks) + 1n) } });
     assert.equal(reused.process, 'gone');
     assert.equal(reused.owner, 'unavailable');

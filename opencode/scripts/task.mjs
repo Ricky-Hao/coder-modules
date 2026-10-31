@@ -10,6 +10,7 @@ export const HEALTH_DEFAULTS = Object.freeze({
   discoveryMs: 30000,
   setupMs: 30000,
   workerMs: 30000,
+  confirmMs: 30000,
   progressMs: 900000,
   toolMs: 21600000,
   drainMs: 250,
@@ -28,6 +29,35 @@ export function healthPolicy(env = {}) {
   return selected;
 }
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const monotonic = () => Number(process.hrtime.bigint()) / 1e6;
+// 同一 boot/time namespace 内跨 worker 复用单调时间，避免 wall clock 跳变重算静默。
+const clockId = (() => {
+  try {
+    return createHash("sha256").update(fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8") +
+      fs.readlinkSync("/proc/self/ns/time")).digest("hex");
+  } catch { return null; }
+})();
+
+export class Confirmation {
+  constructor(policy, tick = monotonic) {
+    this.policy = policy;
+    this.tick = tick;
+  }
+  update(reason) {
+    const at = this.tick();
+    // 监测自身长时间未获调度时，先重新观察；暂停不能代替连续确认。
+    if (!reason || this.lastCheck !== undefined && at - this.lastCheck > 2 * (this.policy.pollMs + this.policy.probeMs)) {
+      this.since = undefined;
+      this.samples = 0;
+    }
+    this.lastCheck = at;
+    this.reason = reason;
+    if (!reason) return false;
+    this.since ??= at;
+    this.samples = (this.samples ?? 0) + 1;
+    return this.samples >= 2 && at - this.since >= this.policy.confirmMs;
+  }
+}
 export async function within(promise, ms) {
   let timer;
   try {
@@ -414,13 +444,16 @@ async function receipt(response) {
 }
 
 export class TaskRunner {
-  constructor({ root, runtime, fetcher = fetch, now = Date.now, policy = HEALTH_DEFAULTS, heartbeat = () => {} }) {
+  constructor({ root, runtime, fetcher = fetch, now = Date.now, policy = HEALTH_DEFAULTS, heartbeat = () => {},
+    tick = monotonic, clock = clockId }) {
     this.root = directory(root);
     this.runtime = runtime;
     this.fetcher = fetcher;
     this.now = now;
     this.policy = policy;
     this.heartbeat = heartbeat;
+    this.tick = tick;
+    this.clock = clock;
   }
   filename(id, name = "task.json") {
     if (!taskPattern.test(id)) throw new Error("INVALID_TASK_ID");
@@ -658,22 +691,26 @@ export class TaskRunner {
     record.nextAttemptAt = this.now();
     delete record.output;
     // The exact result/body is fsync'd before even the first HTTP attempt.
-    this.observe(record, "terminal");
+    this.observe(record, "terminal", { assessment: "settled", suspectedAt: undefined, suspectedReason: undefined });
   }
   health(record) {
     const value = record.health;
     if (!value) return null;
     const observed = (name) => {
       const filename = this.filename(record.id, name);
-      return fs.existsSync(filename) ? time(read(filename).at) : null;
+      return fs.existsSync(filename) ? read(filename) : null;
     };
+    const worker = observed("worker.json");
+    const monitor = observed("monitor.json");
     return {
       phase: identifier(value.phase),
       observed_at: time(value.observedAt),
       last_event_at: time(value.lastEventAt),
       last_probe_at: time(value.lastProbeAt),
-      worker_heartbeat_at: observed("worker.json"),
-      monitor_heartbeat_at: observed("monitor.json"),
+      worker_heartbeat_at: time(worker?.at),
+      monitor_heartbeat_at: time(monitor?.at),
+      worker_assessment: resultChoice(monitor?.workerAssessment, ["observing", "suspected", "stopping"]),
+      worker_suspected_since: time(monitor?.workerSuspectedAt),
       worker_exit_at: time(record.workerExit?.observedAt),
       worker_exit_code: time(record.workerExit?.code),
       retry_not_before: time(value.retryUntil),
@@ -682,11 +719,16 @@ export class TaskRunner {
       owner_heartbeat_at: time(value.ownerHeartbeatAt),
       agent: "unknown", // Shared acpx exposes no agent process exit/heartbeat witness.
       progress: resultChoice(value.progress, ["active", "quiet", "tool_running", "provider_retry", "unknown"]),
+      journal: resultChoice(value.journal, ["available", "unavailable"]),
+      assessment: resultChoice(value.assessment, ["observing", "suspected", "unavailable", "settled"]),
+      suspected_since: time(value.suspectedAt),
+      suspected_reason: identifier(value.suspectedReason),
       reason: identifier(record.executionError),
       outcome: record.notificationKind === "supervision_failure" ? "unknown"
         : resultChoice(record.resultStatus, ["success", "error", "cancelled"]),
       automatic_retry: false,
       policy_ms: value.policy ? Object.fromEntries(Object.keys(HEALTH_DEFAULTS).map((key) => {
+        if (value.policy[key] === undefined) return [key, null]; // 旧记录不补写新策略。
         if (!Number.isSafeInteger(value.policy[key]) || value.policy[key] < 10 || value.policy[key] > 86400000)
           throw new Error("INVALID_TASK_RESULT");
         return [key, value.policy[key]];
@@ -698,11 +740,20 @@ export class TaskRunner {
     this.heartbeat(phase);
     this.write(record);
   }
+  elapsed(wall, tick, clock) {
+    if (this.clock && clock === this.clock && Number.isFinite(tick) && tick <= this.tick())
+      return this.tick() - tick;
+    return Number.isSafeInteger(wall) ? Math.max(0, this.now() - wall) : 0;
+  }
+  assessment(record, reason, restarted = false) {
+    const suspectedAt = reason ? restarted ? this.now() : record.health?.suspectedAt ?? this.now() : undefined;
+    return { assessment: reason ? "suspected" : "observing", suspectedAt, suspectedReason: reason };
+  }
   fail(record, reason) {
     if (record.body) return;
     record.executionError = reason;
     if (record.state === "queued") {
-      this.observe(record, "setup_failed");
+      this.observe(record, "setup_failed", { assessment: "settled" });
       this.seal(record, "error", `Task did not dispatch a prompt: ${reason}.`,
         "execution_setup_failure", "program_generated");
       return;
@@ -720,7 +771,7 @@ export class TaskRunner {
     record.attempts = 0;
     record.nextAttemptAt = this.now();
     delete record.output;
-    this.observe(record, "supervision_failed");
+    this.observe(record, "supervision_failed", { assessment: "unavailable" });
   }
   finish(record, result, source = "turn.result") {
     const status = terminalStatus(result);
@@ -799,68 +850,126 @@ export class TaskRunner {
     let progress = tools.size ? "tool_running" : "active";
     const retry = update?._meta?.["opencode/retry"];
     let retryUntil = record.health?.retryUntil;
-    if (retry === null) retryUntil = undefined;
+    let retryTick = record.health?.retryTick;
+    let retryClock = record.health?.retryClock;
+    if (retry === null) retryUntil = retryTick = retryClock = undefined;
     if (retry && Number.isFinite(Date.parse(retry.nextRetryAt))) {
-      retryUntil = Date.parse(retry.nextRetryAt);
+      const until = Date.parse(retry.nextRetryAt);
+      if (until !== retryUntil || !this.clock || retryClock !== this.clock || !Number.isFinite(retryTick)) {
+        retryTick = this.tick() + until - this.now();
+        retryClock = this.clock;
+      }
+      retryUntil = until;
       progress = "provider_retry";
     }
-    record.health = { ...record.health, lastEventAt: this.now(), progress, retryUntil };
+    record.health = { ...record.health, lastEventAt: this.now(), lastEventTick: this.tick(), eventClock: this.clock,
+      eventSequence: (record.health?.eventSequence ?? 0) + 1, progress, retryUntil, retryTick, retryClock };
   }
   async journal(record, signal, { collect = true, checkpoint = true } = {}) {
-    for await (const event of this.runtime.watchSession({ handle: record.handle, cursor: record.cursor, signal })) {
+    while (!signal.aborted && !record.body) {
+      try {
+        if (!record.handle) {
+          const handle = await within(this.runtime.findSession({ sessionKey: record.sessionKey, agent: "opencode", cwd: record.cwd }), this.policy.probeMs);
+          if (signal.aborted) return;
+          if (!handle) throw new Error("ORIGINAL_SESSION_UNAVAILABLE");
+          record.handle = validateHandle(record, handle);
+        }
+        for await (const event of this.runtime.watchSession({ handle: record.handle, cursor: record.cursor, signal })) {
+          if (signal.aborted || record.body) return;
+          record.health = { ...record.health, journal: "available" };
+          if (event.requestId === record.requestId) {
+            record.originalObserved = true;
+            const unknown = event.type === "turn_result" && event.result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN";
+            if (!unknown) {
+              this.progress(record, event);
+              const update = event.message?.params?.update;
+              if (collect && update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
+                appendOutput(record, update.content.text, update.messageId);
+              if (event.type === "turn_result") return event.result;
+            }
+          }
+          if (checkpoint) {
+            record.cursor = event.cursor;
+            this.write(record);
+          }
+        }
+      } catch { /* 单次读取失败只表示观察中断；按原 cursor 重连，不重派 prompt。 */ }
       if (signal.aborted || record.body) return;
-      if (event.requestId === record.requestId) {
-        record.originalObserved = true;
-        this.progress(record, event);
-        const update = event.message?.params?.update;
-        if (collect && update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
-          appendOutput(record, update.content.text, update.messageId);
-        if (event.type === "turn_result") return event.result;
-      }
-      if (checkpoint) {
-        record.cursor = event.cursor;
-        this.write(record);
-      }
+      record.health = { ...record.health, journal: "unavailable" };
+      await delay(this.policy.pollMs);
     }
   }
-  async followHealth(record, signal, { maxMs = Infinity } = {}) {
-    const began = performance.now();
+  async followHealth(record, signal) {
+    const began = this.tick();
     let missingSince = began;
-    let previousEvent = record.health?.lastEventAt;
-    // Carry the persisted quiet interval across restarts, then use a monotonic clock.
-    let lastProgress = began - (Number.isSafeInteger(previousEvent)
-      ? Math.max(0, this.now() - previousEvent) : 0);
-    let reason = "REQUEST_UNOBSERVABLE";
+    let previousEvent = record.health?.eventSequence;
+    // 记住已由有效 owner 证据配对的进展；lease 中断期间的新事件留待恢复后核对。
+    record.ownerEventSequence ??= previousEvent ?? 0;
+    let lastProgress = began - this.elapsed(record.health?.lastEventAt, record.health?.lastEventTick, record.health?.eventClock);
+    const waitingSince = began - this.elapsed(record.dispatchedAt, record.dispatchTick, record.dispatchClock);
+    let retryUntil;
+    let retryTick;
+    const confirmation = new Confirmation(this.policy, this.tick);
     while (!signal.aborted) {
-      if (this.runtime.observeOwner) {
-        let proof;
+      let proof;
+      if (record.handle && this.runtime.observeOwner) {
         try {
           proof = await within(this.runtime.observeOwner({ handle: record.handle }), this.policy.probeMs);
-        } catch { /* A failed probe is availability evidence, never a business result. */ }
-        if (signal.aborted) return;
-        // Progress may arrive while the asynchronous process probe is pending.
-        if (record.health?.lastEventAt !== previousEvent) {
-          previousEvent = record.health?.lastEventAt;
-          lastProgress = performance.now();
-        }
-        const generationChanged = record.ownerGeneration && proof?.generation && record.ownerGeneration !== proof.generation;
-        if (!record.ownerGeneration && proof?.generation) record.ownerGeneration = proof.generation;
-        const available = proof?.owner === "lease_current" && !generationChanged && record.originalObserved;
-        if (available) missingSince = performance.now();
-        reason = generationChanged ? "OWNER_CHANGED" : proof?.owner !== "lease_current" ? "OWNER_UNAVAILABLE" : "REQUEST_UNOBSERVABLE";
-        let progress = record.health?.progress ?? "unknown";
-        const retryWaiting = record.health?.retryUntil > this.now() - this.policy.progressMs;
-        const quietLimit = progress === "tool_running" ? this.policy.toolMs : this.policy.progressMs;
-        const quiet = record.originalObserved && performance.now() - lastProgress >= quietLimit && !retryWaiting;
-        if (quiet) progress = "quiet";
-        this.observe(record, record.health?.phase ?? "watching", {
-          lastProbeAt: this.now(), owner: proof?.owner ?? "unavailable",
-          ownerProcess: proof?.process ?? "unknown", ownerHeartbeatAt: proof?.heartbeatAt, progress,
-        });
-        if (quiet) return "PROGRESS_UNCONFIRMED";
+        } catch { /* 超时/缺 lease 不是业务死亡证据。 */ }
       }
-      if (performance.now() - began >= maxMs) return reason;
-      if (performance.now() - missingSince >= this.policy.discoveryMs) return reason;
+      if (signal.aborted) return;
+      const at = this.tick();
+      const progressed = record.health?.eventSequence !== previousEvent;
+      if (progressed) {
+        previousEvent = record.health?.eventSequence;
+        lastProgress = Number.isFinite(record.health.lastEventTick) ? Math.min(at, record.health.lastEventTick) : at;
+      }
+      // 新进展可撤销旧 owner 的怀疑；只有共享 owner 换代本身不能续期。
+      const ownerCurrent = proof?.owner === "lease_current";
+      if (ownerCurrent && (!record.ownerGeneration || (record.health?.eventSequence ?? 0) !== record.ownerEventSequence)) {
+        record.ownerGeneration = proof.generation;
+        record.ownerEventSequence = record.health?.eventSequence ?? 0;
+      }
+      const generationChanged = record.ownerGeneration && proof?.generation && record.ownerGeneration !== proof.generation;
+      // journal 重新连接后可能正常静默。相同 owner 与已见原请求只保留普通进展预算，
+      // 不把一次读取失败变成较短的 owner 失联期限，也不刷新原请求静默时间。
+      const available = ownerCurrent && !generationChanged && record.originalObserved;
+      if (progressed || available) missingSince = at;
+      const healthyWait = ownerCurrent && !generationChanged && !record.originalObserved;
+      let reason;
+      if (!healthyWait && at - missingSince >= this.policy.discoveryMs) {
+        reason = !record.handle ? "ORIGINAL_SESSION_UNAVAILABLE" : generationChanged ? "OWNER_CHANGED"
+          : record.health?.journal === "unavailable" ? "JOURNAL_UNAVAILABLE" : "OWNER_UNAVAILABLE";
+      }
+      const health = record.health ?? {};
+      if (health.retryUntil !== retryUntil) {
+        retryUntil = health.retryUntil;
+        // 未识别时钟只信本次换算；过去的 retry 不能重新获得 progress 宽限。
+        retryTick = this.clock && health.retryClock === this.clock && Number.isFinite(health.retryTick)
+          ? health.retryTick : Number.isFinite(retryUntil) ? at + retryUntil - this.now() : undefined;
+      }
+      const retryWaiting = Number.isFinite(retryTick) && at < retryTick + this.policy.progressMs;
+      const quietLimit = record.activeTools?.length ? this.policy.toolMs : this.policy.progressMs;
+      if (record.originalObserved && at - lastProgress >= quietLimit && !retryWaiting)
+        reason ??= health.journal === "unavailable" ? "JOURNAL_UNAVAILABLE" : "PROGRESS_UNCONFIRMED";
+      if (healthyWait && at - waitingSince >= this.policy.progressMs) reason = "REQUEST_UNOBSERVABLE";
+      // 同一次 probe 期间的新原请求事件优先，先撤销怀疑再重新计时。
+      if (progressed) reason = undefined;
+      const previousSuspicion = confirmation.since;
+      const confirmed = confirmation.update(reason);
+      if (!reason && record.executionError !== "REQUEST_FAILED") delete record.executionError;
+      this.observe(record, record.health?.phase ?? "watching", {
+        lastProbeAt: this.now(), owner: proof?.owner ?? "unavailable",
+        ownerProcess: proof?.process ?? "unknown", ownerHeartbeatAt: proof?.heartbeatAt,
+        ...this.assessment(record, reason, previousSuspicion !== confirmation.since),
+      });
+      if (confirmed) {
+        // 先处理本轮已就绪的进展/终态，避免同一次 probe 的完成顺序抢占 callback。
+        await delay(0);
+        if (signal.aborted) return;
+        if (record.health?.eventSequence !== previousEvent) continue;
+        return reason;
+      }
       await new Promise((resolve) => {
         const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
         const timer = setTimeout(done, this.policy.pollMs);
@@ -869,7 +978,7 @@ export class TaskRunner {
       });
     }
   }
-  async watch(record, maxMs = Infinity) {
+  async watch(record) {
     const controller = new AbortController();
     const monitor = this.monitorCancellation(record, () =>
       this.runtime.cancelRequest?.({
@@ -886,7 +995,7 @@ export class TaskRunner {
     try {
       const outcome = await Promise.race([
         this.journal(record, controller.signal).then((result) => ({ result })),
-        this.followHealth(record, controller.signal, { maxMs }).then((reason) => ({ reason })),
+        this.followHealth(record, controller.signal).then((reason) => ({ reason })),
       ]);
       if (outcome.result) this.finish(record, outcome.result, "watchSession.turn_result");
       else if (outcome.reason) record.executionError = outcome.reason;
@@ -900,7 +1009,7 @@ export class TaskRunner {
     if (!record.body) {
       record.state = "ambiguous";
       record.executionError ??= "REQUEST_UNOBSERVABLE";
-      this.observe(record, "unknown");
+      this.observe(record, "unknown", { assessment: "unavailable" });
     }
   }
   monitorCancellation(record, cancel) {
@@ -915,6 +1024,17 @@ export class TaskRunner {
     }, 200);
     monitor.unref();
     return monitor;
+  }
+  async setupSession(record) {
+    const pending = this.runtime.ensureSession({ sessionKey: record.sessionKey, agent: "opencode",
+      mode: "persistent", cwd: record.cwd, ...(record.model ? { model: record.model } : {}) });
+    try {
+      return await within(pending, this.policy.setupMs);
+    } catch (error) {
+      if (error.message !== "OBSERVATION_TIMEOUT") throw error;
+      this.observe(record, "setup", { assessment: "suspected", suspectedAt: this.now(), suspectedReason: "SETUP_SLOW" });
+      return await within(pending, this.policy.confirmMs); // 等同一个初始化，不再发一次 ensureSession。
+    }
   }
   async execute(id, { observeOnly = false } = {}) {
     const record = this.load(id);
@@ -936,17 +1056,11 @@ export class TaskRunner {
       }
       // Persist the attempt while holding worker.lock, before setup or dispatch.
       record.workerAttemptedAt ??= this.now();
-      this.observe(record, "setup");
+      this.observe(record, "setup", { assessment: "observing" });
       try {
         record.handle = validateHandle(
           record,
-          await within(this.runtime.ensureSession({
-            sessionKey: record.sessionKey,
-            agent: "opencode",
-            mode: "persistent",
-            cwd: record.cwd,
-            ...(record.model ? { model: record.model } : {}),
-          }), this.policy.setupMs),
+          await this.setupSession(record),
         );
         delete record.executionError;
       } catch {
@@ -954,10 +1068,14 @@ export class TaskRunner {
         return;
       }
       record.state = "dispatching";
+      record.dispatchedAt = this.now();
+      record.dispatchTick = this.tick();
+      record.dispatchClock = this.clock;
       record.outputTruncated = false;
-      this.observe(record, "dispatching");
+      this.observe(record, "dispatching", { assessment: "observing", suspectedAt: undefined, suspectedReason: undefined });
       let monitor;
       let active = true;
+      let healthConfirmed = false;
       const controller = new AbortController();
       try {
         const turn = this.runtime.startTurn({
@@ -988,6 +1106,7 @@ export class TaskRunner {
             if (!active || record.body) break;
             // Live tool updates precede the journal's checkpoint. Keep their
             // liveness evidence even when raw journal metadata supplies retries.
+            record.originalObserved = true;
             this.progress(record, event);
             if (event.type === "text_delta" && event.stream !== "thought")
               appendOutput(this.runtime.journalAuthoritative ? streamOutput : record, event.text, event.messageId);
@@ -998,22 +1117,29 @@ export class TaskRunner {
           checkpoint: Boolean(this.runtime.journalAuthoritative),
         }).then((result) => result ? { result, source: "watchSession.turn_result" } : new Promise(() => {}))
           .catch(() => new Promise(() => {}));
-        const { result, source } = await Promise.race([
+        const { result, source, reason } = await Promise.race([
           resultPromise.then((result) => ({ result, source: "turn.result" })),
           journal,
-          this.followHealth(record, controller.signal).then((reason) => { throw new Error(reason); }),
+          this.followHealth(record, controller.signal).then((reason) => ({ reason })),
         ]);
-        // Result is authoritative. Give already-buffered output a bounded drain;
-        // neither a stuck events iterator nor promptStarted can veto completion.
-        await within(consume, this.policy.drainMs).catch(() => {});
-        if (this.runtime.journalAuthoritative && source === "turn.result") {
-          await within(journal, this.policy.drainMs).catch(() => {});
-          if (streamOutput.output !== undefined) {
-            record.output = streamOutput.output;
-            record.outputTruncated = streamOutput.outputTruncated ?? false;
+        if (reason) {
+          healthConfirmed = true;
+          record.state = "ambiguous";
+          record.executionError = reason;
+          this.observe(record, "unknown", { assessment: "unavailable" });
+        } else {
+          // Result is authoritative. Give already-buffered output a bounded drain;
+          // neither a stuck events iterator nor promptStarted can veto completion.
+          await within(consume, this.policy.drainMs).catch(() => {});
+          if (this.runtime.journalAuthoritative && source === "turn.result") {
+            await within(journal, this.policy.drainMs).catch(() => {});
+            if (streamOutput.output !== undefined) {
+              record.output = streamOutput.output;
+              record.outputTruncated = streamOutput.outputTruncated ?? false;
+            }
           }
+          this.finish(record, result, source);
         }
-        this.finish(record, result, source);
       } catch (error) {
         record.state = "ambiguous";
         record.executionError = ["REQUEST_UNOBSERVABLE", "OWNER_UNAVAILABLE", "AGENT_DISCONNECTED", "PROGRESS_UNCONFIRMED"].includes(error.message)
@@ -1024,20 +1150,10 @@ export class TaskRunner {
         controller.abort();
         clearInterval(monitor);
       }
-      if (!record.body) await this.watch(record, this.policy.discoveryMs);
+      if (!record.body && !healthConfirmed) await this.watch(record);
     } else if (["dispatching", "running", "ambiguous"].includes(record.state)) {
-      if (!record.handle)
-        record.handle = await within(this.runtime.findSession({
-          sessionKey: record.sessionKey,
-          agent: "opencode",
-          cwd: record.cwd,
-        }), this.policy.probeMs).catch(() => null);
-      if (record.handle) {
-        validateHandle(record, record.handle);
-        await this.watch(record);
-      } else {
-        this.fail(record, "ORIGINAL_SESSION_UNAVAILABLE");
-      }
+      if (record.handle) validateHandle(record, record.handle);
+      await this.watch(record);
     }
   }
   async cancel(id) {

@@ -24,7 +24,8 @@ export async function observeOwner(recordId) {
   if (current?.ownerGeneration !== owner.ownerGeneration || current?.pid !== owner.pid)
     return { owner: "unknown", process: "unknown" };
   const heartbeatAt = Date.parse(owner.heartbeatAt);
-  const fresh = Number.isFinite(heartbeatAt) && Date.now() - heartbeatAt <= 15000;
+  const age = Date.now() - heartbeatAt;
+  const fresh = Number.isFinite(heartbeatAt) && age >= 0 && age <= 15000;
   return {
     owner: incarnation === "matching" && fresh ? "lease_current" : "unavailable",
     process: incarnation === "matching" ? "alive" : incarnation,

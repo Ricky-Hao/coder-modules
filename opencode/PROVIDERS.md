@@ -58,7 +58,7 @@ MCP 开关、header 和默认 disabled 行为保持；disabled 只省略服务�
 提交前会生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider 的
 Sol/low title。任务记录保存非秘密选择与配置路径，纳入去重；恢复不重新解释默认值。
 新 ACP session 使用显式模型选择，并在发送 prompt 前核对 ACP 确认的 model/effort。
-选择失败或超过 setup 期限不发送 prompt，任务封存 error 并沿 outbox 回调；
+选择失败或超过 setup 加确认宽限后不发送 prompt，任务封存 error 并沿 outbox 回调；
 `status` 给出安全的 setup 失败码。监督策略及恢复边界见 [TASKS.md](TASKS.md#监督策略与边界)。
 
 `status` 显示 `model`、`variant`。named session 首次提交固定 model、variant 和配置快照；

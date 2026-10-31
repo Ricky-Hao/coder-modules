@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { delay, deliveryState, privateFile, save } from "./task.mjs";
+import { Confirmation, delay, deliveryState, privateFile, save } from "./task.mjs";
 
 export function workerHeartbeat(runner, id, token) {
   let phase = "starting";
@@ -16,7 +16,7 @@ export function workerHeartbeat(runner, id, token) {
   };
 }
 
-async function driver(runner, id, launch, observe) {
+async function driver(runner, id, launch, observe, report) {
   const token = randomUUID();
   let child;
   let stopReason;
@@ -29,7 +29,8 @@ async function driver(runner, id, launch, observe) {
       resolve({ code: null, reason: "WORKER_START_FAILED" });
     }
   });
-  let observedAt = performance.now();
+  let observedAt = runner.tick();
+  const confirmation = new Confirmation(runner.policy, runner.tick);
   let sequence;
   let checking = false;
   const timer = setInterval(() => {
@@ -41,10 +42,14 @@ async function driver(runner, id, launch, observe) {
         const beat = JSON.parse(fs.readFileSync(privateFile(filename), "utf8"));
         if (beat.token === token && Number.isSafeInteger(beat.sequence) && beat.sequence !== sequence) {
           sequence = beat.sequence;
-          observedAt = performance.now();
+          observedAt = runner.tick();
         }
       }
-      if (performance.now() - observedAt > runner.policy.workerMs) {
+      const reason = runner.tick() - observedAt > runner.policy.workerMs ? "WORKER_UNRESPONSIVE" : undefined;
+      const previousSuspicion = confirmation.since;
+      const confirmed = confirmation.update(reason);
+      report(reason, confirmed, previousSuspicion !== confirmation.since);
+      if (confirmed) {
         stopReason = "WORKER_UNRESPONSIVE";
         // Only this unreaped child is signalled. Never act on a persisted PID.
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -63,7 +68,14 @@ async function driver(runner, id, launch, observe) {
 export async function supervise(runner, id, launch) {
   let record = runner.load(id);
   if (["delivered", "rejected"].includes(deliveryState(record))) return;
-  const beat = () => save(runner.filename(id, "monitor.json"), { at: Date.now() });
+  let workerAssessment = "observing";
+  let workerSuspectedAt;
+  const beat = () => save(runner.filename(id, "monitor.json"), { at: Date.now(), workerAssessment, workerSuspectedAt });
+  const report = (reason, confirmed, restarted) => {
+    workerAssessment = confirmed ? "stopping" : reason ? "suspected" : "observing";
+    workerSuspectedAt = reason ? restarted ? Date.now() : workerSuspectedAt ?? Date.now() : undefined;
+    beat();
+  };
   beat();
   const timer = setInterval(beat, runner.policy.pollMs);
   let observe = record.state !== "queued" || Boolean(record.workerAttemptedAt);
@@ -75,7 +87,7 @@ export async function supervise(runner, id, launch) {
       record = runner.load(id);
       continue;
     }
-    const outcome = await driver(runner, id, launch, observe);
+    const outcome = await driver(runner, id, launch, observe, report);
     record = runner.load(id);
     if (outcome.code === 75) {
       // A prior driver still holds the kernel lock. Its PID is irrelevant.
