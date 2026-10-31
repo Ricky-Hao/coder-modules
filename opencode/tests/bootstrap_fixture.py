@@ -5,9 +5,9 @@ The Python shim delays the bootstrap's main call so fixture archives can replace
 network downloads; decoded installer/helpers and all installation paths still run.
 """
 import base64
-import gzip
 import hashlib
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -23,16 +23,22 @@ def unpack(script):
     encoded = re.search(r"base64\.b64decode\('([A-Za-z0-9+/=]+)'\)", script)
     if encoded is None:
         raise AssertionError('rendered bootstrap payload missing')
-    parts = gzip.decompress(base64.b64decode(encoded.group(1))).decode().split('\0')
-    return {'config': json.loads(parts[0]), 'files': dict(zip(parts[1::2], parts[2::2], strict=True))}
+    source = lzma.decompress(base64.b64decode(encoded.group(1)))
+    expected = re.search(r"hexdigest\(\) != '([a-f0-9]{64})'", script)[1]
+    assert hashlib.sha256(source).hexdigest() == expected, 'rendered source checksum mismatch'
+    config = re.search(r"json.loads\(base64.b64decode\('([A-Za-z0-9+/=]+)'\)\)", script)[1]
+    parts = source.decode().split('\0')
+    return {'config': json.loads(base64.b64decode(config)), 'files': dict(zip(parts[::2], parts[1::2], strict=True))}
 
 
 def render(bundle):
     """Unit fixture; validate_terraform uses the actual Terraform-rendered script."""
     template = (Path(__file__).resolve().parents[1] / 'scripts/install.sh.tftpl').read_text()
-    parts = [json.dumps(bundle['config'])] + [part for pair in sorted(bundle['files'].items()) for part in pair]
-    encoded = base64.b64encode(gzip.compress('\0'.join(parts).encode(), mtime=0)).decode()
-    return template.replace('${bundle}', encoded)
+    parts = [part for pair in sorted(bundle['files'].items()) for part in pair]
+    source = '\0'.join(parts).encode()
+    return (template.replace('${bundle}', base64.b64encode(lzma.compress(source)).decode())
+            .replace('${sha256}', hashlib.sha256(source).hexdigest())
+            .replace('${config}', base64.b64encode(json.dumps(bundle['config']).encode()).decode()))
 
 
 def launch(script, home, fixture_dir, release, node, offline=False):

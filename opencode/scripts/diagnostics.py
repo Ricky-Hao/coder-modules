@@ -132,13 +132,15 @@ def directory_page(root, cursor, maximum):
         libc.closedir(stream)
 
 
-def doctor(root, launched_version=None):
+def doctor(root, launched_version=None, quick=False):
     import install
     import profiles
     files = dict.fromkeys(sorted(install.PAYLOAD_FILES | {'metadata.json', 'settings.json',
                          'node_modules/acpx/package.json', 'node_modules/acpx/dist/cli.js'}), 1024 * 1024)
-    files.update({'opencode': 352 * 1024 * 1024, 'node/bin/node': 160 * 1024 * 1024})
-    names = ['active_launcher', 'installed_inventory', 'settings', 'private_layout', *files,
+    binaries = {'opencode': 352 * 1024 * 1024, 'node/bin/node': 160 * 1024 * 1024}
+    files.update(binaries)
+    names = ['active_launcher', 'installed_inventory', 'settings', 'private_layout',
+             *(item for name in files for item in ([name + ':metadata', name] if name in binaries else [name])),
              'runtime_pins', 'bin/opencode', 'bin/acpx', 'bin/opencode-task', 'module_profile', 'task_capabilities']
     checks = {name: {'name': name, 'status': 'not_checked'} for name in names}
     actual = profile = features = None
@@ -159,14 +161,21 @@ def doctor(root, launched_version=None):
         for parent in list(file.parents)[:len(Path(name).parts) - 1]:
             directory(parent)
         with private_fd(file, maximum) as (fd, info):
+            require(stat.S_IMODE(info.st_mode) == expected['mode'])
+            if name in binaries:
+                require(info.st_mode & 0o100)
+                if quick:
+                    # 只核对同 fd 的类型、属主、私有权限、单链接、大小上限及可执行位。
+                    checks[name]['reason'] = 'quick_mode'
+                    return
+                step(name)
             digest, count = hashlib.sha256(), 0
             while chunk := os.read(fd, min(65536, maximum + 1 - count)):
                 count += len(chunk)
                 if count > maximum:
                     raise ReadError('READ_LIMIT')
                 digest.update(chunk)
-            require(digest.hexdigest() == expected['sha256'] and stat.S_IMODE(info.st_mode) == expected['mode'])
-            require(name not in ('opencode', 'node/bin/node') or info.st_mode & 0o100)
+            require(digest.hexdigest() == expected['sha256'])
 
     try:
         ancestors(root)
@@ -187,7 +196,7 @@ def doctor(root, launched_version=None):
         for name in ('bin', 'runtime', *('runtime/' + n for n in ('home', 'config', 'data', 'cache', 'state', 'tmp'))):
             directory(root / name)
         for name, maximum in files.items():
-            step(name)
+            step(name + ':metadata' if name in binaries else name)
             verify(name, maximum)
         step('runtime_pins')
         identity = manifest['identity']
@@ -215,20 +224,23 @@ def doctor(root, launched_version=None):
         checks[current]['status'] = 'ok'
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks[current].update(status='failed', code=error_code(error))
-    return {'version': 1, 'read_only': True, 'ok': all(c['status'] == 'ok' for c in checks.values()),
+    return {'version': 1, 'read_only': True, 'mode': 'quick' if quick else 'full',
+            'ok': checks['task_capabilities']['status'] == 'ok',
             'checks': list(checks.values()), 'runtime': actual, 'features': features, 'profile': profile,
             'launcher': 'bin/opencode-task -> active/runtime.py',
             'not_checked': ['provider_health', 'mcp_health', 'external_config_contents', 'agent_execution',
-                            'task_history', 'full_dependency_inventory', 'runtime_version_execution'],
-            'guidance': '遇错即停；后续未检。核对私有安装。'}
+                             'task_history', 'full_dependency_inventory', 'runtime_version_execution',
+                             *([name + ':content_and_sha256' for name in binaries] if quick else [])],
+            'guidance': ('快速静态核对；未读二进制内容或核验其哈希，不证明完整性或服务健康。' if quick else
+                         '完整安装校验；不证明服务健康。') + '遇错即停；后续未检。'}
 
 
 def main():
     try:
         if len(sys.argv) == 5 and sys.argv[1] == '_page':
             value = directory_page(Path(sys.argv[2]), json.loads(sys.argv[3]), int(sys.argv[4]))
-        elif len(sys.argv) == 3 and sys.argv[1] == '--root':
-            value = doctor(Path(sys.argv[2]))
+        elif sys.argv[1:2] == ['--root'] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ['--quick']):
+            value = doctor(Path(sys.argv[2]), quick=sys.argv[3:] == ['--quick'])
         else:
             raise ReadError('INVALID_ARGUMENTS')
         print(json.dumps(value, ensure_ascii=False))

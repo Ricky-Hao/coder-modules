@@ -122,7 +122,7 @@ run "executable_dedicated_startup" {
                                         'profile-env.json', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
                                         'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():
-            assert text == (module / 'scripts' / name).read_text()
+            assert text.encode() == (module / 'scripts' / name).read_bytes()
             if name.endswith('.py'):
                 compile(text, name, 'exec')
         path = scratch / ('rendered-' + str(number) + '.sh')
@@ -141,6 +141,23 @@ run "executable_dedicated_startup" {
     assert any(c['install_root'] == '/mnt/opencode/toolset' and c['runtime_profile'] == 'none' for c in configs)
     assert (scratch / 'volume-prepare.py').is_file()
     assert {record['mode'] for record in execution} == {'home', 'dedicated'}
+    # 单独改变源码，证明固定 source 不会静默安装过期的生成包。
+    source = scratch / 'scripts/safety.py'
+    original = source.read_bytes()
+    (scratch / 'tests/stale.tftest.hcl').write_text(provider_mock + '''
+run "stale_source_bundle" {
+  command = plan
+  variables {
+    agent_id = "22222222-2222-4222-8222-222222222222"
+  }
+  expect_failures = [coder_script.opencode]
+}
+''')
+    try:
+        source.write_bytes(original + b'\n')
+        run('stale-bundle', 'test', '-no-color', '-json', '-filter=tests/stale.tftest.hcl')
+    finally:
+        source.write_bytes(original)
     (scratch / 'startup-evidence.json').write_text(json.dumps({'sizes': sizes, 'execution': execution}, indent=2) + '\n')
     print(json.dumps({'sizes': sizes, 'execution': execution}, indent=2))
     print('PASS: cached init, validate, mock plans, budget rejection, rendered env/bash -c execution, install/cache/recovery/preservation; no apply')
