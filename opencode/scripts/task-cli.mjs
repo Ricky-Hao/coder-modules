@@ -16,13 +16,14 @@ const command = args.shift();
 const allowed = new Set([
   "submit",
   "status",
+  "result",
   "cancel",
   "recover",
   "resolve",
   "_worker",
 ]);
 const help =
-  "opencode-task submit --key KEY --prompt-file FILE [--callback-file PRIVATE_FILE] [--session NAME] [--model PROVIDER/MODEL] [--variant VARIANT] [--permission-mode deny-all|approve-reads|approve-all] [--permission-policy-file PRIVATE_FILE]\nopencode-task status TASK_ID\nopencode-task cancel TASK_ID\nopencode-task recover\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nEnv profile defaults to codex/gpt-6.1-sol, max. A named session fixes model/variant/config; conflicts require a new session. Callback registration JSON is read from stdin unless --callback-file is supplied. No callback values in arguments or environment. Permission overrides require existing user authorization for this task; no automatic escalation.";
+  "opencode-task submit --key KEY --prompt-file FILE [--callback-file PRIVATE_FILE] [--session NAME] [--model PROVIDER/MODEL] [--variant VARIANT] [--permission-mode deny-all|approve-reads|approve-all] [--permission-policy-file PRIVATE_FILE]\nopencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task cancel TASK_ID\nopencode-task recover\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nResult output is bounded assistant text; timing is local Unix epoch milliseconds. It does not verify Git, tests or other claims in that text. Env profile defaults to codex/gpt-6.1-sol, max. A named session fixes model/variant/config; conflicts require a new session. Callback registration JSON is read from stdin unless --callback-file is supplied. No callback values in arguments or environment. Permission overrides require existing user authorization for this task; no automatic escalation.";
 
 function spawnWorker(id) {
   const child = spawn(path.join(root, "bin/opencode-task"), ["_worker", id], {
@@ -159,6 +160,9 @@ async function main() {
         );
         spawnWorker(id);
         console.log(JSON.stringify(runner.status(id)));
+      } else if (command === "result") {
+        if (args.length) throw new Error("INVALID_ARGUMENTS");
+        console.log(JSON.stringify(runner.result(id)));
       } else {
         if (args.length) throw new Error("INVALID_ARGUMENTS");
         if (command === "cancel") {
