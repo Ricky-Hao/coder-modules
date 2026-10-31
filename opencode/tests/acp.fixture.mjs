@@ -121,9 +121,18 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
           update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault progress." } } } });
       }, 100) };
     } else if (text === "recover thought progress") {
-      fixtureEvent("quiet_started", request.params.sessionId);
+      fixtureEvent("thought_ready", request.params.sessionId);
+      let quiet = false;
       let resumed;
       active = { request, timer: setInterval(() => {
+        if (!quiet) {
+          if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.quiet`))) {
+            quiet = true;
+            fixtureEvent("quiet_started", request.params.sessionId);
+          } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+            update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault thought." } } } });
+          return;
+        }
         // 测试观察到 suspected 后，仅解除合成 peer 的静默，不改任务状态。
         if (!fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, request.params.sessionId))) return;
         if (resumed === undefined) {

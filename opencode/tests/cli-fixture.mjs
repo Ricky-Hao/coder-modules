@@ -18,7 +18,12 @@ if (!isMainThread && workerData?.kind === "health-witness") {
         record.health.suspectedReason === "PROGRESS_UNCONFIRMED") {
       suspected = record.health.eventSequence;
       parentPort.postMessage({ type: "suspected", snapshot });
-      if (workerData.resumeDirectory) fs.writeFileSync(path.join(workerData.resumeDirectory, snapshot.sessionId), "resume synthetic thought");
+      if (workerData.resumeDirectory) {
+        const evidence = path.join(workerData.resumeDirectory, `${snapshot.sessionId}.suspected.json`);
+        fs.writeFileSync(evidence + ".tmp", JSON.stringify({ suspectedAt: snapshot.health.suspectedAt }));
+        fs.renameSync(evidence + ".tmp", evidence);
+        fs.writeFileSync(path.join(workerData.resumeDirectory, snapshot.sessionId), "resume synthetic thought");
+      }
     } else if (suspected !== undefined && !resumed && record.health?.assessment === "observing" &&
         record.health.eventSequence > suspected) {
       resumed = true;
@@ -54,9 +59,44 @@ export function processBirth(pid) {
   }
 }
 
+export function recordFixtureSpawns(source, filename) {
+  const imported = 'import { spawn } from "node:child_process";';
+  if (!source.includes(imported)) throw new Error("fixture spawn instrumentation no longer matches source");
+  // 复制脚本的父 spawn 点立即登记，覆盖 child 尚在 Python 初始化且 submit 已退出的窗口。
+  return source.replace(imported, `import { spawn as fixtureNativeSpawn } from "node:child_process";
+const spawn = (...args) => {
+  const child = fixtureNativeSpawn(...args);
+  if (child.pid) {
+    try {
+      const ticks = fs.readFileSync('/proc/' + child.pid + '/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19];
+      const role = args[1]?.find((arg) => ['_worker', '_observe', '_supervise', '_fail_launch'].includes(arg)) ?? 'spawned';
+      const taskId = args[1]?.find((arg) => /^task_[a-f0-9]{64}$/.test(arg));
+      fs.appendFileSync(${JSON.stringify(filename)}, JSON.stringify({ pid: child.pid, ticks, role, taskId }) + '\\n');
+    } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
+  }
+  return child;
+};`);
+}
+
+export function fixtureProcessSnapshot(base) {
+  const file = path.join(base, "drivers.ndjson");
+  if (!fs.existsSync(file)) return [];
+  const proofs = fs.readFileSync(file, "utf8").split("\n").slice(0, -1).map(JSON.parse);
+  return [...new Map(proofs.map((proof) => [`${proof.pid}:${proof.ticks}`, proof])).values()].map((proof) => {
+    const birth = processBirth(proof.pid);
+    let waiting = null;
+    if (birth?.ticks === proof.ticks) {
+      try { waiting = fs.readFileSync(`/proc/${proof.pid}/wchan`, "utf8").trim(); } catch { /* 退出与读取可竞争。 */ }
+    }
+    return { ...proof, same_birth: birth?.ticks === proof.ticks, state: birth?.state ?? null, waiting };
+  });
+}
+
 export async function stopFixtureProcesses(base, version) {
-  const allowed = new Set([path.join(base, "toolset/bin/opencode-task"),
-    path.join(version, "runtime.py"), path.join(version, "task-cli.mjs"), path.join(version, "node/bin/node")]);
+  const root = path.join(base, "toolset");
+  const allowed = new Set([path.join(root, "bin/opencode-task"), path.join(root, "bin/opencode"),
+    ...[version, path.join(root, "active")].flatMap((directory) =>
+      ["runtime.py", "task-cli.mjs", "node/bin/node", "opencode"].map((name) => path.join(directory, name)))]);
   const readLines = (file) => fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").slice(0, -1).map(JSON.parse) : [];
   const verified = new Set();
   const live = (proof) => {
@@ -123,7 +163,10 @@ export async function stopFixtureProcesses(base, version) {
 export async function finishFixture(primaryError, cleanup, diagnostic) {
   let cleanupError;
   try { await cleanup(); } catch (error) { cleanupError = error; }
-  if (cleanupError) diagnostic({ phase: "cleanup_failed", code: cleanupError.code ?? null, message: cleanupError.message });
+  if (cleanupError) {
+    try { diagnostic({ phase: "cleanup_failed", code: cleanupError.code ?? null, message: cleanupError.message }); }
+    catch { /* 诊断自身失败也不能替代已经存在的首错。 */ }
+  }
   if (primaryError) throw primaryError; // 首错对象/stack 原样保留，finally 不能覆盖它。
   if (cleanupError) throw cleanupError;
 }

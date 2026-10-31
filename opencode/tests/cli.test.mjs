@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import { TaskRunner } from "../scripts/task.mjs";
-import { startHealthWitness, stopFixtureProcesses, finishFixture } from "./cli-fixture.mjs";
+import { startHealthWitness, stopFixtureProcesses, finishFixture, recordFixtureSpawns, fixtureProcessSnapshot } from "./cli-fixture.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts/", import.meta.url));
 const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -41,10 +41,25 @@ test(
     fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
       '} catch (error) {\n  // No raw', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // No raw`).replace(
       'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise', '_fail_launch'].includes(command)) {
+        process.on('uncaughtExceptionMonitor', (error) => {
+          try { fs.appendFileSync(${JSON.stringify(path.join(base, 'driver-errors.ndjson'))}, JSON.stringify({
+            pid: process.pid, role: command, taskId: id, code: error.code, message: error.message,
+            stack: error.stack, at: Date.now() }) + '\\n'); }
+          catch { /* 仅记录未捕获异常，不拦截默认退出。 */ }
+        });
         fs.appendFileSync(${JSON.stringify(path.join(base, 'drivers.ndjson'))}, JSON.stringify({ pid: process.pid,
-          ticks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19], role: command }) + '\\n');
+          ticks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19], role: command, taskId: id }) + '\\n');
+        process.once('exit', (code) => {
+          try { fs.appendFileSync(${JSON.stringify(path.join(base, 'driver-exits.ndjson'))},
+            JSON.stringify({ pid: process.pid, role: command, taskId: id, code, at: Date.now() }) + '\\n'); }
+          catch { /* 诊断不可改变复制 driver 的退出结果。 */ }
+        });
         fs.writeFileSync(${JSON.stringify(base)} + '/' + (command === '_supervise' ? 'monitor' : 'worker') + '-' + id + '.pid', String(process.pid));
       }`));
+    for (const name of ['task-cli.mjs', 'task-supervisor.mjs']) {
+      const copied = path.join(version, name);
+      fs.writeFileSync(copied, recordFixtureSpawns(fs.readFileSync(copied, 'utf8'), path.join(base, 'drivers.ndjson')));
+    }
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -340,14 +355,26 @@ esac
       const delivered = async (id) => {
         try { await until(() => load(id).state === "delivered", `delivered:${id}`); }
         catch (error) {
-          const { state, executionError, health, workerExit } = load(id);
-          const observations = Object.fromEntries(['worker.json', 'monitor.json'].map((name) => {
-            const file = path.join(root, 'runtime/tasks', id, name);
-            return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null];
-          }));
-          console.error(JSON.stringify({ phase: `delivered:${id}`, state, executionError, health, workerExit,
-            now: Date.now(), observations,
-            fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+          try {
+            const { state, executionError, health, workerExit } = load(id);
+            const observations = Object.fromEntries(['worker.json', 'monitor.json'].map((name) => {
+              const file = path.join(root, 'runtime/tasks', id, name);
+              return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null];
+            }));
+            const record = load(id);
+            const journal = record.handle ? path.join(root, 'runtime/home/.acpx/sessions',
+              `${encodeURIComponent(record.handle.acpxRecordId)}.stream.ndjson`) : null;
+            const journalTerminals = journal && fs.existsSync(journal) ? fs.readFileSync(journal, 'utf8').split('\n').slice(0, -1)
+              .map(JSON.parse).filter((event) => ['turn_started', 'turn_result'].includes(event.type))
+              .map((event) => ({ type: event.type, request_id: event.request_id, status: event.result?.status,
+                detail_code: event.result?.error?.detailCode })) : [];
+            console.error(JSON.stringify({ phase: `delivered:${id}`, state, executionError, health, workerExit,
+              now: Date.now(), request_id: record.requestId, cursor: record.cursor, journalTerminals,
+              processes: fixtureProcessSnapshot(base), observations,
+              exits: fs.existsSync(path.join(base, 'driver-exits.ndjson')) ?
+                fs.readFileSync(path.join(base, 'driver-exits.ndjson'), 'utf8').trim().split('\n').map(JSON.parse).filter((value) => value.taskId === id) : [],
+              fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+          } catch { /* 诊断读取损坏也须重抛进入 catch 的原错误。 */ }
           throw error;
         }
         return load(id);
@@ -557,13 +584,37 @@ esac
       const thoughtWitness = await witnessFor('healthy-thought', progressControl);
       const beforeHealthControls = executionCount();
       const thoughtId = faultSubmit('healthy-thought', 'recover thought progress');
-      // 故意让父测试超过整个短确认窗不获调度；独立 witness 仍须记录怀疑并恢复 peer。
-      const blocked = spawnSync('python3', ['-B', '-c', 'import time; time.sleep(1.8)'], { env: { PATH: env.PATH }, timeout: 3000 });
-      assert.equal(blocked.status, 0);
+      await until(() => {
+        const record = load(thoughtId);
+        return record.handle && peerEvents(record).some((event) => event.type === 'thought_ready');
+      }, 'thought peer ready before blocking');
+      const thoughtSession = load(thoughtId).handle.backendSessionId;
+      // 子进程先触发静默，父线程已阻塞。以真实怀疑时间确认阻塞覆盖整个 confirm 窗口。
+      const blockStartedAt = Date.now();
+      const blockTick = performance.now();
+      const blocked = spawnSync('python3', ['-B', '-c', `import json, pathlib, sys, time
+control = pathlib.Path(sys.argv[1])
+control.with_name(control.name + '.quiet').write_text('inject synthetic silence')
+started = time.monotonic()
+while True:
+    evidence = control.with_name(control.name + '.suspected.json')
+    if evidence.exists() and time.monotonic() - started >= 1.8:
+        suspected = json.loads(evidence.read_text())['suspectedAt']
+        if time.time() * 1000 >= suspected + 800: break
+    if time.monotonic() - started > 4: raise RuntimeError('thought blocking evidence timed out')
+    time.sleep(0.01)
+`, path.join(progressControl, thoughtSession)], { env: { PATH: env.PATH }, timeout: 5000 });
+      const blockEndedAt = Date.now();
+      const parentBlockedMs = performance.now() - blockTick;
+      assert.equal(blocked.status, 0, blocked.stderr?.toString());
       await until(() => thoughtWitness.events.suspected || thoughtWitness.events.error || thoughtWitness.events.sealed, 'thought enters suspicion');
       assert.equal(thoughtWitness.events.error, undefined);
       const quietThought = thoughtWitness.events.suspected;
       assert.ok(quietThought, JSON.stringify(thoughtWitness.events));
+      const quietStartedAt = peerEvents(load(thoughtId)).find((event) => event.type === 'quiet_started').at;
+      assert.ok(quietStartedAt >= blockStartedAt && quietStartedAt <= blockEndedAt);
+      assert.ok(quietThought.health.suspectedAt >= quietStartedAt);
+      assert.ok(blockEndedAt - quietThought.health.suspectedAt >= 800);
       assert.equal(quietThought.health.suspectedReason, 'PROGRESS_UNCONFIRMED');
       assert.equal(quietThought.health.ownerProcess, 'alive');
       assert.equal(quietThought.bodyPresent, false);
@@ -602,7 +653,9 @@ esac
       t.diagnostic(JSON.stringify({ scenario: 'thought-after-suspicion', task_id: thoughtId, request_id: thought.requestId,
         suspected_at: quietThought.health.suspectedAt, resumed_at: resumedAt, completed_at: completedAt,
         cleared_at: resumedThought.health.observedAt, thought_events: thoughtUpdates.length,
-        assistant_events: 0, parent_blocked_ms: 1800, business_executions: 1, http_posts: 1, result_status: 'success' }));
+        assistant_events: 0, parent_blocked_ms: parentBlockedMs, block_started_at: blockStartedAt,
+        block_ended_at: blockEndedAt, quiet_started_at: quietStartedAt,
+        business_executions: 1, http_posts: 1, result_status: 'success' }));
 
       const stalledCallback = `tcb_${'alive-stall'.padEnd(43, 'v')}`;
       let lostStallReceipt = false;
@@ -836,10 +889,14 @@ esac
     } catch (error) {
       primaryError = error;
       // 先保留首错与阶段；即使随后清理失败，原 stack 仍作为测试失败返回。
-      console.error(JSON.stringify({ phase, temporary_root: base, first_failure: error.message, stack: error.stack }));
+      try { console.error(JSON.stringify({ phase, temporary_root: base, first_failure: error.message, stack: error.stack,
+        driver_errors: fs.existsSync(path.join(base, 'driver-errors.ndjson')) ?
+          fs.readFileSync(path.join(base, 'driver-errors.ndjson'), 'utf8').trim().split('\n').map(JSON.parse) : [] })); }
+      catch { /* 诊断输出失败时仍保留同一个 primaryError。 */ }
     } finally {
       await finishFixture(primaryError, async () => {
-        console.error(JSON.stringify({ fixture_phase: 'cleanup', after_failure: Boolean(primaryError), at: Date.now() }));
+        try { console.error(JSON.stringify({ fixture_phase: 'cleanup', after_failure: Boolean(primaryError), at: Date.now() })); }
+        catch { /* 诊断不能阻止进程收尾。 */ }
         try {
           for (const witness of witnesses) await witness.close();
           await stopFixtureProcesses(base, version);
@@ -847,8 +904,9 @@ esac
           // 清理被拒绝时也释放本地 receiver，不能让首错变成测试进程悬挂。
           await new Promise((resolve) => { webhook.close(resolve); webhook.closeAllConnections(); });
         }
-        fs.rmSync(base, { recursive: true, force: true });
-        t.diagnostic(JSON.stringify({ phase: 'cleanup', writers_stopped: true, temporary_root_removed: true }));
+        if (!primaryError) fs.rmSync(base, { recursive: true, force: true });
+        t.diagnostic(JSON.stringify({ phase: 'cleanup', writers_stopped: true, temporary_root_removed: !primaryError,
+          retained_failure_root: primaryError ? base : undefined }));
       }, (value) => t.diagnostic(JSON.stringify(value)));
     }
   },

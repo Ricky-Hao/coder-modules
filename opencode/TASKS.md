@@ -428,7 +428,8 @@ confirm 800 毫秒；首次 POST 须在最后进展后的 1400～4600 毫秒内�
 `result_status/terminal_at: null`。只执行一次业务；同 session 后续请求仍排队，未误取消或放行。
 
 健康对照由独立采样线程记录怀疑/恢复快照并只放行 peer 的 thought，避免同步 submit 阻塞父测试
-时错过短暂状态。父测试刻意阻塞 1.8 秒，peer 仍持续 thought，待父测试核对恢复且健康跨度超过
+时错过短暂状态。等待任务 handle 就绪及 peer 实际接收后，由阻塞子进程触发静默；记录真实阻塞起止，并核对怀疑发生在
+阻塞期间、阻塞结束已越过该次怀疑的确认期限。父测试至少阻塞 1.8 秒，peer 恢复后仍持续 thought，待核对健康跨度超过
 progress + confirm 后才放行成功终态。最后只有一次 success callback，全程没有 assistant 文字；已有长工具
 对照继续跨普通静默边界成功。CLI 的 `healthy-tool`、`thought-after-suspicion`、
 `alive-original-stall` 诊断只输出合成标识、策略、观测时间与次数，可由上述命令复核。
@@ -436,12 +437,19 @@ progress + confirm 后才放行成功终态。最后只有一次 success callbac
 暂时不可区分。业务无需自动恢复，监护接续原请求也不等于重做业务。
 
 夹具清理先保留原失败及阶段，再按出生身份停止自有 monitor、worker、owner/agent，等待它们
-退出或进入不可写的僵尸状态后才删临时目录。覆盖尚未完成 Node 初始化的自有子进程和暂停的
+退出或进入不可写的僵尸状态后才删临时目录。复制脚本的父 spawn 点立即登记 child 出生身份，
+精确匹配 version、active 及 wrapper 启动路径，覆盖尚未完成 Node 初始化的自有子进程和暂停的
 worker；无法确认停止则保留临时目录并报错。清理异常会另行诊断，不覆盖首错；只有清理失败
 也必须使测试失败。回归用真实子进程验证 TERM 后延迟重建目录、SIGSTOP、PID 出生身份不符和
-首错保留，未改生产监督逻辑或原等待上限。旧夹具只发 TERM 就立即删目录，存在可证的并发写入
-竞态；sing-box 固定 `7f7b749` 的 ENOTEMPTY 会掩盖首错，原日志未提供被覆盖的异常，因此不能
-据此认定生产检测失败或确定首错。前轮单次 fixture timeout 的根因同样仍未确定。
+首错保留（含诊断自身抛错），未改生产监督逻辑或原等待上限。旧夹具只发 TERM 就立即删目录，
+存在可证的并发写入竞态；旧 finally 在已有首错时可能用 ENOTEMPTY 覆盖它。sing-box 固定
+`7f7b749` 的原 TAP 尚未取得，是否存在首错及其内容未知，不能据此认定生产检测失败或确定首错。
+前轮单次 fixture timeout 的根因同样仍未确定。
+本轮另一次本地 cancel/recover 等待 delivered 超时按 exit 1 保留，未被清理异常覆盖；该次
+原始进程及 journal 证据不足，原因未证。失败诊断会补充原请求终态摘要、已登记进程的出生
+身份/状态与正常退出记录；写入者停止后仍保留失败夹具目录，成功运行才删除。
+另一次同 session 后续请求停在 queued 的现场确认 monitor 在启动后约 0.45 秒以 code 1 退出，
+尚无对应异常证据；复制脚本新增 `uncaughtExceptionMonitor` 记录，不拦截 Node 默认退出。
 
 双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
 去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用
