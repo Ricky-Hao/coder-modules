@@ -11,6 +11,11 @@ tags: [helper, ide, ai]
 
 The module also installs **`opencode-task`** for detached tasks, durable callback
 delivery, recovery and bounded terminal-result reads using the pinned acpx runtime.
+Each task has a monitor for worker exit and callback delivery. Unknown execution
+outcomes retain `ambiguous` and send an explicit supervision-failure notification;
+the [health policy](TASKS.md#监督策略与边界) defines deadlines, configuration and limits.
+监督阈值先进入怀疑，再连续确认；原请求的新进展可撤销怀疑。静默和观察失败仍有未知边界，
+不能作为业务死亡证明。
 See [TASKS.md](TASKS.md) for the CLI, private-input contract, protocol and focused
 verification.
 

@@ -8,6 +8,7 @@ const input = JSON.parse(fs.readFileSync(0, "utf8"));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "callback-protocol-"));
 fs.chmodSync(root, 0o700);
 let executions = 0;
+let requestId;
 const runtime = {
   async ensureSession(input) {
     return {
@@ -20,6 +21,7 @@ const runtime = {
   },
   startTurn(turn) {
     executions++;
+    requestId = turn.requestId;
     if (turn.text.includes(input.callback_id))
       throw new Error("Callback leaked to prompt");
     return {
@@ -33,6 +35,9 @@ const runtime = {
       })(),
       result: Promise.resolve({ status: input.result ?? "completed" }),
     };
+  },
+  async *watchSession() {
+    yield { type: 'turn_result', requestId, cursor: '1', result: { status: input.result ?? 'completed' } };
   },
 };
 try {

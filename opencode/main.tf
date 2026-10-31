@@ -16,7 +16,7 @@ locals {
       release_sha256  = local.release.sha256
       runtime_profile = var.runtime_profile
     }
-    files = { for name in ["install.py", "runtime.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-cli.mjs", "task-acp.mjs", "package.json", "package-lock.json"] :
+    files = { for name in ["install.py", "runtime.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-cli.mjs", "task-acp.mjs", "task-supervisor.mjs", "package.json", "package-lock.json"] :
       name => file("${path.module}/scripts/${name}")
     }
   }))

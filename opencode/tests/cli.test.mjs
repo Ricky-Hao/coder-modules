@@ -3,9 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { TaskRunner } from "../scripts/task.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts/", import.meta.url));
 const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -13,8 +14,8 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test(
   "actual wrapper/CLI: detached submit, private stdin, lost receipt/worker restart, dedupe and status",
-  { timeout: 60000 },
-  async () => {
+  { timeout: 120000 },
+  async (t) => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     fs.chmodSync(base, 0o700);
     const root = path.join(base, "toolset");
@@ -30,12 +31,14 @@ test(
       "task.mjs",
       "task-cli.mjs",
       "task-acp.mjs",
+      "task-supervisor.mjs",
     ])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     // Only this synthetic fixture may expose diagnostics from its copied worker.
     const copiedCli = path.join(version, 'task-cli.mjs');
     fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
-      '} catch (error) {\n  // No raw', '} catch (error) {\n  console.error(error.stack);\n  // No raw'));
+      '} catch (error) {\n  // No raw', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // No raw`).replace(
+      'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise'].includes(command)) fs.writeFileSync(${JSON.stringify(base)} + '/' + (command === '_supervise' ? 'monitor' : 'worker') + '-' + id + '.pid', String(process.pid));`));
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -107,12 +110,17 @@ test(
       { mode: 0o600 },
     );
     const executions = path.join(base, "executions");
+    const eventLog = path.join(base, "events.ndjson");
+    const progressControl = path.join(base, "progress-control");
+    fs.mkdirSync(progressControl, { mode: 0o700 });
     const env = {
       PATH: "/usr/local/bin:/usr/bin:/bin",
       HOME: base,
       OPENCODE_ACP_REQUIRED_MODEL: "fixture/test",
       TASK_FIXTURE_LOG: executions,
       TASK_FIXTURE_CONTROL_LOG: path.join(base, 'controls'),
+      TASK_FIXTURE_PROCESS_LOG: path.join(base, 'processes'),
+      TASK_FIXTURE_EVENT_LOG: eventLog, TASK_FIXTURE_PROGRESS_CONTROL: progressControl,
       TASK_FIXTURE_ENV_CHECK: '1',
       HTTP_PROXY: 'http://proxy.example.invalid:8080',
       https_proxy: 'http://proxy.example.invalid:8443',
@@ -126,6 +134,9 @@ test(
       UNLISTED_CALLBACK_BEARER: `Bearer tcb_${'e'.repeat(43)}`,
       CODEX_BASE_URL: 'https://codex.example.invalid/v1', CODEX_API_KEY: 'synthetic-codex',
       COPILOT_BASE_URL: 'https://copilot.example.invalid/v1', COPILOT_API_KEY: 'synthetic-copilot',
+      OPENCODE_TASK_POLL_MS: '100', OPENCODE_TASK_PROBE_MS: '1000', OPENCODE_TASK_DISCOVERY_MS: '5000',
+      OPENCODE_TASK_WORKER_MS: '5000', OPENCODE_TASK_SETUP_MS: '15000', OPENCODE_TASK_PROGRESS_MS: '10000',
+      OPENCODE_TASK_DRAIN_MS: '30', OPENCODE_TASK_CONFIRM_MS: '600',
     };
     const cli = (args, input) =>
       spawnSync(path.join(root, "bin/opencode-task"), args, {
@@ -136,6 +147,9 @@ test(
         timeout: 5000,
       });
     const seen = [];
+    const receipts = new Map();
+    const httpAttempts = [];
+    let interruptCallback;
     const webhook = http.createServer((req, res) => {
       let data = "";
       req.on("data", (chunk) => {
@@ -143,16 +157,18 @@ test(
       });
       req.on("end", () => {
         seen.push(data);
-        if (seen.length === 1) req.socket.destroy();
+        const id = JSON.parse(data).callback_id;
+        // 本地 receiver 先记录接收，再模拟首 receipt 丢失；同 id/body 只接收一次。
+        if (!receipts.has(id)) receipts.set(id, { body: data, receipt: {
+          version: 1, receipt_id: "durable-fixture", accepted_at: new Date().toISOString(),
+        } });
+        assert.equal(data, receipts.get(id).body);
+        const dropped = seen.length === 1 || interruptCallback?.(data);
+        httpAttempts.push({ id, at: Date.now(), status: dropped ? null : 202 });
+        if (dropped) req.socket.destroy();
         else {
           res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              version: 1,
-              receipt_id: "durable-fixture",
-              accepted_at: new Date().toISOString(),
-            }),
-          );
+          res.end(JSON.stringify(receipts.get(id).receipt));
         }
       });
     });
@@ -189,8 +205,8 @@ test(
         state: JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', taskId, 'task.json'), 'utf8')).state,
         workerError: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '',
       }));
-      const workerPid = Number(fs.readFileSync(pidfile(taskId), "utf8"));
-      process.kill(workerPid, "SIGKILL");
+      const monitorPid = Number(fs.readFileSync(path.join(base, `monitor-${taskId}.pid`), "utf8"));
+      process.kill(monitorPid, "SIGKILL");
       await pause(100);
       const recovering = cli(["recover"]);
       assert.equal(recovering.status, 0, recovering.stderr);
@@ -269,10 +285,15 @@ test(
             "utf8",
           ),
         );
-      const until = async (condition) => {
+      const until = async (condition, label = "condition") => {
         const end = Date.now() + 10000;
         while (!condition()) {
-          if (Date.now() > end) throw new Error("CLI fixture timed out");
+          if (Date.now() > end) {
+            const tasks = fs.readdirSync(path.join(root, 'runtime/tasks')).filter((name) => /^task_[a-f0-9]{64}$/.test(name))
+              .map((id) => { const { state, executionError, health, workerExit } = load(id); return { id, state, executionError, health, workerExit }; });
+            throw new Error(JSON.stringify({ message: 'CLI fixture timed out', label, tasks,
+              fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+          }
           await pause(40);
         }
       };
@@ -300,7 +321,17 @@ test(
         return JSON.parse(result.stdout).task_id;
       };
       const delivered = async (id) => {
-        await until(() => load(id).state === "delivered");
+        try { await until(() => load(id).state === "delivered", `delivered:${id}`); }
+        catch {
+          const { state, executionError, health, workerExit } = load(id);
+          const observations = Object.fromEntries(['worker.json', 'monitor.json'].map((name) => {
+            const file = path.join(root, 'runtime/tasks', id, name);
+            return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null];
+          }));
+          throw new Error(JSON.stringify({ id, state, executionError, health, workerExit,
+            now: Date.now(), observations,
+            fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+        }
         return load(id);
       };
       const denied = submit("default-write", "write fixture");
@@ -333,7 +364,7 @@ test(
         "SIGKILL",
       );
       await pause(80);
-      assert.equal(cli(["recover"]).status, 0);
+      // Its monitor must recover this lost driver without an operator recover call.
       const authorizedRecord = await delivered(authorized);
       assert.match(
         JSON.parse(authorizedRecord.body).output,
@@ -401,7 +432,7 @@ test(
       // Recovery/cancel has no in-process turn object and must target A,
       // while the unrelated queued follow-up Q continues normally.
       process.kill(
-        Number(fs.readFileSync(pidfile(waiting), "utf8")),
+        Number(fs.readFileSync(path.join(base, `monitor-${waiting}.pid`), "utf8")),
         "SIGKILL",
       );
       await pause(80);
@@ -458,13 +489,298 @@ test(
       env.TASK_FIXTURE_REFUSE_MODEL = 'copilot/gpt-6.1-sol';
       const refused = JSON.parse(cli(['submit', '--key', 'refused-model', '--prompt-file', modelFile,
         '--model', 'copilot/gpt-6.1-sol'], registrationFor('f')).stdout);
-      await until(() => load(refused.task_id).executionError === 'MODEL_OR_SESSION_SETUP_FAILED');
+      await delivered(refused.task_id);
       assert.equal(fs.readFileSync(executions, 'utf8'), beforeRefusal);
-      assert.equal(load(refused.task_id).state, 'queued');
-      cli(['cancel', refused.task_id]);
-      assert.equal((await delivered(refused.task_id)).resultStatus, 'cancelled');
+      assert.equal(load(refused.task_id).state, 'delivered');
+      assert.equal(load(refused.task_id).resultStatus, 'error');
+      assert.equal(cli(['cancel', refused.task_id]).status, 1);
       delete env.TASK_FIXTURE_REFUSE_MODEL;
+      const faultSubmit = (key, prompt, flags = []) => {
+        fs.writeFileSync(modelFile, prompt);
+        const result = cli(['submit', '--key', key, '--prompt-file', modelFile, ...flags],
+          JSON.stringify({ callback_id: `tcb_${key.padEnd(43, 'v')}`, callback_url: JSON.parse(registration).callback_url }));
+        assert.equal(result.status, 0, result.stderr);
+        return JSON.parse(result.stdout).task_id;
+      };
+      const failed = await delivered(faultSubmit('provider-failed', 'provider failed'));
+      assert.equal(failed.resultStatus, 'error');
+      assert.equal(failed.executionError, 'REQUEST_FAILED');
+      assert.equal(failed.terminalSource, 'watchSession.turn_result');
+      assert.equal(failed.body.includes('synthetic provider.internal'), false);
+      const exited = await delivered(faultSubmit('agent-exit', 'agent exit'));
+      assert.equal(exited.resultStatus, 'error');
+      assert.equal(exited.terminalSource, 'watchSession.turn_result');
+      env.OPENCODE_TASK_PROGRESS_MS = '500';
+      env.OPENCODE_TASK_TOOL_MS = '5000';
+      const toolBegan = Date.now();
+      const slow = await delivered(faultSubmit('healthy-tool', 'long tool'));
+      assert.equal(slow.resultStatus, 'success');
+      assert.equal(JSON.parse(slow.body).output, 'Slow tool completed');
+      t.diagnostic(JSON.stringify({ scenario: 'healthy-tool', progress_ms: 500, confirm_ms: 600, tool_ms: 5000,
+        elapsed_ms: Date.now() - toolBegan, result_status: slow.resultStatus }));
+
+      // 真实 detached worker/monitor 自动完成判断、封存和 HTTP 投递，测试只读任务文件。
+      env.OPENCODE_TASK_PROGRESS_MS = '600';
+      env.OPENCODE_TASK_CONFIRM_MS = '800';
+      const lines = (file) => fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').slice(0, -1).map(JSON.parse) : [];
+      const peerEvents = (record) => lines(eventLog).filter((event) => event.sessionId === record.handle.backendSessionId);
+      const journalEntries = (record) => lines(path.join(root, 'runtime/home/.acpx/sessions',
+        `${encodeURIComponent(record.handle.acpxRecordId)}.stream.ndjson`)); // pinned acpx，只读合成 journal。
+      const executionCount = () => fs.readFileSync(executions, 'utf8').trim().split('\n').length;
+      const callbacks = (record) => seen.filter((body) => JSON.parse(body).callback_id === record.callback.callback_id);
+      const beforeHealthControls = executionCount();
+      const thoughtId = faultSubmit('healthy-thought', 'recover thought progress');
+      await until(() => load(thoughtId).health?.assessment === 'suspected', 'thought enters suspicion');
+      const quietThought = load(thoughtId);
+      assert.equal(quietThought.health.suspectedReason, 'PROGRESS_UNCONFIRMED');
+      assert.equal(quietThought.health.ownerProcess, 'alive');
+      assert.equal(quietThought.body, undefined);
+      assert.equal(callbacks(quietThought).length, 0);
+      fs.writeFileSync(path.join(progressControl, quietThought.handle.backendSessionId), 'resume synthetic thought');
+      await until(() => load(thoughtId).health?.assessment === 'observing' &&
+        peerEvents(quietThought).some((event) => event.type === 'thought_resumed'), 'thought retracts suspicion');
+      const resumedThought = load(thoughtId);
+      assert.equal(resumedThought.health.suspectedAt, undefined);
+      assert.equal(resumedThought.health.suspectedReason, undefined);
+      assert.equal(resumedThought.body, undefined);
+      assert.equal(resumedThought.output ?? '', '');
+      const thought = await delivered(thoughtId);
+      assert.equal(thought.resultStatus, 'success');
+      assert.equal(JSON.parse(thought.body).output, '');
+      assert.equal(callbacks(thought).length, 1);
+      assert.equal(thought.notificationKind, undefined);
+      assert.equal(executionCount(), beforeHealthControls + 1);
+      const thoughtJournal = journalEntries(thought);
+      assert.equal(thoughtJournal.filter((event) => event.type === 'turn_started' && event.request_id === thought.requestId).length, 1);
+      assert.equal(thoughtJournal.filter((event) => event.type === 'turn_result' && event.request_id === thought.requestId).length, 1);
+      assert.equal(thoughtJournal.some((event) => event.params?.update?.sessionUpdate === 'agent_message_chunk'), false);
+      const thoughtUpdates = thoughtJournal.filter((event) => event.params?.update?.sessionUpdate === 'agent_thought_chunk');
+      assert.ok(thoughtUpdates.length >= 5);
+      const thoughtEvents = peerEvents(thought);
+      const resumedAt = thoughtEvents.find((event) => event.type === 'thought_resumed').at;
+      const completedAt = thoughtEvents.find((event) => event.type === 'thought_completed').at;
+      assert.ok(completedAt - resumedAt > 600 + 800);
+      t.diagnostic(JSON.stringify({ scenario: 'thought-after-suspicion', task_id: thoughtId, request_id: thought.requestId,
+        suspected_at: quietThought.health.suspectedAt, resumed_at: resumedAt, completed_at: completedAt,
+        cleared_at: resumedThought.health.observedAt, thought_events: thoughtUpdates.length,
+        assistant_events: 0, business_executions: 1, http_posts: 1, result_status: 'success' }));
+
+      const stalledCallback = `tcb_${'alive-stall'.padEnd(43, 'v')}`;
+      let lostStallReceipt = false;
+      interruptCallback = (body) => {
+        if (JSON.parse(body).callback_id !== stalledCallback || lostStallReceipt) return false;
+        lostStallReceipt = true;
+        return true;
+      };
+      const beforeStall = executionCount();
+      const stalledId = faultSubmit('alive-stall', 'silent forever', ['--session', 'alive-stall-session']);
+      await until(() => load(stalledId).state === 'running' && load(stalledId).originalObserved, 'silent original started');
+      const startedStall = load(stalledId);
+      assert.ok(journalEntries(startedStall).some((event) => event.type === 'turn_started' && event.request_id === startedStall.requestId));
+      const originalPeer = peerEvents(startedStall).find((event) => event.type === 'silent_started');
+      assert.ok(originalPeer);
+      const incarnation = lines(path.join(base, 'processes')).find((proof) => proof.agent === originalPeer.agent);
+      assert.equal(incarnation.owner, originalPeer.owner);
+      const assertOriginalAlive = () => {
+        for (const [pid, ticks, command] of [[incarnation.agent, incarnation.startTicks, fixturePeer],
+          [incarnation.owner, incarnation.ownerStartTicks, path.join(version, 'node_modules/acpx')]]) {
+          const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/);
+          assert.equal(stat[19], ticks);
+          assert.notEqual(stat[0], 'Z');
+          assert.ok(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(command));
+          process.kill(pid, 0); // 只观察出生身份；检测完成前不发送终止/取消。
+        }
+      };
+      assertOriginalAlive();
+      // 同 session 的另一请求保持排队，卡死检测不得误取消或自动放行它。
+      env.OPENCODE_TASK_PROGRESS_MS = '60000';
+      const behindStall = faultSubmit('behind-stall', 'continuity', ['--session', 'alive-stall-session']);
+      env.OPENCODE_TASK_PROGRESS_MS = '600';
+      await until(() => load(behindStall).state === 'dispatching', 'unrelated same-session request queued');
+      await until(() => load(stalledId).health?.assessment === 'suspected', 'silent original suspected');
+      const suspectedStall = load(stalledId);
+      assert.equal(suspectedStall.health.suspectedReason, 'PROGRESS_UNCONFIRMED');
+      assert.equal(suspectedStall.health.owner, 'lease_current');
+      assert.equal(suspectedStall.body, undefined);
+      assert.equal(callbacks(suspectedStall).length, 0);
+      assertOriginalAlive();
+      await until(() => load(stalledId).notificationState === 'delivered', 'silent original automatic error receipt');
+      const stalled = load(stalledId);
+      assertOriginalAlive();
+      assert.equal(stalled.executionError, 'PROGRESS_UNCONFIRMED');
+      assert.equal(stalled.state, 'ambiguous');
+      assert.equal(stalled.health.assessment, 'unavailable');
+      assert.equal(stalled.health.owner, 'lease_current');
+      assert.equal(stalled.health.lastEventAt, suspectedStall.health.lastEventAt);
+      assert.equal(stalled.cancelRequested, undefined);
+      assert.equal(fs.existsSync(path.join(root, 'runtime/tasks', stalledId, 'cancel.json')), false);
+      assert.equal(peerEvents(stalled).some((event) => event.type === 'cancel'), false);
+      assert.equal(load(behindStall).state, 'dispatching');
+      assert.equal(load(behindStall).handle.acpxRecordId, stalled.handle.acpxRecordId);
+      assert.notEqual(load(behindStall).requestId, stalled.requestId);
+      assert.equal(callbacks(load(behindStall)).length, 0);
+      assert.equal(executionCount(), beforeStall + 1);
+      const stalledJournal = journalEntries(stalled);
+      assert.equal(stalledJournal.filter((event) => event.type === 'turn_started' && event.request_id === stalled.requestId).length, 1);
+      assert.equal(stalledJournal.some((event) => event.type === 'turn_result' && event.request_id === stalled.requestId), false);
+      assert.equal(stalledJournal.some((event) => event.type === 'turn_started' && event.request_id === load(behindStall).requestId), false);
+      const stalledFile = path.join(root, 'runtime/tasks', stalledId, 'task.json');
+      const beforeStallRead = fs.readFileSync(stalledFile);
+      const stalledResult = readerCli(['result', stalledId]);
+      assert.equal(stalledResult.status, 0, stalledResult.stderr);
+      const safeStall = JSON.parse(stalledResult.stdout);
+      assert.equal(safeStall.request_id, stalled.requestId);
+      assert.equal(safeStall.callback_state, 'delivered');
+      assert.equal(safeStall.callback_kind, 'supervision_failure');
+      assert.equal(safeStall.callback_status, 'error');
+      assert.equal(safeStall.result_status, null);
+      assert.equal(safeStall.timing.terminal_at, null);
+      assert.equal(safeStall.health.automatic_retry, false);
+      assert.equal(safeStall.health.reason, 'PROGRESS_UNCONFIRMED');
+      assert.equal(stalledResult.stdout.includes(stalledCallback), false);
+      assert.equal(stalledResult.stdout.includes(JSON.parse(registration).callback_url), false);
+      assert.equal(stalledResult.stdout.includes('silent forever'), false);
+      const safeStallStatus = readerCli(['status', stalledId]);
+      assert.equal(safeStallStatus.status, 0, safeStallStatus.stderr);
+      assert.equal(JSON.parse(safeStallStatus.stdout).callback_state, 'delivered');
+      assert.deepEqual(fs.readFileSync(stalledFile), beforeStallRead);
+      assert.deepEqual(callbacks(stalled), [stalled.body, stalled.body]);
+      assert.equal(lostStallReceipt, true);
+      const payload = JSON.parse(stalled.body);
+      assert.equal(payload.status, 'error');
+      assert.match(payload.output, /outcome and side effects are unknown.*PROGRESS_UNCONFIRMED.*may still be running/);
+      assert.deepEqual(stalled.receipt, receipts.get(stalledCallback).receipt);
+      const attempts = httpAttempts.filter((attempt) => attempt.id === stalledCallback);
+      assert.deepEqual(attempts.map((attempt) => attempt.status), [null, 202]);
+      const policy = stalled.health.policy;
+      const detectionBudget = policy.progressMs + policy.confirmMs + 2 * (policy.pollMs + policy.probeMs) + policy.probeMs;
+      const detectionMs = attempts[0].at - stalled.health.lastEventAt;
+      assert.ok(detectionMs >= policy.progressMs + policy.confirmMs, JSON.stringify({ detectionMs, policy }));
+      assert.ok(detectionMs <= detectionBudget, JSON.stringify({ detectionMs, detectionBudget, policy }));
+      assert.ok(stalled.supervisionFailedAt - suspectedStall.health.suspectedAt >= policy.confirmMs);
+      assert.ok(stalled.callbackDeliveredAt - stalled.health.lastEventAt <= detectionBudget + 5000 + 2 * policy.pollMs);
+      t.diagnostic(JSON.stringify({ scenario: 'alive-original-stall', task_id: stalledId, request_id: stalled.requestId,
+        owner_agent_alive_with_same_birth: true, started_at: stalled.startedAt, last_event_at: stalled.health.lastEventAt,
+        suspected_at: suspectedStall.health.suspectedAt, sealed_at: stalled.supervisionFailedAt,
+        http_at: attempts.map((attempt) => attempt.at), delivered_at: stalled.callbackDeliveredAt,
+        policy_ms: policy, detection_ms: detectionMs, detection_budget_ms: detectionBudget,
+        state: safeStall.state, callback_kind: safeStall.callback_kind, callback_state: safeStall.callback_state,
+        callback_status: safeStall.callback_status, result_status: safeStall.result_status, terminal_at: safeStall.timing.terminal_at,
+        business_executions: 1, http_posts: 2, receiver_notifications: 1, receipt_status: 202,
+        exact_bytes: true, cancel_events: 0, same_session_followup: 'queued' }));
+      interruptCallback = undefined;
+      env.OPENCODE_TASK_PROGRESS_MS = '10000';
+      env.OPENCODE_TASK_CONFIRM_MS = '600';
+      env.OPENCODE_TASK_WORKER_MS = '300';
+      env.OPENCODE_TASK_CONFIRM_MS = '1200';
+      const pausedId = faultSubmit('paused-worker', 'long tool');
+      await until(() => load(pausedId).state === 'running');
+      const pausedPid = Number(fs.readFileSync(pidfile(pausedId), 'utf8'));
+      const pausedToken = JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', pausedId, 'worker.json'), 'utf8')).token;
+      process.kill(pausedPid, 'SIGSTOP');
+      try {
+        await pause(800); // 超过 worker 阈值，低于阈值加连续确认，正常恢复应保留该 child。
+        assert.equal(JSON.parse(readerCli(['status', pausedId]).stdout).health.worker_assessment, 'suspected');
+      } finally { process.kill(pausedPid, 'SIGCONT'); }
+      const pausedRecord = await delivered(pausedId);
+      assert.equal(pausedRecord.resultStatus, 'success');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', pausedId, 'worker.json'), 'utf8')).token, pausedToken);
+      assert.equal(pausedRecord.workerExit.reason, 'WORKER_EXITED');
+      env.OPENCODE_TASK_CONFIRM_MS = '600';
+      const beforeStopped = fs.readFileSync(executions, 'utf8').trim().split('\n').length;
+      const stoppedId = faultSubmit('stopped-worker', 'long tool');
+      await until(() => load(stoppedId).state === 'running');
+      const stoppedPid = Number(fs.readFileSync(pidfile(stoppedId), 'utf8'));
+      process.kill(stoppedPid, 'SIGSTOP');
+      const stoppedRecord = await delivered(stoppedId); // 监护结束自有 child，observer 接续原请求。
+      assert.equal(stoppedRecord.resultStatus, 'success');
+      assert.equal(stoppedRecord.terminalSource, 'watchSession.turn_result');
+      assert.notEqual(Number(fs.readFileSync(pidfile(stoppedId), 'utf8')), stoppedPid);
+      assert.equal(fs.readFileSync(executions, 'utf8').trim().split('\n').length, beforeStopped + 1);
+      env.OPENCODE_TASK_WORKER_MS = '5000';
+      const lostId = faultSubmit('owner-exit', 'wait for cancellation');
+      await until(() => load(lostId).state === 'running');
+      const owned = JSON.parse(fs.readFileSync(path.join(base, 'processes'), 'utf8').trim().split('\n').at(-1));
+      assert.ok(fs.readFileSync(`/proc/${owned.owner}/cmdline`, 'utf8').includes(path.join(version, 'node_modules/acpx')));
+      process.kill(owned.owner, 'SIGKILL');
+      await until(() => load(lostId).notificationState === 'delivered');
+      const lost = load(lostId);
+      assert.equal(lost.state, 'ambiguous');
+      assert.equal(lost.resultStatus, undefined);
+      assert.match(JSON.parse(lost.body).output, /side effects are unknown/);
+      const unknown = JSON.parse(cli(['result', lostId]).stdout);
+      assert.equal(unknown.result_status, null);
+      assert.equal(unknown.callback_kind, 'supervision_failure');
+      assert.equal(unknown.timing.terminal_at, null);
+      assert.equal(seen.filter((body) => JSON.parse(body).callback_id === JSON.parse(lost.body).callback_id).length, 1);
+      assert.equal(cli(['recover', lostId]).status, 0);
+      assert.equal(load(lostId).body, lost.body);
+      assert.equal(cli(['cancel', lostId]).status, 1); // Dead owner's cancellation cannot be confirmed.
+      assert.equal(JSON.parse(cli(['status', lostId]).stdout).cancel_requested, true);
+      try {
+        const ticks = fs.readFileSync(`/proc/${owned.agent}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19];
+        if (ticks === owned.startTicks) process.kill(owned.agent, 'SIGKILL');
+      } catch {}
+      const legacyRunner = new TaskRunner({ root: path.join(root, 'runtime/tasks') });
+      const legacy = legacyRunner.submit({ key: 'legacy-unsealed', cwd: base, prompt: 'Synthetic prior task.',
+        callback: JSON.parse(registrationFor('r')) });
+      const legacyRecord = legacyRunner.load(legacy.task_id);
+      legacyRecord.state = 'ambiguous';
+      legacyRunner.write(legacyRecord);
+      const verifiedFile = path.join(base, 'verified.txt');
+      fs.writeFileSync(verifiedFile, 'Independently verified fixture result.');
+      const beforeResolve = fs.readFileSync(executions, 'utf8');
+      const resolved = readerCli(['resolve', legacy.task_id, '--status', 'success', '--output-file', verifiedFile]);
+      assert.equal(resolved.status, 0, resolved.stderr);
+      const resolvedRecord = await delivered(legacy.task_id); // No recover call is allowed to start delivery.
+      assert.equal(resolvedRecord.terminalSource, 'operator_resolution');
+      assert.equal(JSON.parse(resolvedRecord.body).output, 'Independently verified fixture result.');
+      assert.deepEqual(seen.filter((body) => JSON.parse(body).callback_id === legacyRecord.callback.callback_id), [resolvedRecord.body]);
+      assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+      for (const lockName of ['monitor.lock', 'worker.lock']) {
+        const pending = legacyRunner.submit({ key: `launch-failure-${lockName}`, cwd: base, prompt: 'Never dispatched.',
+          callback: JSON.parse(registrationFor(lockName[0])) });
+        const lockPath = legacyRunner.filename(pending.task_id, lockName);
+        fs.writeFileSync(lockPath, '', { mode: 0o600 });
+        const locker = spawn('python3', ['-B', '-c',
+          "import fcntl, sys; lock = open(sys.argv[1], 'r+'); fcntl.flock(lock, fcntl.LOCK_EX); print('ready', flush=True); sys.stdin.buffer.read(1)",
+          lockPath], { cwd: base, env: { PATH: env.PATH }, stdio: ['pipe', 'pipe', 'ignore'] });
+        const exited = new Promise((resolve) => locker.once('exit', resolve));
+        try {
+          await new Promise((resolve, reject) => { locker.once('error', reject); locker.stdout.once('data', resolve); });
+          const beforeFailure = fs.readFileSync(legacyRunner.filename(pending.task_id));
+          assert.equal(readerCli(['_fail_launch', pending.task_id]).status, 1);
+          assert.deepEqual(fs.readFileSync(legacyRunner.filename(pending.task_id)), beforeFailure);
+        } finally {
+          locker.stdin.end();
+          await exited;
+        }
+        let concurrentRecovery;
+        if (lockName === 'monitor.lock') interruptCallback = (body) => {
+          if (JSON.parse(body).callback_id !== legacyRunner.load(pending.task_id).callback.callback_id) return false;
+          interruptCallback = undefined;
+          concurrentRecovery = readerCli(['recover', pending.task_id]);
+          return true; // Lose the first receipt while recover sees this monitor's lock.
+        };
+        const finalizing = spawn(path.join(root, 'bin/opencode-task'), ['_fail_launch', pending.task_id], {
+          cwd: base, env: { PATH: env.PATH, HOME: base }, stdio: 'ignore',
+        });
+        assert.equal(await new Promise((resolve, reject) => {
+          finalizing.once('error', reject);
+          finalizing.once('exit', resolve);
+        }), 0);
+        const launchFailed = await delivered(pending.task_id);
+        assert.equal(launchFailed.executionError, 'SUPERVISOR_START_FAILED');
+        assert.equal(launchFailed.resultStatus, 'error');
+        assert.equal(launchFailed.terminalSource, 'execution_setup_failure');
+        const failureBodies = seen.filter((body) => JSON.parse(body).callback_id === launchFailed.callback.callback_id);
+        assert.deepEqual(failureBodies, Array(lockName === 'monitor.lock' ? 2 : 1).fill(launchFailed.body));
+        if (lockName === 'monitor.lock') assert.equal(concurrentRecovery.status, 0, concurrentRecovery.stderr);
+        assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+      }
       // Graceful fixture shutdown only; never wait for an idle ACP owner to report completion.
+      assert.deepEqual(callbacks(load(stalledId)), [stalled.body, stalled.body]);
+      assert.equal(peerEvents(stalled).some((event) => event.type === 'cancel'), false);
       const { createSharedAcpRuntime, createAgentRegistry } =
         await import("../scripts/node_modules/acpx/dist/runtime.js");
       const priorHome = process.env.HOME;
@@ -477,7 +793,8 @@ test(
         }),
       });
       try {
-        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle])
+        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle, failed.handle, exited.handle, slow.handle,
+          thought.handle, stalled.handle, pausedRecord.handle, stoppedRecord.handle])
           await runtime.close({ handle, reason: "CLI fixture cleanup" });
       } finally {
         await runtime.shutdown();
@@ -488,7 +805,7 @@ test(
       webhook.close();
       for (const name of fs
         .readdirSync(base)
-        .filter((name) => /^worker-task_.*\.pid$/.test(name))) {
+        .filter((name) => /^(worker|monitor)-task_.*\.pid$/.test(name))) {
         try {
           const pid = Number(fs.readFileSync(path.join(base, name), "utf8"));
           // Only the fixture's own detached worker may be stopped; a stale PID
@@ -500,6 +817,18 @@ test(
           )
             process.kill(pid, "SIGTERM");
         } catch {}
+      }
+      // 仅清理本夹具的出生身份；失败诊断也不能遗留永久静默的合成 peer。
+      const processes = path.join(base, 'processes');
+      if (fs.existsSync(processes)) for (const proof of fs.readFileSync(processes, 'utf8').trim().split('\n').map(JSON.parse)) {
+        for (const [pid, ticks] of [[proof.owner, proof.ownerStartTicks], [proof.agent, proof.startTicks]]) {
+          try {
+            const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/);
+            if (stat[19] === ticks && stat[0] !== 'Z' &&
+              fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(path.join(version, 'node/bin/node')))
+              process.kill(pid, 'SIGTERM');
+          } catch {}
+        }
       }
       fs.rmSync(base, { recursive: true, force: true });
     }

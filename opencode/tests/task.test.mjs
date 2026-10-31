@@ -11,17 +11,27 @@ import {
   retryDelay,
   save,
   validateCallback,
+  HEALTH_DEFAULTS,
+  healthPolicy,
+  delay,
+  deliveryState,
+  Confirmation,
 } from "../scripts/task.mjs";
+import { supervise } from "../scripts/task-supervisor.mjs";
+import { EventEmitter } from "node:events";
 
 const callback = {
   callback_id: `tcb_${"x".repeat(43)}`,
   callback_url: "http://127.0.0.1:1/api/agents/task-callbacks",
 };
+const shortPolicy = { ...HEALTH_DEFAULTS, pollMs: 10, probeMs: 20, discoveryMs: 90,
+  setupMs: 60, workerMs: 120, confirmMs: 40, progressMs: 500, drainMs: 20 };
 function fixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "module-task-"));
   fs.chmodSync(root, 0o700);
   t.after(() => fs.rmSync(root, { recursive: true }));
   let executions = 0;
+  let requestId;
   let clock = 1000;
   const runtime = {
     async ensureSession(input) {
@@ -36,6 +46,7 @@ function fixture(t, options = {}) {
     },
     startTurn(input) {
       executions++;
+      requestId = input.requestId;
       assert.equal(input.text.includes(callback.callback_id), false);
       return {
         promptStarted: Promise.resolve(),
@@ -63,6 +74,8 @@ function fixture(t, options = {}) {
     },
     async *watchSession(input) {
       for (const event of options.journal ?? []) yield event;
+      if (requestId && options.result === "failed")
+        yield { type: "turn_result", requestId, result: { status: "failed" }, cursor: "failure" };
     },
     async cancel() {},
   };
@@ -71,6 +84,7 @@ function fixture(t, options = {}) {
     runtime,
     now: () => clock,
     fetcher: options.fetcher,
+    policy: options.policy ?? shortPolicy,
   });
   const accepted = runner.submit({
     key: "local-submit-key",
@@ -116,7 +130,8 @@ for (const [result, status] of [
         assert.equal(init.headers.Authorization, undefined);
         assert.deepEqual(
           JSON.parse(init.body),
-          callbackBody(callback, status, "Done ✓"),
+          callbackBody(callback, status, status === "error"
+            ? "Original request failed (REQUEST_FAILED). Side effects may have occurred; verify before retrying." : "Done ✓"),
         );
         return ok();
       },
@@ -156,6 +171,7 @@ test("bounded result projection separates lifecycle and callback evidence", asyn
     terminal_at: 1010,
     callback_attempted_at: null,
     callback_delivered_at: null,
+    supervision_failed_at: null,
   });
   assert.deepEqual(summary.evidence, {
     lifecycle: "program_observed",
@@ -227,6 +243,7 @@ test("legacy result records report missing timing and source as unknown", async 
     terminal_at: null,
     callback_attempted_at: null,
     callback_delivered_at: null,
+    supervision_failed_at: null,
   });
   assert.equal(summary.output, "Done ✓");
   assert.equal(summary.output_truncated, null);
@@ -323,6 +340,7 @@ test("result withholds callback-shaped output and fails safely on malformed meta
     { requestId: { secret: callback.callback_id } },
     { sessionName: callback.callback_id },
     { terminalSource: callback.callback_url },
+    { notificationKind: callback.callback_id },
     { outputSource: { prompt: sealed.prompt } },
     { receipt: { version: 1, receipt_id: callback.callback_id, accepted_at: "2026-10-20T00:00:00Z" } },
     { body: { secret: callback.callback_id } },
@@ -491,17 +509,19 @@ test("model intent binds dedupe/session and survives recovery; old records stay 
   f.runtime.ensureSession = async (input) => {
     assert.deepEqual(input.model, common.model); throw new Error('selection refused before prompt');
   };
-  await assert.rejects(f.runner.execute(accepted.task_id), /selection refused/);
+  await f.runner.execute(accepted.task_id);
   assert.equal(f.executions(), 0);
   assert.equal(f.runner.status(accepted.task_id).execution_error, 'MODEL_OR_SESSION_SETUP_FAILED');
+  assert.equal(f.runner.status(accepted.task_id).state, 'outbox');
+  assert.equal(f.runner.result(accepted.task_id).evidence.terminal_source, 'execution_setup_failure');
   f.runtime.ensureSession = ensure;
   await f.runner.execute(accepted.task_id);
-  assert.equal(f.executions(), 1);
+  assert.equal(f.executions(), 0);
   const completed = f.runner.load(accepted.task_id);
   const recovered = new TaskRunner({ root: f.root, runtime: f.runtime });
   await recovered.execute(accepted.task_id);
   assert.deepEqual(recovered.load(accepted.task_id), completed);
-  assert.equal(f.executions(), 1);
+  assert.equal(f.executions(), 0);
   assert.deepEqual(recovered.load(named.task_id).model, common.model);
   // The original fixture record has no selection fields or new fingerprint inputs.
   const legacy = f.runner.load(f.id);
@@ -551,6 +571,7 @@ test("journal recovery matches original requestId and saves output with cursor; 
   let cursor;
   f.runtime.watchSession = async function* (input) {
     cursor = input.cursor;
+    if (input.cursor === "2") throw new Error("still unavailable");
     yield {
       type: "turn_result",
       requestId: "someone-else",
@@ -687,3 +708,602 @@ test("refuses unsafe task file and preserves unrelated sibling/session content",
   assert.equal(fs.readFileSync(sentinel, "utf8"), "preserved");
   assert.equal(retryDelay(99, "1", 0), 300000);
 });
+
+const never = () => new Promise(() => {});
+const connected = async () => ({ owner: "lease_current", process: "alive", generation: 1 });
+
+test("setup timeout seals a safe error without dispatch or replay", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: shortPolicy });
+  f.runtime.ensureSession = never;
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.load(f.id).state, "outbox");
+  assert.equal(f.runner.result(f.id).result_status, "error");
+  assert.equal(f.runner.result(f.id).timing.started_at, null);
+  await f.runner.execute(f.id);
+  assert.equal(f.executions(), 0);
+});
+
+test("canonical failure seals even when events and promptStarted never finish; late started cannot overwrite it",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: shortPolicy });
+    let started;
+    f.runtime.startTurn = () => ({ promptStarted: new Promise((resolve) => { started = resolve; }),
+      events: (async function* () { await never(); })(),
+      result: Promise.resolve({ status: "failed", error: { code: "RUNTIME", message: "private synthetic error" } }) });
+    f.runtime.watchSession = async function* () {
+      yield { type: "turn_result", requestId: f.accepted.request_id, result: { status: "failed" }, cursor: "1" };
+    };
+    const began = Date.now();
+    await f.runner.execute(f.id);
+    const sealed = f.runner.load(f.id).body;
+    started();
+    await delay(10);
+    assert.ok(Date.now() - began < 1000);
+    assert.equal(f.runner.load(f.id).state, "outbox");
+    assert.equal(f.runner.load(f.id).body, sealed);
+    assert.equal(sealed.includes("private synthetic error"), false);
+    assert.equal(f.runner.result(f.id).timing.started_at, null);
+  });
+
+test("matching original journal entry cannot disable liveness discovery; unknown notification preserves ambiguity and exact bytes",
+  { timeout: 2000 }, async (t) => {
+    const bodies = [];
+    const f = fixture(t, { policy: shortPolicy, fetcher: async (_url, init) => { bodies.push(init.body); return ok(); } });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    f.runtime.watchSession = async function* () {
+      yield { requestId: record.requestId, type: "turn_started", cursor: "original" };
+      await never(); // Even an iterator ignoring AbortSignal must not retain the driver.
+    };
+    f.runtime.observeOwner = async () => ({ owner: "unavailable", process: "unknown" });
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.status(f.id).state, "ambiguous");
+    f.runner.fail(f.runner.load(f.id), "OWNER_UNAVAILABLE");
+    await f.runner.deliver(f.runner.load(f.id));
+    const summary = f.runner.result(f.id);
+    assert.equal(summary.state, "ambiguous");
+    assert.equal(summary.result_status, null);
+    assert.equal(summary.callback_status, "error");
+    assert.equal(summary.callback_state, "delivered");
+    assert.equal(summary.callback_kind, "supervision_failure");
+    assert.equal(summary.timing.terminal_at, null);
+    assert.ok(summary.timing.supervision_failed_at);
+    assert.match(summary.output, /side effects are unknown/);
+    assert.equal(summary.health.automatic_retry, false);
+    await f.runner.execute(f.id);
+    assert.equal(f.executions(), 0);
+    assert.equal(f.runner.load(f.id).body, bodies[0]);
+    assert.equal(f.runner.pending().length, 0);
+    assert.throws(() => f.runner.resolve(f.id, "success", "different"), /TASK_NOT_AMBIGUOUS/);
+  });
+
+for (const kind of ["silent", "tool", "retry"]) {
+  test(`slow healthy ${kind} survives the discovery bound without cancellation or duplicate dispatch`,
+    { timeout: 3000 }, async (t) => {
+      const f = fixture(t, { policy: { ...shortPolicy, progressMs: kind === "silent" ? 1000 : 40, toolMs: 500 } });
+      const record = f.runner.load(f.id);
+      record.state = "running";
+      record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+      f.runner.write(record);
+      let cancelled = 0;
+      f.runtime.cancelRequest = async () => { cancelled++; };
+      f.runtime.observeOwner = connected;
+      f.runtime.watchSession = async function* () {
+        yield { requestId: record.requestId, type: "message", cursor: "1", message: { params: { update:
+          kind === "tool" ? { sessionUpdate: "tool_call", status: "in_progress", toolCallId: "long-tool" }
+            : kind === "retry" ? { sessionUpdate: "session_info_update", _meta: { "opencode/retry":
+              { nextRetryAt: new Date(Date.now() + 500).toISOString(), attempt: 2 } } }
+              : { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "private thought" } } } } };
+        await delay(180);
+        yield { requestId: "someone-else", cursor: "2", type: "turn_result", result: { status: "failed" } };
+        yield { requestId: record.requestId, cursor: "3", type: "turn_result", result: { status: "completed" } };
+      };
+      // Synthetic retry timestamps and the clock must share the same basis.
+      f.runner.now = Date.now;
+      await f.runner.execute(f.id);
+      assert.equal(f.runner.result(f.id).result_status, "success");
+      assert.equal(cancelled, 0);
+      assert.equal(f.executions(), 0);
+    });
+}
+
+test("a responsive but unobservable request reports supervision failure, never a guessed business terminal",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, progressMs: 60 } });
+    f.runtime.observeOwner = connected;
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () { await never(); })(), result: never() });
+    f.runtime.watchSession = async function* () { await never(); };
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.load(f.id).state, "ambiguous");
+    assert.equal(f.runner.load(f.id).executionError, "PROGRESS_UNCONFIRMED");
+    f.runner.fail(f.runner.load(f.id), "PROGRESS_UNCONFIRMED");
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.runner.result(f.id).timing.terminal_at, null);
+  });
+
+test("a shared healthy owner cannot indefinitely hide an unacknowledged original dispatch",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: shortPolicy });
+    let dispatches = 0;
+    let cancelled = 0;
+    f.runtime.observeOwner = connected;
+    f.runtime.cancelRequest = async () => { cancelled++; };
+    f.runtime.startTurn = () => {
+      dispatches++;
+      return { promptStarted: never(), events: (async function* () { await never(); })(), result: never() };
+    };
+    f.runtime.watchSession = async function* ({ signal }) {
+      while (!signal.aborted) {
+        await delay(10);
+        yield { requestId: "another-request", type: "turn_started", cursor: "other" };
+      }
+    };
+    const began = performance.now();
+    await f.runner.execute(f.id);
+    assert.ok(performance.now() - began < 1000);
+    assert.equal(f.runner.load(f.id).state, "ambiguous");
+    assert.equal(f.runner.load(f.id).executionError, "REQUEST_UNOBSERVABLE");
+    f.runner.fail(f.runner.load(f.id), "REQUEST_UNOBSERVABLE");
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.runner.result(f.id).callback_kind, "supervision_failure");
+    assert.equal(dispatches, 1);
+    assert.equal(cancelled, 0);
+  });
+
+for (const progress of ["active", "tool_running"]) {
+  test(`recovery retains the persisted quiet interval for ${progress}`,
+    { timeout: 2500 }, async (t) => {
+      const f = fixture(t, { policy: { ...shortPolicy, progressMs: 500, toolMs: 1200 } });
+      const record = f.runner.load(f.id);
+      record.state = "running";
+      record.originalObserved = true;
+      record.cursor = "saved-cursor";
+      record.health = { lastEventAt: 1000, progress };
+      record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+      f.runner.write(record);
+      f.advance(2000);
+      f.runtime.observeOwner = connected;
+      f.runtime.watchSession = async function* ({ cursor }) {
+        assert.equal(cursor, "saved-cursor");
+        yield { requestId: "another-request", type: "turn_started", cursor: "other" };
+        await never();
+      };
+      const began = performance.now();
+      await f.runner.execute(f.id);
+      assert.ok(performance.now() - began < 350);
+      assert.equal(f.runner.load(f.id).executionError, "PROGRESS_UNCONFIRMED");
+      assert.equal(f.runner.load(f.id).health.lastEventAt, 1000);
+      assert.equal(f.runner.result(f.id).result_status, null);
+      assert.equal(f.executions(), 0);
+    });
+}
+
+test("monitor seals a worker spawn error and delivers without needing a working driver", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+  let launches = 0;
+  await supervise(f.runner, f.id, () => {
+    launches++;
+    const child = new EventEmitter();
+    setImmediate(() => child.emit("error", new Error("synthetic ENOENT")));
+    return child;
+  });
+  assert.equal(launches, 1);
+  assert.equal(f.runner.load(f.id).state, "delivered");
+  assert.equal(f.runner.load(f.id).executionError, "WORKER_START_FAILED");
+  assert.equal(f.executions(), 0);
+});
+
+for (const restarted of [false, true]) {
+  test(`monitor ${restarted ? "restart" : "worker exit"} observes only the original request`, { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+    const record = f.runner.load(f.id);
+    record.state = restarted ? "dispatching" : "queued";
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    if (restarted) record.workerAttemptedAt = 1;
+    f.runner.write(record);
+    f.runtime.watchSession = async function* () {
+      yield { requestId: record.requestId, type: "turn_result", cursor: "terminal", result: { status: "completed" } };
+    };
+    const launches = [];
+    await supervise(f.runner, f.id, (action) => {
+      launches.push(action);
+      const child = new EventEmitter();
+      setImmediate(async () => {
+        if (!restarted && launches.length === 1) {
+          record.state = "dispatching"; f.runner.write(record); child.emit("exit", 9); return;
+        }
+        await f.runner.execute(f.id, { observeOnly: true });
+        child.emit("exit", 0);
+      });
+      return child;
+    });
+    assert.deepEqual(launches, restarted ? ["_observe"] : ["_worker", "_observe"]);
+    assert.equal(launches.length, restarted ? 1 : 2);
+    assert.equal(f.executions(), 0);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+  });
+}
+
+test("health configuration rejects invalid bounds and legacy health stays unknown", (t) => {
+  assert.deepEqual(healthPolicy(), HEALTH_DEFAULTS);
+  assert.throws(() => healthPolicy({ OPENCODE_TASK_WORKER_MS: "100" }), /INVALID_TASK_HEALTH_POLICY/);
+  assert.throws(() => healthPolicy({ OPENCODE_TASK_POLL_MS: "NaN" }), /INVALID_TASK_HEALTH_POLICY/);
+  const f = fixture(t);
+  assert.equal(f.runner.result(f.id).health, null);
+  assert.equal(deliveryState(f.runner.load(f.id)), "queued");
+});
+
+for (const detailCode of ['QUEUE_DISCONNECTED_BEFORE_COMPLETION', 'WATCH_OUTCOME_UNKNOWN']) {
+  test(`failed/${detailCode} is evidence of unknown outcome, never a business failure`, async (t) => {
+    const f = fixture(t, { policy: shortPolicy });
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(),
+      events: (async function* () {})(), result: Promise.resolve({ status: 'failed', error: { code: 'RUNTIME', detailCode } }) });
+    f.runtime.watchSession = async function* () {
+      if (detailCode === 'WATCH_OUTCOME_UNKNOWN') yield { type: 'turn_result', requestId: f.accepted.request_id,
+        cursor: 'unknown', result: { status: 'failed', error: { detailCode } } };
+    };
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.load(f.id).state, 'ambiguous');
+    assert.equal(f.runner.load(f.id).body, undefined);
+    f.runner.fail(f.runner.load(f.id), 'REQUEST_OUTCOME_UNKNOWN');
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.runner.result(f.id).callback_kind, 'supervision_failure');
+  });
+}
+
+test("supervision notification retries original bytes after restart and never becomes a business result", async (t) => {
+  const bodies = [];
+  const f = fixture(t, { fetcher: async (_url, init) => {
+    bodies.push(init.body);
+    if (bodies.length === 1) throw new Error("lost receipt");
+    return ok();
+  } });
+  const record = f.runner.load(f.id);
+  record.state = "dispatching";
+  f.runner.fail(record, "WORKER_EXITED");
+  await f.runner.deliver(f.runner.load(f.id));
+  f.advance(10000);
+  const resumed = new TaskRunner({ root: f.root, now: () => 11000, fetcher: f.runner.fetcher });
+  await resumed.execute(f.id);
+  await resumed.deliver(resumed.load(f.id));
+  assert.deepEqual(bodies, [record.body, record.body]);
+  assert.equal(resumed.result(f.id).state, "ambiguous");
+  assert.equal(resumed.result(f.id).result_status, null);
+  assert.equal(resumed.result(f.id).callback_state, "delivered");
+  assert.equal(f.executions(), 0);
+});
+
+test("monitor stops only its own unresponsive driver, waits for exit, then watches the original request",
+  { timeout: 3000 }, async (t) => {
+    const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+    const record = f.runner.load(f.id);
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    const actions = [];
+    let stopped = false;
+    f.runtime.watchSession = async function* () {
+      assert.equal(stopped, true);
+      yield { requestId: record.requestId, type: "turn_result", result: { status: "completed" }, cursor: "1" };
+    };
+    await supervise(f.runner, f.id, (action) => {
+      actions.push(action);
+      const child = new EventEmitter();
+      child.exitCode = null; child.signalCode = null;
+      if (actions.length === 1) {
+        record.state = "dispatching"; f.runner.write(record);
+        child.kill = (signal) => {
+          assert.equal(signal, "SIGKILL"); stopped = true;
+          setImmediate(() => child.emit("exit", null));
+        };
+      } else setImmediate(async () => {
+        assert.equal(action, "_observe");
+        await f.runner.execute(f.id, { observeOnly: true });
+        child.emit("exit", 0);
+      });
+      return child;
+    });
+    assert.deepEqual(actions, ["_worker", "_observe"]);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+    assert.equal(f.executions(), 0);
+  });
+
+test("progress arriving during an owner probe resets quiet time before evaluation", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: { ...shortPolicy, probeMs: 200, discoveryMs: 500, progressMs: 40 } });
+  f.runner.now = Date.now;
+  f.runtime.observeOwner = async () => { await delay(90); return connected(); };
+  f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () {
+    await delay(70);
+    yield { type: 'text_delta', stream: 'output', text: 'Recent progress' };
+  })(), result: delay(110).then(() => ({ status: 'completed' })) });
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, 'success');
+  assert.equal(f.runner.result(f.id).output, 'Recent progress');
+});
+
+test("new original-request progress after an owner change restores observation", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: shortPolicy });
+  f.runner.now = Date.now;
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.ownerGeneration = 1;
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.write(record);
+  let generation = 1;
+  f.runtime.observeOwner = async () => ({ ...(await connected()), generation });
+  f.runtime.watchSession = async function* () {
+    yield { type: "turn_started", requestId: record.requestId, cursor: "start" };
+    for (let index = 0; index < 8; index++) {
+      await delay(30);
+      generation = 2;
+      yield { type: "message", requestId: record.requestId, cursor: `progress-${index}`,
+        message: { params: { update: { sessionUpdate: "agent_thought_chunk" } } } };
+    }
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+  assert.equal(f.runner.load(f.id).ownerGeneration, 2);
+  assert.equal(f.executions(), 0);
+});
+
+for (const fault of ["probe", "lease", "journal", "find"]) {
+  test(`transient ${fault} interruption reconnects to the original request without consuming its callback`,
+    { timeout: 2500 }, async (t) => {
+      const f = fixture(t, { policy: shortPolicy });
+      const record = f.runner.load(f.id);
+      record.state = "running";
+      record.originalObserved = true;
+      const handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+      if (fault !== "find") record.handle = handle;
+      f.runner.write(record);
+      let probes = 0;
+      f.runtime.observeOwner = async () => {
+        if (++probes <= 2 && fault === "probe") return never();
+        if (probes <= 3 && fault === "lease") return { owner: "unavailable", process: "alive" };
+        return connected();
+      };
+      let finds = 0;
+      f.runtime.findSession = async () => {
+        if (++finds === 1) return never();
+        return handle;
+      };
+      let watches = 0;
+      f.runtime.watchSession = async function* ({ cursor }) {
+        if (fault === "journal" && ++watches === 1) {
+          yield { requestId: record.requestId, type: "turn_started", cursor: "saved" };
+          throw new Error("synthetic temporary journal read failure");
+        }
+        if (fault === "journal") assert.equal(cursor, "saved");
+        await delay(160);
+        yield { requestId: record.requestId, type: "turn_result", cursor: "done", result: { status: "completed" } };
+      };
+      await f.runner.execute(f.id);
+      assert.equal(f.runner.result(f.id).result_status, "success");
+      assert.equal(f.runner.result(f.id).callback_kind, "request_result");
+      assert.equal(f.runner.load(f.id).notificationKind, undefined);
+      assert.equal(f.executions(), 0);
+    });
+}
+
+test("cold setup finishing in the confirmation grace uses the same pending setup", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: { ...shortPolicy, setupMs: 40, confirmMs: 150 } });
+  const ensure = f.runtime.ensureSession;
+  let setups = 0;
+  f.runtime.ensureSession = async (input) => {
+    setups++;
+    await delay(85);
+    assert.equal(f.runner.status(f.id).health.assessment, "suspected");
+    return ensure(input);
+  };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+  assert.equal(f.runner.result(f.id).health.suspected_since, null);
+  assert.equal(setups, 1);
+  assert.equal(f.executions(), 1);
+});
+
+test("unstarted queue wait with a healthy owner can outlast discovery, then start normally", { timeout: 2000 }, async (t) => {
+  const f = fixture(t);
+  f.runtime.observeOwner = connected;
+  f.runtime.startTurn = () => ({ promptStarted: delay(220), events: (async function* () { await never(); })(),
+    result: delay(270).then(() => ({ status: "completed" })) });
+  f.runtime.watchSession = async function* () { await never(); };
+  await f.runner.execute(f.id);
+  assert.equal(f.runner.result(f.id).result_status, "success");
+});
+
+test("new progress retracts suspicion even across a wall-clock jump; terminal beats the next confirmation",
+  { timeout: 2500 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, progressMs: 55, confirmMs: 100 } });
+    f.runtime.observeOwner = connected;
+    let assessed = false;
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () {
+      await delay(100);
+      assert.equal(f.runner.status(f.id).health.assessment, "suspected");
+      f.advance(86400000);
+      yield { type: "text_delta", stream: "thought", text: "Synthetic progress" };
+      await delay(20);
+      assert.equal(f.runner.status(f.id).health.assessment, "observing");
+      assert.equal(f.runner.status(f.id).health.suspected_since, null);
+      assessed = true;
+    })(), result: delay(230).then(() => ({ status: "completed" })) });
+    f.runtime.watchSession = async function* () { await never(); };
+    await f.runner.execute(f.id);
+    assert.equal(assessed, true);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+    assert.equal(f.runner.result(f.id).health.assessment, "settled");
+  });
+
+test("another request cannot confirm a replacement owner or hide a persistently missing original request",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { fetcher: async () => ok() });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.ownerGeneration = 1;
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    f.runtime.observeOwner = async () => ({ ...(await connected()), generation: 2 });
+    f.runtime.watchSession = async function* ({ signal }) {
+      for (let index = 0; !signal.aborted; index++) {
+        await delay(10);
+        yield { type: "turn_started", requestId: "other-request", cursor: `other-${index}` };
+      }
+    };
+    const began = performance.now();
+    await f.runner.execute(f.id);
+    const elapsed = performance.now() - began;
+    assert.ok(elapsed >= shortPolicy.discoveryMs + shortPolicy.confirmMs && elapsed < 1000);
+    assert.equal(f.runner.load(f.id).executionError, "OWNER_CHANGED");
+    assert.equal(f.runner.load(f.id).ownerGeneration, 1);
+    f.runner.fail(f.runner.load(f.id), "OWNER_CHANGED");
+    await f.runner.deliver(f.runner.load(f.id));
+    assert.equal(f.runner.result(f.id).callback_kind, "supervision_failure");
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.runner.result(f.id).health.assessment, "unavailable");
+    assert.equal(f.executions(), 0);
+  });
+
+test("recovery uses the same boot clock for silence despite wall-clock corrections", { timeout: 2000 }, async (t) => {
+  const f = fixture(t);
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.cursor = "saved";
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.progress(record, { type: "prompt_started" });
+  f.runner.write(record);
+  f.advance(86400000);
+  const resumed = new TaskRunner({ root: f.root, runtime: f.runtime, now: f.runner.now, policy: shortPolicy });
+  f.runtime.observeOwner = connected;
+  f.runtime.watchSession = async function* () {
+    await delay(150);
+    assert.equal(resumed.status(f.id).health.assessment, "observing");
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await resumed.execute(f.id);
+  assert.equal(resumed.result(f.id).result_status, "success");
+  assert.equal(f.executions(), 0);
+});
+
+test("confirmation requires fresh repeated observations after a monitor scheduling pause", () => {
+  let tick = 0;
+  const confirmation = new Confirmation(shortPolicy, () => tick);
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 15;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 500; // 超过连续观察允许的间隔，即使已过 confirm，也须重新确认。
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 520;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), false);
+  tick = 545;
+  assert.equal(confirmation.update("OWNER_UNAVAILABLE"), true);
+  assert.equal(confirmation.update(undefined), false);
+});
+
+test("original tool progress during a lease outage still confirms the owner when its lease recovers",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, discoveryMs: 60, toolMs: 700 } });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.ownerGeneration = 1;
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    let broken = false;
+    let generation = 1;
+    f.runtime.observeOwner = async () => broken ? { owner: "unavailable", process: "unknown" }
+      : { ...(await connected()), generation };
+    f.runtime.watchSession = async function* () {
+      yield { type: "turn_started", requestId: record.requestId, cursor: "start" };
+      await delay(30);
+      broken = true;
+      generation = 2;
+      yield { type: "message", requestId: record.requestId, cursor: "tool", message: { params: { update:
+        { sessionUpdate: "tool_call", status: "in_progress", toolCallId: "continuing-tool" } } } };
+      await delay(45);
+      broken = false;
+      await delay(190);
+      yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+    };
+    await f.runner.execute(f.id);
+    assert.equal(f.runner.result(f.id).result_status, "success");
+    assert.equal(f.runner.load(f.id).ownerGeneration, 2);
+    assert.equal(f.executions(), 0);
+  });
+
+for (const clock of ["legacy", "unidentified"]) {
+  test(`recovery does not renew an expired retry grace with ${clock} clock evidence`, { timeout: 2000 }, async (t) => {
+    const f = fixture(t);
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.originalObserved = true;
+    record.cursor = "saved";
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    record.health = { lastEventAt: 1000, retryUntil: -86400000, progress: "provider_retry",
+      ...(clock === "unidentified" ? { retryClock: null, retryTick: f.runner.tick() + 100000 } : {}) };
+    f.runner.write(record);
+    f.advance(2000);
+    if (clock === "unidentified") f.runner.clock = null;
+    f.runtime.observeOwner = connected;
+    f.runtime.watchSession = async function* () { await never(); };
+    const began = performance.now();
+    await f.runner.execute(f.id);
+    assert.ok(performance.now() - began < 350);
+    assert.equal(f.runner.load(f.id).executionError, "PROGRESS_UNCONFIRMED");
+    assert.equal(f.runner.result(f.id).result_status, null);
+    assert.equal(f.executions(), 0);
+  });
+}
+
+test("a future retry retains its monotonic deadline through recovery and wall-clock jumps", { timeout: 2000 }, async (t) => {
+  const policy = { ...shortPolicy, progressMs: 40 };
+  const f = fixture(t, { policy });
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.originalObserved = true;
+  record.cursor = "retry";
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.progress(record, { message: { params: { update: { sessionUpdate: "session_info_update",
+    _meta: { "opencode/retry": { nextRetryAt: new Date(1300).toISOString() } } } } } });
+  f.runner.write(record);
+  f.advance(86400000);
+  const resumed = new TaskRunner({ root: f.root, runtime: f.runtime, now: f.runner.now, policy });
+  f.runtime.observeOwner = connected;
+  f.runtime.watchSession = async function* () {
+    await delay(180);
+    assert.equal(resumed.status(f.id).health.assessment, "observing");
+    yield { type: "turn_result", requestId: record.requestId, cursor: "done", result: { status: "completed" } };
+  };
+  await resumed.execute(f.id);
+  assert.equal(resumed.result(f.id).result_status, "success");
+});
+
+test("a canonical terminal queued by the confirming probe wins over the supervision notification",
+  { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: { ...shortPolicy, pollMs: 20, progressMs: 50, confirmMs: 10 } });
+    let release;
+    const ready = new Promise((resolve) => { release = resolve; });
+    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () { await never(); })(), result: never() });
+    f.runtime.watchSession = async function* () {
+      yield { type: "turn_started", requestId: f.accepted.request_id, cursor: "start" };
+      await ready;
+      yield { type: "turn_result", requestId: f.accepted.request_id, cursor: "done", result: { status: "failed" } };
+    };
+    let queued = false;
+    f.runtime.observeOwner = async () => {
+      if (!queued && f.runner.load(f.id).health?.assessment === "suspected") {
+        queued = true;
+        setTimeout(release, 0); // 与确认同一轮已就绪，不能先封存监督通知。
+      }
+      return connected();
+    };
+    await f.runner.execute(f.id);
+    assert.equal(queued, true);
+    assert.equal(f.runner.result(f.id).result_status, "error");
+    assert.equal(f.runner.result(f.id).callback_kind, "request_result");
+    assert.equal(f.runner.result(f.id).evidence.terminal_source, "watchSession.turn_result");
+  });
