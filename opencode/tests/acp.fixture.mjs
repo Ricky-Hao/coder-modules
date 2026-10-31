@@ -31,7 +31,12 @@ const configOptions = () => [
 const pending = new Map();
 if (process.env.TASK_FIXTURE_PROCESS_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_PROCESS_LOG,
   JSON.stringify({ agent: process.pid, owner: process.ppid,
-    startTicks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\s+/)[19] }) + "\n");
+    startTicks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\s+/)[19],
+    ownerStartTicks: fs.readFileSync(`/proc/${process.ppid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19] }) + "\n");
+const fixtureEvent = (type, sessionId) => {
+  if (process.env.TASK_FIXTURE_EVENT_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_EVENT_LOG,
+    JSON.stringify({ type, sessionId, agent: process.pid, owner: process.ppid, at: Date.now() }) + "\n");
+};
 function call(method, params, receive) {
   const id = randomUUID();
   pending.set(id, receive);
@@ -105,6 +110,29 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       send({ id: request.id, error: { code: -32603, message: "synthetic provider.internal",
         data: { service: "session", errorName: "provider.internal" } } });
     } else if (text === "agent exit") process.exit(23);
+    else if (text === "silent forever") {
+      // 保持 ACP 连接/进程存活，已开始的请求不再发送事件，也永不完成。
+      fixtureEvent("silent_started", request.params.sessionId);
+      active = { request };
+    } else if (text === "recover thought progress") {
+      fixtureEvent("quiet_started", request.params.sessionId);
+      let resumed;
+      active = { request, timer: setInterval(() => {
+        // 测试观察到 suspected 后，仅解除合成 peer 的静默，不改任务状态。
+        if (!fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, request.params.sessionId))) return;
+        if (resumed === undefined) {
+          resumed = performance.now();
+          fixtureEvent("thought_resumed", request.params.sessionId);
+        }
+        if (performance.now() - resumed >= 1600) {
+          clearInterval(active.timer);
+          fixtureEvent("thought_completed", request.params.sessionId);
+          reply({ stopReason: "end_turn" }); // 全程没有 assistant 文字。
+          active = undefined;
+        } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+          update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic progress." } } } });
+      }, 100) };
+    }
     else if (text === "long tool") {
       send({ method: "session/update", params: { sessionId: request.params.sessionId,
         update: { sessionUpdate: "tool_call", toolCallId: "slow-tool", title: "Synthetic slow tool", status: "in_progress", kind: "other" } } });
@@ -163,6 +191,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       active = { request, timer: setTimeout(() => finish(), 30000) };
     else finish();
   } else if (request.method === "session/cancel") {
+    fixtureEvent("cancel", request.params.sessionId);
     if (active) {
       clearTimeout(active.timer);
       send({ id: active.request.id, result: { stopReason: "cancelled" } });
