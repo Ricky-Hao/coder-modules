@@ -130,6 +130,26 @@ class DoctorTests(unittest.TestCase):
         self.assertIsNone(value['runtime'])
         self.assertEqual(snapshot(self.root), before)
 
+    def test_launch_store_is_optional_private_and_preserved(self):
+        tasks = self.root / 'runtime/tasks'
+        if not tasks.exists():
+            tasks.mkdir(mode=0o700)
+            (tasks / 'owner.json').write_text(json.dumps({'schema': 1, 'uid': os.getuid(),
+                                                        'workspace_id': self.fixture.bundle['config']['workspace_id']}))
+            (tasks / 'owner.json').chmod(0o600)
+        store = tasks / '.launches'
+        store.mkdir(mode=0o700)
+        (store / 'private-intent').write_text('not inspected by doctor')
+        before = snapshot(self.root)
+        self.assertEqual(self.call(quick=True).returncode, 0)
+        self.assertEqual(snapshot(self.root), before)
+        store.chmod(0o755)
+        self.assertEqual(self.call(quick=True).returncode, 1)
+        store.chmod(0o700)
+        store.rename(tasks / '.saved-launches')
+        store.symlink_to(tasks / '.saved-launches', target_is_directory=True)
+        self.assertEqual(self.call(quick=True).returncode, 1)
+
     def test_env_profile_reports_names_without_keys_or_generated_configuration(self):
         self.fixture.bundle['config']['runtime_profile'] = 'env'
         self.fixture.install()

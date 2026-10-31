@@ -19,7 +19,7 @@ RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_S
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
             'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_MODULE_TASK_SELECTION',
             'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK',
-            'OPENCODE_MODULE_MONITOR_PID', 'OPENCODE_MODULE_TASK_LOCKS'}
+            'OPENCODE_MODULE_MONITOR_PID', 'OPENCODE_MODULE_TASK_LOCKS', 'OPENCODE_MODULE_LAUNCH_LOCK'}
 
 
 def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
@@ -104,6 +104,42 @@ def acpx_arguments(arguments):
     return [*defaults, *arguments]
 
 
+def launch_selection(settings):
+    """从 stdio 解析选择；复用 profile 校验与快照，不读取任务业务输入。"""
+    request = json.loads(sys.stdin.buffer.read(65537))
+    source = dict(os.environ)
+    saved = request.get('saved')
+    if saved:
+        regular(Path(saved['modelConfig']))
+        source['OPENCODE_MODULE_CONFIG'] = saved['modelConfig']
+    config_path = source.get('OPENCODE_MODULE_CONFIG')
+    if config_path:
+        config = json.loads(Path(config_path).read_text())
+    elif settings.get('runtime_profile') == 'env':
+        config = json.loads((VERSION / 'profile-env.json').read_text())
+    else:
+        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    default = saved['model'] if saved else profiles.selection(config.get('model'))
+    provider, model = default['id'].split('/', 1)
+    target = request.get('provider', provider) + '/' + request.get('model', model)
+    changed = target != default['id'] if saved else 'provider' in request or 'model' in request
+    arguments = ['submit']
+    if changed or saved:
+        arguments.extend(['--model', target])
+    variant = request.get('variant', default.get('variant') if saved and not changed else None)
+    if variant is not None:
+        arguments.extend(['--variant', variant])
+    child = environment(source, Path(settings['install_root']), settings.get('runtime_profile', 'none'),
+                        settings['workspace_id'], arguments, submit=True)
+    if 'OPENCODE_MODULE_TASK_SELECTION' not in child:
+        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    if saved and saved['modelProfile'] == 'env':
+        profiles.configuration(child, VERSION, json.loads(child['OPENCODE_MODULE_TASK_SELECTION'])['id'].split('/', 1)[0])
+    print(json.dumps({'model': json.loads(child['OPENCODE_MODULE_TASK_SELECTION']),
+                      'modelConfig': child['OPENCODE_MODULE_TASK_CONFIG'],
+                      'modelProfile': saved['modelProfile'] if saved else child['OPENCODE_MODULE_TASK_PROFILE']}))
+
+
 def follow_monitor():
     # Linux clears PDEATHSIG on fork: an acpx owner survives its replaceable driver.
     # Set it before any blocking lock/setup, and close the parent-exit race.
@@ -167,6 +203,13 @@ def main():
         print(json.dumps(profiles.information(profile, bool(os.environ.get('OPENCODE_MODULE_CONFIG')),
                                               os.environ, VERSION), sort_keys=True))
         return
+    if tool == 'opencode-task' and arguments == ['_selection']:
+        try:
+            launch_selection(settings)
+            return 0
+        except (OSError, ValueError, KeyError, TypeError):
+            print(json.dumps({'error': {'code': 'LAUNCH_SELECTION_INVALID'}}))
+            return 1
     task_arguments = arguments
     session_lock = None
     if tool == 'opencode-task':
@@ -220,13 +263,13 @@ def main():
                 raise SystemExit(1)
         elif arguments[:1] != ['submit']:
             task_arguments = ['--help']
-        if arguments[:1] in (['submit'], ['_worker'], ['_observe'], ['_supervise'], ['resolve'], ['_fail_launch']):
+        if arguments[:1] in (['submit'], ['launch'], ['_worker'], ['_observe'], ['_supervise'], ['resolve'], ['_fail_launch']):
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
             if os.fstat(task_lock).st_mode & 0o077:
                 raise ValueError('task lock must be private')
             try:
-                fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] == ['submit'] else fcntl.LOCK_NB))
+                fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] in (['submit'], ['launch']) else fcntl.LOCK_NB))
             except BlockingIOError:
                 if arguments[:1] == ['_supervise']:
                     if arguments[2:] == ['--ready']:
@@ -243,7 +286,15 @@ def main():
         regular(session_lock)
         fcntl.flock(selection_lock, fcntl.LOCK_EX)
         os.set_inheritable(selection_lock, True)
-    child = environment(os.environ, root, profile,
+    if tool == 'opencode-task' and arguments[:1] == ['launch']:
+        # Git 沿调用者的 HOME/SSH/PATH；选择和 worker 再走各自的模块环境。
+        caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
+        child = {k: v for k, v in os.environ.items() if k not in RESERVED - caller_paths
+                 and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
+                 and not re.search(r'tcb_[A-Za-z0-9_-]{43}', v)}
+        child['OPENCODE_MODULE_LAUNCH_LOCK'] = str(task_lock)
+    else:
+        child = environment(os.environ, root, profile,
                           settings['workspace_id'], task_arguments, task,
                           submit=tool == 'opencode-task' and arguments[:1] == ['submit'])
     if selection_lock is not None:

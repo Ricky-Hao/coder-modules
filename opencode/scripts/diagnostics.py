@@ -195,6 +195,10 @@ def doctor(root, launched_version=None, quick=False):
             'schema': 1, 'uid': os.getuid(), 'workspace_id': settings['workspace_id']})
         for name in ('bin', 'runtime', *('runtime/' + n for n in ('home', 'config', 'data', 'cache', 'state', 'tmp'))):
             directory(root / name)
+        launches = root / 'runtime/tasks/.launches'
+        if os.path.lexists(launches):
+            task_root(root, settings)
+            directory(launches)  # 只核私有容器，不递归遍历历史。
         for name, maximum in files.items():
             step(name + ':metadata' if name in binaries else name)
             verify(name, maximum)
