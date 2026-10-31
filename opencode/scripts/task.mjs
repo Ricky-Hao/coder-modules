@@ -4,6 +4,43 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 export const OUTPUT_BYTES = 32768;
+export const HEALTH_DEFAULTS = Object.freeze({
+  pollMs: 5000,
+  probeMs: 3000,
+  discoveryMs: 30000,
+  setupMs: 30000,
+  workerMs: 30000,
+  progressMs: 900000,
+  toolMs: 21600000,
+  drainMs: 250,
+});
+export function healthPolicy(env = {}) {
+  const selected = {};
+  for (const [key, fallback] of Object.entries(HEALTH_DEFAULTS)) {
+    const value = env[`OPENCODE_TASK_${key.replace(/Ms$/, "_MS").toUpperCase()}`];
+    const number = value === undefined ? fallback : Number(value);
+    if (!Number.isSafeInteger(number) || number < 10 || number > 86400000)
+      throw new Error("INVALID_TASK_HEALTH_POLICY");
+    selected[key] = number;
+  }
+  if (selected.workerMs < selected.pollMs * 3 || selected.discoveryMs < selected.probeMs)
+    throw new Error("INVALID_TASK_HEALTH_POLICY");
+  return selected;
+}
+export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export async function within(promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("OBSERVATION_TIMEOUT")), ms);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+export function deliveryState(record) {
+  return record.notificationState ?? record.state;
+}
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const taskPattern = /^task_[a-f0-9]{64}$/;
 const callbackPattern = /^tcb_[A-Za-z0-9_-]{43}$/;
@@ -221,6 +258,7 @@ function timing(record) {
     terminal_at: time(record.terminalAt),
     callback_attempted_at: time(record.callbackAttemptedAt),
     callback_delivered_at: time(record.callbackDeliveredAt),
+    supervision_failed_at: time(record.supervisionFailedAt),
   };
 }
 
@@ -228,7 +266,7 @@ function sealedResult(record, callback) {
   if (record.body === undefined) return null;
   if (
     typeof record.body !== "string" ||
-    !["outbox", "delivered", "rejected"].includes(record.state)
+    !["outbox", "delivered", "rejected"].includes(deliveryState(record))
   )
     throw new Error("INVALID_TASK_RESULT");
   let value;
@@ -298,6 +336,7 @@ function evidence(record, payload, callback) {
     lifecycle: "program_observed",
     terminal_source: payload ? resultChoice(record.terminalSource, [
       "turn.result", "watchSession.turn_result", "queued_cancellation", "operator_resolution",
+      "execution_setup_failure", "supervision_failure",
     ]) : null,
     output_source: payload ? resultChoice(record.outputSource, [
       "assistant_output", "program_generated", "operator_verified",
@@ -375,11 +414,13 @@ async function receipt(response) {
 }
 
 export class TaskRunner {
-  constructor({ root, runtime, fetcher = fetch, now = Date.now }) {
+  constructor({ root, runtime, fetcher = fetch, now = Date.now, policy = HEALTH_DEFAULTS, heartbeat = () => {} }) {
     this.root = directory(root);
     this.runtime = runtime;
     this.fetcher = fetcher;
     this.now = now;
+    this.policy = policy;
+    this.heartbeat = heartbeat;
   }
   filename(id, name = "task.json") {
     if (!taskPattern.test(id)) throw new Error("INVALID_TASK_ID");
@@ -532,14 +573,21 @@ export class TaskRunner {
       ...(record.model ? { model: record.model.id, variant: record.model.variant ?? null } : {}),
       ...(record.sessionName ? { session: record.sessionName } : {}),
       cancel_requested: fs.existsSync(this.filename(id, "cancel.json")),
-      ...(record.resultStatus ? { result_status: record.resultStatus } : {}),
+      ...(record.notificationKind === "supervision_failure" ? { result_status: null }
+        : record.resultStatus ? { result_status: record.resultStatus } : {}),
       ...(record.deliveryError ? { delivery_error: record.deliveryError } : {}),
       ...(record.executionError ? { execution_error: record.executionError } : {}),
       timing: timing(record),
+      health: this.health(record),
+      callback_state: record.body ? deliveryState(record) : null,
+      callback_kind: record.body ? resultChoice(record.notificationKind, ["supervision_failure"]) ?? "request_result" : null,
+      callback_status: record.body ? record.notificationKind === "supervision_failure" ? "error" : record.resultStatus ?? null : null,
       ...(record.state === "ambiguous"
         ? {
             guidance:
-              "Original request outcome is unknown. Recover watches that request; resolve only with independently verified output. Never automatically resubmit the prompt.",
+              record.body
+                ? "Original outcome and side effects are unknown. The supervision notification is sealed; independently verify the original request. Never automatically resubmit the prompt."
+                : "Original request outcome is unknown. Recover watches that request; resolve only with independently verified output. Never automatically resubmit the prompt.",
           }
         : {}),
     };
@@ -568,7 +616,11 @@ export class TaskRunner {
       state: resultChoice(record.state, [
         "queued", "dispatching", "running", "ambiguous", "outbox", "delivered", "rejected",
       ]),
-      result_status: payload?.status ?? null,
+      result_status: record.notificationKind === "supervision_failure" ? null : payload?.status ?? null,
+      callback_status: payload?.status ?? null,
+      callback_state: payload ? deliveryState(record) : null,
+      callback_kind: payload ? resultChoice(record.notificationKind, ["supervision_failure"]) ?? "request_result" : null,
+      health: this.health(record),
       timing: timing(record),
       ...resultOutput(record, payload, callback),
       evidence: evidence(record, payload, callback),
@@ -581,7 +633,7 @@ export class TaskRunner {
       .filter(
         (id) =>
           fs.existsSync(this.filename(id)) &&
-          !["delivered", "rejected"].includes(this.load(id).state),
+           !["delivered", "rejected"].includes(deliveryState(this.load(id))),
       );
   }
   seal(
@@ -606,10 +658,94 @@ export class TaskRunner {
     record.nextAttemptAt = this.now();
     delete record.output;
     // The exact result/body is fsync'd before even the first HTTP attempt.
+    this.observe(record, "terminal");
+  }
+  health(record) {
+    const value = record.health;
+    if (!value) return null;
+    const observed = (name) => {
+      const filename = this.filename(record.id, name);
+      return fs.existsSync(filename) ? time(read(filename).at) : null;
+    };
+    return {
+      phase: identifier(value.phase),
+      observed_at: time(value.observedAt),
+      last_event_at: time(value.lastEventAt),
+      last_probe_at: time(value.lastProbeAt),
+      worker_heartbeat_at: observed("worker.json"),
+      monitor_heartbeat_at: observed("monitor.json"),
+      worker_exit_at: time(record.workerExit?.observedAt),
+      worker_exit_code: time(record.workerExit?.code),
+      retry_not_before: time(value.retryUntil),
+      owner: resultChoice(value.owner, ["lease_current", "unavailable", "unknown"]),
+      owner_process: resultChoice(value.ownerProcess, ["alive", "gone", "unknown"]),
+      owner_heartbeat_at: time(value.ownerHeartbeatAt),
+      agent: "unknown", // Shared acpx exposes no agent process exit/heartbeat witness.
+      progress: resultChoice(value.progress, ["active", "quiet", "tool_running", "provider_retry", "unknown"]),
+      reason: identifier(record.executionError),
+      outcome: record.notificationKind === "supervision_failure" ? "unknown"
+        : resultChoice(record.resultStatus, ["success", "error", "cancelled"]),
+      automatic_retry: false,
+      policy_ms: value.policy ? Object.fromEntries(Object.keys(HEALTH_DEFAULTS).map((key) => {
+        if (!Number.isSafeInteger(value.policy[key]) || value.policy[key] < 10 || value.policy[key] > 86400000)
+          throw new Error("INVALID_TASK_RESULT");
+        return [key, value.policy[key]];
+      })) : null,
+    };
+  }
+  observe(record, phase, changes = {}) {
+    record.health = { ...record.health, phase, observedAt: this.now(), policy: this.policy, ...changes };
+    this.heartbeat(phase);
     this.write(record);
   }
+  fail(record, reason) {
+    if (record.body) return;
+    record.executionError = reason;
+    if (record.state === "queued") {
+      this.observe(record, "setup_failed");
+      this.seal(record, "error", `Task did not dispatch a prompt: ${reason}.`,
+        "execution_setup_failure", "program_generated");
+      return;
+    }
+    record.state = "ambiguous";
+    record.supervisionFailedAt = this.now();
+    record.notificationKind = "supervision_failure";
+    record.notificationState = "outbox";
+    record.outputSource = "program_generated";
+    record.terminalSource = "supervision_failure";
+    const output = `Original request outcome and side effects are unknown; do not automatically retry. Execution supervision failed: ${reason}. It may still be running. Inspect the original request and verify its result before further action.`;
+    const body = callbackBody(record.callback, "error", output);
+    record.body = JSON.stringify(body);
+    record.outputTruncated = body.output !== output;
+    record.attempts = 0;
+    record.nextAttemptAt = this.now();
+    delete record.output;
+    this.observe(record, "supervision_failed");
+  }
+  finish(record, result, source = "turn.result") {
+    const status = terminalStatus(result);
+    // Shared result.failed also represents lost ACK/completion replies. A matching
+    // journal terminal confirms failure; WATCH_OUTCOME_UNKNOWN confirms only loss.
+    if (status === "error" && (source === "turn.result" || result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN")) {
+      record.executionError = result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN"
+        ? "REQUEST_OUTCOME_UNKNOWN" : "TURN_FAILED_UNCONFIRMED";
+      return false;
+    }
+    if (status === "error") {
+      record.executionError = "REQUEST_FAILED";
+      this.seal(record, status, "Original request failed (REQUEST_FAILED). Side effects may have occurred; verify before retrying.", source, "program_generated");
+    } else {
+      delete record.executionError;
+      this.seal(record, status, record.output ?? "", source);
+    }
+    return true;
+  }
   async deliver(record) {
-    if (record.state !== "outbox" || record.nextAttemptAt > this.now()) return;
+    if (deliveryState(record) !== "outbox" || record.nextAttemptAt > this.now()) return;
+    const state = (value) => {
+      if (record.notificationKind === "supervision_failure") record.notificationState = value;
+      else record.state = value;
+    };
     let retryAfter;
     record.callbackAttemptedAt = this.now();
     this.write(record);
@@ -624,7 +760,7 @@ export class TaskRunner {
       if (response.status === 202) {
         record.receipt = await receipt(response);
         record.callbackDeliveredAt = this.now();
-        record.state = "delivered";
+        state("delivered");
         delete record.deliveryError;
       } else {
         retryAfter = response.headers.get("retry-after");
@@ -635,7 +771,7 @@ export class TaskRunner {
           response.status === 429 ||
           response.status >= 500
         )) {
-          record.state = "rejected";
+          state("rejected");
           record.deliveryError =
             response.status >= 300 && response.status < 400
               ? "REDIRECT_REFUSED"
@@ -645,16 +781,96 @@ export class TaskRunner {
     } catch {
       record.deliveryError = "DELIVERY_UNCONFIRMED";
     }
-    if (record.state === "outbox") {
+    if (deliveryState(record) === "outbox") {
       record.nextAttemptAt =
         this.now() + retryDelay(record.attempts++, retryAfter, this.now());
     }
     this.write(record);
   }
-  async watch(record, timeoutMs = 30000) {
+  progress(record, event) {
+    const update = event.message?.params?.update ?? (event.type === "tool_call"
+      ? { ...event, sessionUpdate: event.tag ?? "tool_call" } : undefined);
+    const tools = new Set(record.activeTools ?? []);
+    if (["tool_call", "tool_call_update"].includes(update?.sessionUpdate)) {
+      if (["pending", "in_progress"].includes(update.status)) tools.add(update.toolCallId);
+      if (["completed", "failed"].includes(update.status)) tools.delete(update.toolCallId);
+      record.activeTools = [...tools];
+    }
+    let progress = tools.size ? "tool_running" : "active";
+    const retry = update?._meta?.["opencode/retry"];
+    let retryUntil = record.health?.retryUntil;
+    if (retry === null) retryUntil = undefined;
+    if (retry && Number.isFinite(Date.parse(retry.nextRetryAt))) {
+      retryUntil = Date.parse(retry.nextRetryAt);
+      progress = "provider_retry";
+    }
+    record.health = { ...record.health, lastEventAt: this.now(), progress, retryUntil };
+  }
+  async journal(record, signal, { collect = true, checkpoint = true } = {}) {
+    for await (const event of this.runtime.watchSession({ handle: record.handle, cursor: record.cursor, signal })) {
+      if (signal.aborted || record.body) return;
+      if (event.requestId === record.requestId) {
+        record.originalObserved = true;
+        this.progress(record, event);
+        const update = event.message?.params?.update;
+        if (collect && update?.sessionUpdate === "agent_message_chunk" && update.content?.type === "text")
+          appendOutput(record, update.content.text, update.messageId);
+        if (event.type === "turn_result") return event.result;
+      }
+      if (checkpoint) {
+        record.cursor = event.cursor;
+        this.write(record);
+      }
+    }
+  }
+  async followHealth(record, signal, { maxMs = Infinity } = {}) {
+    const began = performance.now();
+    let missingSince = began;
+    let previousEvent = record.health?.lastEventAt;
+    // Carry the persisted quiet interval across restarts, then use a monotonic clock.
+    let lastProgress = began - (Number.isSafeInteger(previousEvent)
+      ? Math.max(0, this.now() - previousEvent) : 0);
+    let reason = "REQUEST_UNOBSERVABLE";
+    while (!signal.aborted) {
+      if (this.runtime.observeOwner) {
+        let proof;
+        try {
+          proof = await within(this.runtime.observeOwner({ handle: record.handle }), this.policy.probeMs);
+        } catch { /* A failed probe is availability evidence, never a business result. */ }
+        if (signal.aborted) return;
+        // Progress may arrive while the asynchronous process probe is pending.
+        if (record.health?.lastEventAt !== previousEvent) {
+          previousEvent = record.health?.lastEventAt;
+          lastProgress = performance.now();
+        }
+        const generationChanged = record.ownerGeneration && proof?.generation && record.ownerGeneration !== proof.generation;
+        if (!record.ownerGeneration && proof?.generation) record.ownerGeneration = proof.generation;
+        const available = proof?.owner === "lease_current" && !generationChanged && record.originalObserved;
+        if (available) missingSince = performance.now();
+        reason = generationChanged ? "OWNER_CHANGED" : proof?.owner !== "lease_current" ? "OWNER_UNAVAILABLE" : "REQUEST_UNOBSERVABLE";
+        let progress = record.health?.progress ?? "unknown";
+        const retryWaiting = record.health?.retryUntil > this.now() - this.policy.progressMs;
+        const quietLimit = progress === "tool_running" ? this.policy.toolMs : this.policy.progressMs;
+        const quiet = record.originalObserved && performance.now() - lastProgress >= quietLimit && !retryWaiting;
+        if (quiet) progress = "quiet";
+        this.observe(record, record.health?.phase ?? "watching", {
+          lastProbeAt: this.now(), owner: proof?.owner ?? "unavailable",
+          ownerProcess: proof?.process ?? "unknown", ownerHeartbeatAt: proof?.heartbeatAt, progress,
+        });
+        if (quiet) return "PROGRESS_UNCONFIRMED";
+      }
+      if (performance.now() - began >= maxMs) return reason;
+      if (performance.now() - missingSince >= this.policy.discoveryMs) return reason;
+      await new Promise((resolve) => {
+        const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+        const timer = setTimeout(done, this.policy.pollMs);
+        signal.addEventListener("abort", done, { once: true });
+        if (signal.aborted) done();
+      });
+    }
+  }
+  async watch(record, maxMs = Infinity) {
     const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), timeoutMs);
-    deadline.unref();
     const monitor = this.monitorCancellation(record, () =>
       this.runtime.cancelRequest?.({
         handle: record.handle,
@@ -666,59 +882,43 @@ export class TaskRunner {
       record.outputTruncated = false;
       delete record.outputMessageId;
     }
+    this.observe(record, "watching");
     try {
-      for await (const event of this.runtime.watchSession({
-        handle: record.handle,
-        cursor: record.cursor,
-        signal: controller.signal,
-      })) {
-        // A persistent owner may have other requests. Their results never settle this task.
-        if (event.requestId === record.requestId) {
-          // Once this original request is observed, follow its journal for as
-          // long as it runs. Owner uncertainty, not elapsed runtime, ends recovery.
-          clearTimeout(deadline);
-          if (event.type === "message") {
-            const update = event.message?.params?.update;
-            if (
-              update?.sessionUpdate === "agent_message_chunk" &&
-              update.content?.type === "text"
-            )
-              appendOutput(record, update.content.text, update.messageId);
-          }
-          if (event.type === "turn_result") {
-            this.seal(
-              record,
-              terminalStatus(event.result),
-              record.output ?? "",
-              "watchSession.turn_result",
-            );
-            return;
-          }
-        }
-        record.cursor = event.cursor;
-        this.write(record);
-      }
+      const outcome = await Promise.race([
+        this.journal(record, controller.signal).then((result) => ({ result })),
+        this.followHealth(record, controller.signal, { maxMs }).then((reason) => ({ reason })),
+      ]);
+      if (outcome.result) this.finish(record, outcome.result, "watchSession.turn_result");
+      else if (outcome.reason) record.executionError = outcome.reason;
     } catch {
+      record.executionError = "JOURNAL_UNAVAILABLE";
       /* Journal/owner uncertainty never authorizes prompt replay. */
     } finally {
-      clearTimeout(deadline);
+      controller.abort();
       clearInterval(monitor);
     }
-    record.state = "ambiguous";
-    this.write(record);
+    if (!record.body) {
+      record.state = "ambiguous";
+      record.executionError ??= "REQUEST_UNOBSERVABLE";
+      this.observe(record, "unknown");
+    }
   }
   monitorCancellation(record, cancel) {
+    let pending = false;
     const monitor = setInterval(() => {
-      if (fs.existsSync(this.filename(record.id, "cancel.json")))
+      if (!pending && fs.existsSync(this.filename(record.id, "cancel.json"))) {
+        pending = true;
         Promise.resolve()
           .then(cancel)
-          .catch(() => {});
+          .catch(() => {}).finally(() => { pending = false; });
+      }
     }, 200);
     monitor.unref();
     return monitor;
   }
-  async execute(id) {
+  async execute(id, { observeOnly = false } = {}) {
     const record = this.load(id);
+    if (record.body) return;
     if (record.state === "queued") {
       if (fs.existsSync(this.filename(id, "cancel.json"))) {
         this.seal(
@@ -730,28 +930,35 @@ export class TaskRunner {
         );
         return;
       }
-      // ensureSession does not dispatch the prompt. A queued crash is safe to resume.
+      if (observeOnly) {
+        this.fail(record, "WORKER_LOST_BEFORE_DISPATCH");
+        return;
+      }
+      // Persist the attempt while holding worker.lock, before setup or dispatch.
+      record.workerAttemptedAt ??= this.now();
+      this.observe(record, "setup");
       try {
         record.handle = validateHandle(
           record,
-          await this.runtime.ensureSession({
+          await within(this.runtime.ensureSession({
             sessionKey: record.sessionKey,
             agent: "opencode",
             mode: "persistent",
             cwd: record.cwd,
             ...(record.model ? { model: record.model } : {}),
-          }),
+          }), this.policy.setupMs),
         );
         delete record.executionError;
-      } catch (error) {
-        record.executionError = "MODEL_OR_SESSION_SETUP_FAILED";
-        this.write(record);
-        throw error; // No dispatch has been attempted; retain queued for explicit recovery.
+      } catch {
+        this.fail(record, "MODEL_OR_SESSION_SETUP_FAILED");
+        return;
       }
       record.state = "dispatching";
       record.outputTruncated = false;
-      this.write(record);
+      this.observe(record, "dispatching");
       let monitor;
+      let active = true;
+      const controller = new AbortController();
       try {
         const turn = this.runtime.startTurn({
           handle: record.handle,
@@ -759,57 +966,90 @@ export class TaskRunner {
           mode: "prompt",
           requestId: record.requestId,
         });
-        const resultPromise = turn.result;
-        const started = turn.promptStarted
+        const resultPromise = Promise.resolve(turn.result);
+        const streamOutput = {};
+        Promise.resolve(turn.promptStarted)
           .then(() => {
+            if (!active || record.body) return;
             record.state = "running";
+            record.originalObserved = true;
+            this.progress(record, { type: "prompt_started" });
             if (record.startedAt === undefined) record.startedAt = this.now();
-            this.write(record);
+            this.observe(record, "running");
           })
           .catch(() => {});
-        monitor = this.monitorCancellation(record, () => turn.cancel());
+        const cancel = () => this.runtime.cancelRequest
+          ? this.runtime.cancelRequest({ handle: record.handle, requestId: record.requestId }) : turn.cancel();
+        monitor = this.monitorCancellation(record, cancel);
         if (fs.existsSync(this.filename(id, "cancel.json")))
-          await turn.cancel();
+          Promise.resolve(cancel()).catch(() => {});
         const consume = (async () => {
           for await (const event of turn.events) {
+            if (!active || record.body) break;
+            // Live tool updates precede the journal's checkpoint. Keep their
+            // liveness evidence even when raw journal metadata supplies retries.
+            this.progress(record, event);
             if (event.type === "text_delta" && event.stream !== "thought")
-              appendOutput(record, event.text, event.messageId);
+              appendOutput(this.runtime.journalAuthoritative ? streamOutput : record, event.text, event.messageId);
           }
-        })();
-        const [result] = await Promise.all([resultPromise, consume, started]);
-        this.seal(record, terminalStatus(result), record.output ?? "");
-      } catch {
+        })().catch(() => {});
+        const journal = this.journal(record, controller.signal, {
+          collect: Boolean(this.runtime.journalAuthoritative),
+          checkpoint: Boolean(this.runtime.journalAuthoritative),
+        }).then((result) => result ? { result, source: "watchSession.turn_result" } : new Promise(() => {}))
+          .catch(() => new Promise(() => {}));
+        const { result, source } = await Promise.race([
+          resultPromise.then((result) => ({ result, source: "turn.result" })),
+          journal,
+          this.followHealth(record, controller.signal).then((reason) => { throw new Error(reason); }),
+        ]);
+        // Result is authoritative. Give already-buffered output a bounded drain;
+        // neither a stuck events iterator nor promptStarted can veto completion.
+        await within(consume, this.policy.drainMs).catch(() => {});
+        if (this.runtime.journalAuthoritative && source === "turn.result") {
+          await within(journal, this.policy.drainMs).catch(() => {});
+          if (streamOutput.output !== undefined) {
+            record.output = streamOutput.output;
+            record.outputTruncated = streamOutput.outputTruncated ?? false;
+          }
+        }
+        this.finish(record, result, source);
+      } catch (error) {
         record.state = "ambiguous";
-        this.write(record);
+        record.executionError = ["REQUEST_UNOBSERVABLE", "OWNER_UNAVAILABLE", "AGENT_DISCONNECTED", "PROGRESS_UNCONFIRMED"].includes(error.message)
+          ? error.message : "TURN_TRANSPORT_INTERRUPTED";
+        this.observe(record, "recovering");
       } finally {
+        active = false;
+        controller.abort();
         clearInterval(monitor);
       }
+      if (!record.body) await this.watch(record, this.policy.discoveryMs);
     } else if (["dispatching", "running", "ambiguous"].includes(record.state)) {
       if (!record.handle)
-        record.handle = await this.runtime.findSession({
+        record.handle = await within(this.runtime.findSession({
           sessionKey: record.sessionKey,
           agent: "opencode",
           cwd: record.cwd,
-        });
+        }), this.policy.probeMs).catch(() => null);
       if (record.handle) {
         validateHandle(record, record.handle);
         await this.watch(record);
       } else {
-        record.state = "ambiguous";
-        this.write(record);
+        this.fail(record, "ORIGINAL_SESSION_UNAVAILABLE");
       }
     }
   }
   async cancel(id) {
     const record = this.load(id);
-    if (record.body) throw new Error("TASK_TERMINAL");
+    if (record.body && record.notificationKind !== "supervision_failure") throw new Error("TASK_TERMINAL");
     save(this.filename(id, "cancel.json"), { requested: true });
     if (record.handle) {
       validateHandle(record, record.handle);
-      await this.runtime.cancelRequest?.({
+      await within(Promise.resolve(this.runtime.cancelRequest?.({
         handle: record.handle,
         requestId: record.requestId,
-      });
+      })), this.policy.probeMs);
     }
   }
   resolve(id, status, output) {

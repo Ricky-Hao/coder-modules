@@ -29,6 +29,9 @@ const configOptions = () => [
     options: ['low', 'medium', 'high', 'xhigh', 'max', 'default'].map((value) => ({ value, name: value })) },
 ];
 const pending = new Map();
+if (process.env.TASK_FIXTURE_PROCESS_LOG) fs.appendFileSync(process.env.TASK_FIXTURE_PROCESS_LOG,
+  JSON.stringify({ agent: process.pid, owner: process.ppid,
+    startTicks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\s+/)[19] }) + "\n");
 function call(method, params, receive) {
   const id = randomUUID();
   pending.set(id, receive);
@@ -98,7 +101,19 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       reply({ stopReason: "end_turn" });
       active = undefined;
     };
-    if (text.startsWith("write fixture")) {
+    if (text === "provider failed") {
+      send({ id: request.id, error: { code: -32603, message: "synthetic provider.internal",
+        data: { service: "session", errorName: "provider.internal" } } });
+    } else if (text === "agent exit") process.exit(23);
+    else if (text === "long tool") {
+      send({ method: "session/update", params: { sessionId: request.params.sessionId,
+        update: { sessionUpdate: "tool_call", toolCallId: "slow-tool", title: "Synthetic slow tool", status: "in_progress", kind: "other" } } });
+      active = { request, timer: setTimeout(() => {
+        send({ method: "session/update", params: { sessionId: request.params.sessionId,
+          update: { sessionUpdate: "tool_call_update", toolCallId: "slow-tool", status: "completed" } } });
+        finish("Slow tool completed");
+      }, 1600) };
+    } else if (text.startsWith("write fixture")) {
       call(
         "session/request_permission",
         {

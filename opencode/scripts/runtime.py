@@ -7,6 +7,7 @@ import re
 import sys
 import fcntl
 import hashlib
+import signal
 
 # The active symlink resolves once: a concurrent upgrade cannot mix version files.
 VERSION = Path(__file__).resolve().parent
@@ -17,7 +18,8 @@ import profiles
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
             'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_MODULE_TASK_SELECTION',
-            'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK'}
+            'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK',
+            'OPENCODE_MODULE_MONITOR_PID', 'OPENCODE_MODULE_TASK_LOCKS'}
 
 
 def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
@@ -102,6 +104,18 @@ def acpx_arguments(arguments):
     return [*defaults, *arguments]
 
 
+def follow_monitor():
+    # Linux clears PDEATHSIG on fork: an acpx owner survives its replaceable driver.
+    # Set it before any blocking lock/setup, and close the parent-exit race.
+    import ctypes
+    parent = os.getppid()
+    expected = int(os.environ.get('OPENCODE_MODULE_MONITOR_PID', parent))
+    if parent != expected or parent == 1 or ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise ValueError('task monitor unavailable')
+    if os.getppid() != parent:
+        raise SystemExit(1)
+
+
 def main():
     os.umask(0o077)
     settings = json.loads((VERSION / 'settings.json').read_text())
@@ -150,18 +164,27 @@ def main():
         finally:
             os.close(runtime_fd)
         lockpath = tasks / 'submit.lock'
-        if arguments[:1] == ['resolve']:
+        if arguments[:1] in (['resolve'], ['_fail_launch']):
             if len(arguments) < 2 or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
-                raise ValueError('invalid task resolution')
+                raise ValueError('invalid task finalization')
             lockpath = directory(tasks / arguments[1]) / 'worker.lock'
-        if arguments[:1] == ['_worker']:
-            if len(arguments) != 2 or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
+            monitor_path = tasks / arguments[1] / 'monitor.lock'
+            monitor_lock = os.open(monitor_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            regular(monitor_path)
+            if os.fstat(monitor_lock).st_mode & 0o077:
+                raise ValueError('task lock must be private')
+            fcntl.flock(monitor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.set_inheritable(monitor_lock, True)
+        if arguments[:1] in (['_worker'], ['_observe'], ['_supervise']):
+            if len(arguments) not in (2, 3) or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
                 raise ValueError('invalid task worker')
             task_dir = directory(tasks / arguments[1])
-            lockpath = task_dir / 'worker.lock'
+            lockpath = task_dir / ('monitor.lock' if arguments[0] == '_supervise' else 'worker.lock')
             regular(task_dir / 'task.json')
             task_state = json.loads((task_dir / 'task.json').read_text())
-            if task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
+            if arguments[0] != '_supervise':
+                follow_monitor()
+            if arguments[0] != '_worker' or task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
                 task_arguments = ['--help']  # Passive watch/outbox needs no provider credentials.
             elif task_state.get('model'):
                 task = task_state
@@ -172,14 +195,20 @@ def main():
                 raise SystemExit(1)
         elif arguments[:1] != ['submit']:
             task_arguments = ['--help']
-        if arguments[:1] in (['submit'], ['_worker'], ['resolve']):
+        if arguments[:1] in (['submit'], ['_worker'], ['_observe'], ['_supervise'], ['resolve'], ['_fail_launch']):
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
+            if os.fstat(task_lock).st_mode & 0o077:
+                raise ValueError('task lock must be private')
             try:
                 fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] == ['submit'] else fcntl.LOCK_NB))
             except BlockingIOError:
-                if arguments[:1] == ['_worker']:
+                if arguments[:1] == ['_supervise']:
+                    if arguments[2:] == ['--ready']:
+                        os.write(3, b'ready\n')
                     return
+                if arguments[:1] in (['_worker'], ['_observe']):
+                    raise SystemExit(75)
                 raise
             os.set_inheritable(task_lock, True)
     # Serialize only initialization/selection, not execution or the session queue.
@@ -194,6 +223,8 @@ def main():
                           submit=tool == 'opencode-task' and arguments[:1] == ['submit'])
     if selection_lock is not None:
         child['OPENCODE_MODULE_SESSION_LOCK'] = str(selection_lock)
+    if tool == 'opencode-task' and arguments[:1] in (['resolve'], ['_fail_launch']):
+        child['OPENCODE_MODULE_TASK_LOCKS'] = json.dumps([task_lock, monitor_lock])
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')
     if tool == 'opencode':

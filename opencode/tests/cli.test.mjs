@@ -3,9 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { TaskRunner } from "../scripts/task.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts/", import.meta.url));
 const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -13,7 +14,7 @@ const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test(
   "actual wrapper/CLI: detached submit, private stdin, lost receipt/worker restart, dedupe and status",
-  { timeout: 60000 },
+  { timeout: 120000 },
   async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     fs.chmodSync(base, 0o700);
@@ -30,12 +31,14 @@ test(
       "task.mjs",
       "task-cli.mjs",
       "task-acp.mjs",
+      "task-supervisor.mjs",
     ])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     // Only this synthetic fixture may expose diagnostics from its copied worker.
     const copiedCli = path.join(version, 'task-cli.mjs');
     fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
-      '} catch (error) {\n  // No raw', '} catch (error) {\n  console.error(error.stack);\n  // No raw'));
+      '} catch (error) {\n  // No raw', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // No raw`).replace(
+      'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise'].includes(command)) fs.writeFileSync(${JSON.stringify(base)} + '/' + (command === '_supervise' ? 'monitor' : 'worker') + '-' + id + '.pid', String(process.pid));`));
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -113,6 +116,7 @@ test(
       OPENCODE_ACP_REQUIRED_MODEL: "fixture/test",
       TASK_FIXTURE_LOG: executions,
       TASK_FIXTURE_CONTROL_LOG: path.join(base, 'controls'),
+      TASK_FIXTURE_PROCESS_LOG: path.join(base, 'processes'),
       TASK_FIXTURE_ENV_CHECK: '1',
       HTTP_PROXY: 'http://proxy.example.invalid:8080',
       https_proxy: 'http://proxy.example.invalid:8443',
@@ -126,6 +130,9 @@ test(
       UNLISTED_CALLBACK_BEARER: `Bearer tcb_${'e'.repeat(43)}`,
       CODEX_BASE_URL: 'https://codex.example.invalid/v1', CODEX_API_KEY: 'synthetic-codex',
       COPILOT_BASE_URL: 'https://copilot.example.invalid/v1', COPILOT_API_KEY: 'synthetic-copilot',
+      OPENCODE_TASK_POLL_MS: '100', OPENCODE_TASK_PROBE_MS: '1000', OPENCODE_TASK_DISCOVERY_MS: '5000',
+      OPENCODE_TASK_WORKER_MS: '5000', OPENCODE_TASK_SETUP_MS: '15000', OPENCODE_TASK_PROGRESS_MS: '10000',
+      OPENCODE_TASK_DRAIN_MS: '30',
     };
     const cli = (args, input) =>
       spawnSync(path.join(root, "bin/opencode-task"), args, {
@@ -136,6 +143,7 @@ test(
         timeout: 5000,
       });
     const seen = [];
+    let interruptCallback;
     const webhook = http.createServer((req, res) => {
       let data = "";
       req.on("data", (chunk) => {
@@ -143,7 +151,7 @@ test(
       });
       req.on("end", () => {
         seen.push(data);
-        if (seen.length === 1) req.socket.destroy();
+        if (seen.length === 1 || interruptCallback?.(data)) req.socket.destroy();
         else {
           res.writeHead(202, { "Content-Type": "application/json" });
           res.end(
@@ -189,8 +197,8 @@ test(
         state: JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', taskId, 'task.json'), 'utf8')).state,
         workerError: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '',
       }));
-      const workerPid = Number(fs.readFileSync(pidfile(taskId), "utf8"));
-      process.kill(workerPid, "SIGKILL");
+      const monitorPid = Number(fs.readFileSync(path.join(base, `monitor-${taskId}.pid`), "utf8"));
+      process.kill(monitorPid, "SIGKILL");
       await pause(100);
       const recovering = cli(["recover"]);
       assert.equal(recovering.status, 0, recovering.stderr);
@@ -300,7 +308,17 @@ test(
         return JSON.parse(result.stdout).task_id;
       };
       const delivered = async (id) => {
-        await until(() => load(id).state === "delivered");
+        try { await until(() => load(id).state === "delivered"); }
+        catch {
+          const { state, executionError, health, workerExit } = load(id);
+          const observations = Object.fromEntries(['worker.json', 'monitor.json'].map((name) => {
+            const file = path.join(root, 'runtime/tasks', id, name);
+            return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null];
+          }));
+          throw new Error(JSON.stringify({ state, executionError, health, workerExit,
+            now: Date.now(), observations,
+            fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+        }
         return load(id);
       };
       const denied = submit("default-write", "write fixture");
@@ -333,7 +351,7 @@ test(
         "SIGKILL",
       );
       await pause(80);
-      assert.equal(cli(["recover"]).status, 0);
+      // Its monitor must recover this lost driver without an operator recover call.
       const authorizedRecord = await delivered(authorized);
       assert.match(
         JSON.parse(authorizedRecord.body).output,
@@ -401,7 +419,7 @@ test(
       // Recovery/cancel has no in-process turn object and must target A,
       // while the unrelated queued follow-up Q continues normally.
       process.kill(
-        Number(fs.readFileSync(pidfile(waiting), "utf8")),
+        Number(fs.readFileSync(path.join(base, `monitor-${waiting}.pid`), "utf8")),
         "SIGKILL",
       );
       await pause(80);
@@ -458,12 +476,113 @@ test(
       env.TASK_FIXTURE_REFUSE_MODEL = 'copilot/gpt-6.1-sol';
       const refused = JSON.parse(cli(['submit', '--key', 'refused-model', '--prompt-file', modelFile,
         '--model', 'copilot/gpt-6.1-sol'], registrationFor('f')).stdout);
-      await until(() => load(refused.task_id).executionError === 'MODEL_OR_SESSION_SETUP_FAILED');
+      await delivered(refused.task_id);
       assert.equal(fs.readFileSync(executions, 'utf8'), beforeRefusal);
-      assert.equal(load(refused.task_id).state, 'queued');
-      cli(['cancel', refused.task_id]);
-      assert.equal((await delivered(refused.task_id)).resultStatus, 'cancelled');
+      assert.equal(load(refused.task_id).state, 'delivered');
+      assert.equal(load(refused.task_id).resultStatus, 'error');
+      assert.equal(cli(['cancel', refused.task_id]).status, 1);
       delete env.TASK_FIXTURE_REFUSE_MODEL;
+      const faultSubmit = (key, prompt) => {
+        fs.writeFileSync(modelFile, prompt);
+        const result = cli(['submit', '--key', key, '--prompt-file', modelFile],
+          JSON.stringify({ callback_id: `tcb_${key.padEnd(43, 'v')}`, callback_url: JSON.parse(registration).callback_url }));
+        assert.equal(result.status, 0, result.stderr);
+        return JSON.parse(result.stdout).task_id;
+      };
+      const failed = await delivered(faultSubmit('provider-failed', 'provider failed'));
+      assert.equal(failed.resultStatus, 'error');
+      assert.equal(failed.executionError, 'REQUEST_FAILED');
+      assert.equal(failed.terminalSource, 'watchSession.turn_result');
+      assert.equal(failed.body.includes('synthetic provider.internal'), false);
+      const exited = await delivered(faultSubmit('agent-exit', 'agent exit'));
+      assert.equal(exited.resultStatus, 'error');
+      assert.equal(exited.terminalSource, 'watchSession.turn_result');
+      env.OPENCODE_TASK_PROGRESS_MS = '500';
+      env.OPENCODE_TASK_TOOL_MS = '5000';
+      const slow = await delivered(faultSubmit('healthy-tool', 'long tool'));
+      assert.equal(slow.resultStatus, 'success');
+      assert.equal(JSON.parse(slow.body).output, 'Slow tool completed');
+      env.OPENCODE_TASK_PROGRESS_MS = '10000';
+      const lostId = faultSubmit('owner-exit', 'wait for cancellation');
+      await until(() => load(lostId).state === 'running');
+      const owned = JSON.parse(fs.readFileSync(path.join(base, 'processes'), 'utf8').trim().split('\n').at(-1));
+      assert.ok(fs.readFileSync(`/proc/${owned.owner}/cmdline`, 'utf8').includes(path.join(version, 'node_modules/acpx')));
+      process.kill(owned.owner, 'SIGKILL');
+      await until(() => load(lostId).notificationState === 'delivered');
+      const lost = load(lostId);
+      assert.equal(lost.state, 'ambiguous');
+      assert.equal(lost.resultStatus, undefined);
+      assert.match(JSON.parse(lost.body).output, /side effects are unknown/);
+      const unknown = JSON.parse(cli(['result', lostId]).stdout);
+      assert.equal(unknown.result_status, null);
+      assert.equal(unknown.callback_kind, 'supervision_failure');
+      assert.equal(unknown.timing.terminal_at, null);
+      assert.equal(seen.filter((body) => JSON.parse(body).callback_id === JSON.parse(lost.body).callback_id).length, 1);
+      assert.equal(cli(['recover', lostId]).status, 0);
+      assert.equal(load(lostId).body, lost.body);
+      assert.equal(cli(['cancel', lostId]).status, 1); // Dead owner's cancellation cannot be confirmed.
+      assert.equal(JSON.parse(cli(['status', lostId]).stdout).cancel_requested, true);
+      try {
+        const ticks = fs.readFileSync(`/proc/${owned.agent}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19];
+        if (ticks === owned.startTicks) process.kill(owned.agent, 'SIGKILL');
+      } catch {}
+      const legacyRunner = new TaskRunner({ root: path.join(root, 'runtime/tasks') });
+      const legacy = legacyRunner.submit({ key: 'legacy-unsealed', cwd: base, prompt: 'Synthetic prior task.',
+        callback: JSON.parse(registrationFor('r')) });
+      const legacyRecord = legacyRunner.load(legacy.task_id);
+      legacyRecord.state = 'ambiguous';
+      legacyRunner.write(legacyRecord);
+      const verifiedFile = path.join(base, 'verified.txt');
+      fs.writeFileSync(verifiedFile, 'Independently verified fixture result.');
+      const beforeResolve = fs.readFileSync(executions, 'utf8');
+      const resolved = readerCli(['resolve', legacy.task_id, '--status', 'success', '--output-file', verifiedFile]);
+      assert.equal(resolved.status, 0, resolved.stderr);
+      const resolvedRecord = await delivered(legacy.task_id); // No recover call is allowed to start delivery.
+      assert.equal(resolvedRecord.terminalSource, 'operator_resolution');
+      assert.equal(JSON.parse(resolvedRecord.body).output, 'Independently verified fixture result.');
+      assert.deepEqual(seen.filter((body) => JSON.parse(body).callback_id === legacyRecord.callback.callback_id), [resolvedRecord.body]);
+      assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+      for (const lockName of ['monitor.lock', 'worker.lock']) {
+        const pending = legacyRunner.submit({ key: `launch-failure-${lockName}`, cwd: base, prompt: 'Never dispatched.',
+          callback: JSON.parse(registrationFor(lockName[0])) });
+        const lockPath = legacyRunner.filename(pending.task_id, lockName);
+        fs.writeFileSync(lockPath, '', { mode: 0o600 });
+        const locker = spawn('python3', ['-B', '-c',
+          "import fcntl, sys; lock = open(sys.argv[1], 'r+'); fcntl.flock(lock, fcntl.LOCK_EX); print('ready', flush=True); sys.stdin.buffer.read(1)",
+          lockPath], { cwd: base, env: { PATH: env.PATH }, stdio: ['pipe', 'pipe', 'ignore'] });
+        const exited = new Promise((resolve) => locker.once('exit', resolve));
+        try {
+          await new Promise((resolve, reject) => { locker.once('error', reject); locker.stdout.once('data', resolve); });
+          const beforeFailure = fs.readFileSync(legacyRunner.filename(pending.task_id));
+          assert.equal(readerCli(['_fail_launch', pending.task_id]).status, 1);
+          assert.deepEqual(fs.readFileSync(legacyRunner.filename(pending.task_id)), beforeFailure);
+        } finally {
+          locker.stdin.end();
+          await exited;
+        }
+        let concurrentRecovery;
+        if (lockName === 'monitor.lock') interruptCallback = (body) => {
+          if (JSON.parse(body).callback_id !== legacyRunner.load(pending.task_id).callback.callback_id) return false;
+          interruptCallback = undefined;
+          concurrentRecovery = readerCli(['recover', pending.task_id]);
+          return true; // Lose the first receipt while recover sees this monitor's lock.
+        };
+        const finalizing = spawn(path.join(root, 'bin/opencode-task'), ['_fail_launch', pending.task_id], {
+          cwd: base, env: { PATH: env.PATH, HOME: base }, stdio: 'ignore',
+        });
+        assert.equal(await new Promise((resolve, reject) => {
+          finalizing.once('error', reject);
+          finalizing.once('exit', resolve);
+        }), 0);
+        const launchFailed = await delivered(pending.task_id);
+        assert.equal(launchFailed.executionError, 'SUPERVISOR_START_FAILED');
+        assert.equal(launchFailed.resultStatus, 'error');
+        assert.equal(launchFailed.terminalSource, 'execution_setup_failure');
+        const failureBodies = seen.filter((body) => JSON.parse(body).callback_id === launchFailed.callback.callback_id);
+        assert.deepEqual(failureBodies, Array(lockName === 'monitor.lock' ? 2 : 1).fill(launchFailed.body));
+        if (lockName === 'monitor.lock') assert.equal(concurrentRecovery.status, 0, concurrentRecovery.stderr);
+        assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+      }
       // Graceful fixture shutdown only; never wait for an idle ACP owner to report completion.
       const { createSharedAcpRuntime, createAgentRegistry } =
         await import("../scripts/node_modules/acpx/dist/runtime.js");
@@ -477,7 +596,7 @@ test(
         }),
       });
       try {
-        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle])
+        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle, failed.handle, exited.handle, slow.handle])
           await runtime.close({ handle, reason: "CLI fixture cleanup" });
       } finally {
         await runtime.shutdown();
@@ -488,7 +607,7 @@ test(
       webhook.close();
       for (const name of fs
         .readdirSync(base)
-        .filter((name) => /^worker-task_.*\.pid$/.test(name))) {
+        .filter((name) => /^(worker|monitor)-task_.*\.pid$/.test(name))) {
         try {
           const pid = Number(fs.readFileSync(path.join(base, name), "utf8"));
           // Only the fixture's own detached worker may be stopped; a stale PID
