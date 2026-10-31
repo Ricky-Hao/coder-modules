@@ -126,8 +126,8 @@ def main():
         try:
             settings = read_json(VERSION / 'settings.json')
             root = Path(settings['install_root'])
-            if arguments == ['doctor']:
-                value = doctor(root, VERSION)
+            if arguments in (['doctor'], ['doctor', '--quick']):
+                value = doctor(root, VERSION, quick=arguments == ['doctor', '--quick'])
                 print(json.dumps(value, ensure_ascii=False))
                 return 0 if value['ok'] else 1
             if arguments[:1] == ['doctor']:

@@ -33,8 +33,8 @@ class DoctorTests(unittest.TestCase):
         self.fixture.install()
         self.root = self.fixture.root
 
-    def call(self, extra=None):
-        return subprocess.run([str(self.root / 'bin/opencode-task'), 'doctor'], cwd=self.fixture.base,
+    def call(self, extra=None, quick=False):
+        return subprocess.run([str(self.root / 'bin/opencode-task'), 'doctor', *(['--quick'] if quick else [])], cwd=self.fixture.base,
                               env={'PATH': '/usr/bin:/bin', **(extra or {})}, capture_output=True, text=True, timeout=10)
 
     def test_installed_launcher_inventory_pins_and_profile_without_execution_or_writes(self):
@@ -53,12 +53,70 @@ class DoctorTests(unittest.TestCase):
         for secret in (str(self.root), 'PRIVATE-CONFIG', 'SYNTHETIC-NEVER-PRINT'):
             self.assertNotIn(secret, response.stdout + response.stderr)
         self.assertEqual(snapshot(self.root), before)
+
         with patch.object(subprocess, 'run', side_effect=AssertionError('doctor must not spawn tools')), \
                 patch.object(os, 'execve', side_effect=AssertionError('doctor must not execute tools')):
-            value = diagnostics.doctor(self.root)
-        self.assertTrue(value['ok'])
-        self.assertEqual(value['profile'], {'source': 'none', 'automatic_environment_names': []})
+            for quick in (False, True):
+                value = diagnostics.doctor(self.root, quick=quick)
+                self.assertTrue(value['ok'])
+                self.assertEqual(value['profile'], {'source': 'none', 'automatic_environment_names': []})
         self.assertEqual(snapshot(self.root), before)
+
+    def test_quick_skips_binary_reads_but_checks_scripts_and_rejects_unsafe_binary(self):
+        original_read = os.read
+        binary_bytes = 0
+        version = (self.root / 'active').resolve()
+        binaries = {version / 'opencode', version / 'node/bin/node'}
+
+        def measured(fd, maximum):
+            nonlocal binary_bytes
+            data = original_read(fd, maximum)
+            if Path(os.readlink('/proc/self/fd/' + str(fd))) in binaries:
+                binary_bytes += len(data)
+            return data
+
+        before = snapshot(self.root)
+        with patch.object(os, 'read', side_effect=measured):
+            value = diagnostics.doctor(self.root, quick=True)
+        self.assertTrue(value['ok'])
+        self.assertEqual(binary_bytes, 0)
+        checks = {check['name']: check for check in value['checks']}
+        self.assertEqual(checks['opencode']['status'], 'not_checked')
+        self.assertEqual(checks['node/bin/node']['status'], 'not_checked')
+        self.assertEqual(checks['opencode:metadata']['status'], 'ok')
+        self.assertEqual(snapshot(self.root), before)
+        binary = self.root / 'active/opencode'
+        original = binary.read_bytes()
+        binary.write_bytes(original.replace(b'import', b'IMPORT', 1))
+        self.assertEqual(self.call(quick=True).returncode, 0)
+        self.assertEqual(self.call().returncode, 1)  # 默认仍发现内容篡改。
+        binary.write_bytes(original)
+        for kind in ('mode', 'symlink', 'fifo', 'hardlink', 'owner'):
+            if kind == 'owner' and os.getuid() != 0:
+                continue
+            with self.subTest(kind=kind):
+                binary.unlink()
+                if kind == 'symlink':
+                    binary.symlink_to('/PRIVATE-TARGET')
+                elif kind == 'fifo':
+                    os.mkfifo(binary, 0o700)
+                elif kind == 'hardlink':
+                    os.link(self.root / 'active/task-cli.mjs', binary)
+                else:
+                    binary.write_bytes(original)
+                    binary.chmod(0o770 if kind == 'mode' else 0o700)
+                    if kind == 'owner':
+                        os.chown(binary, 65534, 65534)
+                response = self.call(quick=True)
+                self.assertEqual(response.returncode, 1)
+                self.assertFalse(json.loads(response.stdout)['ok'])
+                self.assertNotIn('PRIVATE-', response.stdout + response.stderr)
+                binary.unlink()
+                binary.write_bytes(original)
+                binary.chmod(0o700)
+        script = self.root / 'active/task-cli.mjs'
+        script.write_text('tampered small script')
+        self.assertEqual(self.call(quick=True).returncode, 1)
 
     def test_incomplete_installation_reports_missing_and_unknown_pins_without_repair(self):
         (self.root / 'active/node/bin/node').unlink()
@@ -68,7 +126,7 @@ class DoctorTests(unittest.TestCase):
         value = json.loads(response.stdout)
         self.assertFalse(value['ok'])
         failed = {check['name']: check for check in value['checks'] if check['status'] == 'failed'}
-        self.assertEqual(failed['node/bin/node']['code'], 'MISSING')
+        self.assertEqual(failed['node/bin/node:metadata']['code'], 'MISSING')
         self.assertIsNone(value['runtime'])
         self.assertEqual(snapshot(self.root), before)
 

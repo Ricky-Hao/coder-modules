@@ -43,6 +43,7 @@ opencode-task result task_<64-hex-digest-from-submit>
 opencode-task list --state ambiguous --limit 10
 opencode-task inspect task_<64-hex-digest-from-submit>
 opencode-task doctor
+opencode-task doctor --quick
 opencode-task recover
 # Recover only the original task when inspecting an interruption:
 opencode-task recover task_<64-hex-digest-from-submit>
@@ -77,8 +78,10 @@ opencode-task list --state running --session ticket-123 --limit 5 --scan-limit 5
 opencode-task list --state ambiguous --cursor '<上页 next_cursor>'
 opencode-task inspect task_<64-hex-digest-from-submit>
 opencode-task doctor
+opencode-task doctor --quick
 # 稳定入口或 active 缺失时，在已审阅的源码 checkout 中直接检查：
 python3 -B opencode/scripts/diagnostics.py --root /mnt/opencode/toolset
+python3 -B opencode/scripts/diagnostics.py --root /mnt/opencode/toolset --quick
 ```
 
 `list` 的 `--state` 精确匹配 `queued|dispatching|running|ambiguous|outbox|delivered|rejected`。
@@ -151,6 +154,23 @@ doctor 遇首个失败即停，`checks` 区分 ok、failed、not_checked，返�
 边界，external 文件不打开，环境仅用于既有 profile 选择和 MCP enable flag；不读取或打印认证值。
 `not_checked` 明列 Provider/MCP 健康、外部配置内容、agent 执行、任务历史、全依赖 inventory 和
 运行时版本执行。静态 ready、文件存在及版本匹配都不证明实际 Provider 健康。
+
+`doctor --quick` 复用同一流程。输出 `mode: quick`；默认命令为 `mode: full`。
+quick 仍对小型启动链文件做摘要校验，对两个大型二进制只打开 fd 并核对类型、当前 UID、
+私有权限、单链接、大小上限、inventory mode 及可执行位。`opencode:metadata` 和
+`node/bin/node:metadata` 是静态属性检查；`opencode`、`node/bin/node` 内容项明确为
+`not_checked`，原因 `quick_mode`。顶层 `not_checked` 同时列出各自 `content_and_sha256`。
+它不读这两个文件的内容，不返回或复用旧哈希来冒充本次实测。`ok: true` 只表示所选模式完成，
+不能将 quick 当作二进制完整性、运行版本执行或服务健康证明。默认 full 仍读取内容并发现篡改。
+两个模式均遇错即停；真正的权限、类型、属主和 link 错误仍退出 1，不启动 Node/agent、网络、
+认证检查或 callback，也不初始化目录和配置。新 metadata 项使失败阶段更明确；下游须按 name
+读取检查结果，不能依赖数组位置或仅凭 ok 推断未检内容。
+
+隔离静态安装 fixture 复制当前真实发布二进制：OpenCode 223516848 字节，Node 124902584 字节。
+一次 full 显式读取 348735004 字节，其中二进制 348419432；一次 quick 读取 315572 字节，
+二进制为 0。两次耗时约 0.398 秒和 0.004 秒，包含 fd 属性核对；这是复制及 inventory 后的
+热缓存样本，每种模式仅一次。计数覆盖 doctor 的显式 `os.read`，不含解释器/import 读取。
+这些是实际大二进制的读取量证据，不是冷存储、生产延迟或服务速度承诺；小 fixture 不用于外推。
 
 只读错误为安全 JSON `{error:{code,hint}}`，不附原始异常、路径或记录原文。
 命令/存储级失败及 doctor failed 退出 1；成功退出 0。list 可退出 0 并带逐记录 errors，须检查
@@ -494,6 +514,7 @@ is migrated or deleted.
 
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
+python3 -B opencode/build_bundle.py --check
 node --test opencode/tests/task.test.mjs opencode/tests/task-supervisor.test.mjs
 node --test opencode/tests/task-read.test.mjs
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)

@@ -21,6 +21,7 @@ verification.
 新增 `opencode-task list`、`inspect TASK_ID`、`doctor` 提供有界任务定位、安全历史观测和
 离线安装自检。它们不执行模型、恢复或 callback，也不初始化任务存储。分页、读取预算、
 陈旧/未知时间与失败项的解释见 [只读查询契约](TASKS.md#只读查询与离线安装自检)。
+`doctor` 默认完整校验；日常可用 `doctor --quick`，跳过二进制内容读取和哈希，并明确列为未检。
 
 Install pinned OpenCode and acpx as the existing workspace user. Only `agent_id` is
 required. For persistent use, a dedicated writable PVC is recommended:
@@ -136,15 +137,19 @@ from agent configuration back to module outputs. This avoids agent/module cycles
 
 ### Startup execution budget
 
-The startup script embeds a gzip-compressed, base64-encoded bundle using Terraform's
-`base64gzip`. Python's standard-library `gzip` decoder restores the exact source
-files and settings in memory before invoking the existing installer. 源码采用 NUL 分隔的原始文本，
-首段为 settings JSON，之后交替为文件名和源码；plan 校验分隔数量。这样避免 JSON 对源码的
-引号、换行及 HTML 字符再转义。解包逐文件字节、inventory 和 fingerprint 契约保持。
-This adds no
-remote bootstrap, download, prerequisite, or trust source. Installed-file inventory,
-payload fingerprints, ownership checks, wrapper commands and persistent state keep
-their existing contracts; transport-only changes do not invalidate a verified cache.
+启动脚本内嵌随源码提交的 [source.json](scripts/source.json)。其中 `data` 是标准 XZ 压缩后
+的 base64，`sha256` 是解压原文摘要。源码原文交替存放 NUL 分隔的文件名和 UTF-8 原字节。
+动态 settings 单独以 base64 JSON 传入，不进入生成包。Terraform 从当前各源码文件计算摘要，
+拒绝过期包和非法 NUL 分隔；Python 标准库 `lzma` 在内存解包，先核对原文摘要，再执行 installer。
+损坏包在安装及 status 写入前失败，保留已有 active。需要 Python 自带的 `lzma` 模块；
+不新增外部工具、远程 bootstrap、下载地址或信任源。
+
+维护者修改运行源码后执行 `python3 -B opencode/build_bundle.py`，将源码和生成包一起审阅提交。
+`python3 -B opencode/build_bundle.py --check` 检查所有恢复原字节及摘要，不改文件，也不要求
+压缩库产出逐字节相同的压缩流。固定 Git source 已带生成包，安装者无需预生成或运行构建命令。
+生成包不安装到 runtime。installer 仍按恢复后的原始文件和 settings 计算 fingerprint、inventory
+及缓存 key；仅改变压缩流不使有效缓存失效。实际源码变化会创建新版本，旧 task/session/cache
+不迁移、不删除。wrapper、权限、owner、缓存验证和失败回退保持原契约。
 
 Coder launches scripts through execution arguments. On a Linux host with 4096-byte
 pages, one argument may occupy at most 131072 bytes including its terminator.
@@ -170,6 +175,14 @@ installed command as well as readiness; an old status file is not fresh startup
 evidence. No runtime data repair or deletion is needed for this transport failure.
 40722 是当时修复版本的历史数据。新增入口仍须通过当前实际 Terraform render；Python 压缩
 预算检查不能替代真实渲染。后续源码或 settings 增长可能触发 plan-time budget 拒绝。
+
+本候选使用相同配置的真实 Terraform mock plan 比较：HOME 从 65331 降为 57861 字节，
+`/mnt/opencode/toolset` 从 65347 降为 57889 字节，含引号路径从 65363 降为 57905 字节。
+本轮全部配置的最大值为 57993/65536，余量 7543 字节（约 7.37 KiB），未达 8 KiB 目标。
+取舍是使用标准 XZ 和一个生成包，不继续增加定制压缩编码。65536 上限保持，超长 settings
+仍由真实 plan 拒绝；余量有限，未来增长仍须实测。真实渲染通过 Linux `env bash -c`、
+HOME/独立目录首次与离线缓存安装、恢复调用和数据保留。另以 UID 65534 验证本候选启动、
+可信 PVC group、缓存及真实 Node 的只读入口；root 只准备 `/tmp` 隔离目录，不修改真实卷。
 
 The helper appends **only the wrapper bin directory** to `.bashrc` and Bash's existing
 preferred login profile (`.bash_profile`, `.bash_login`, otherwise `.profile`). It

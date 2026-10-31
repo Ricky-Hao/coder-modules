@@ -16,11 +16,11 @@ run "agent_only" {
     error_message = "Default startup must own blocking installation and PATH setup."
   }
   assert {
-    condition     = jsondecode(split("\u0000", local.bundle)[0]).install_root == ""
+    condition     = local.bundle_config.install_root == ""
     error_message = "HOME must be resolved at runtime."
   }
   assert {
-    condition     = jsondecode(split("\u0000", local.bundle)[0]).workspace_id == data.coder_workspace.me.id
+    condition     = local.bundle_config.workspace_id == data.coder_workspace.me.id
     error_message = "Workspace identity must be derived internally."
   }
   assert {

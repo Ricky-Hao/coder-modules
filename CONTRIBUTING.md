@@ -13,6 +13,7 @@ From the repository root, with Python 3.11+ and Node 22+ available:
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
 node --test opencode/tests/task.test.mjs
+python3 -B opencode/build_bundle.py --check
 git diff --check
 ```
 
@@ -21,6 +22,10 @@ real provider/MCP requests. See [opencode/README.md](opencode/README.md#validati
 for Terraform mock/render checks and [opencode/TASKS.md](opencode/TASKS.md#verification-and-rollout-boundary)
 for optional acpx runtime/CLI fixtures and their prerequisites. Offline checks do
 not establish live acceptance, publication or deployment.
+
+修改 OpenCode 运行源码后，维护者运行 `python3 -B opencode/build_bundle.py`，将无损生成包
+与源码一起提交；固定 source 的安装者无需此步骤。plan 拒绝过期摘要，启动拒绝损坏原文，
+具体封装和预算见 [启动传输契约](opencode/README.md#startup-execution-budget)。
 
 修改 Provider/任务选模型时，还须运行 pinned acpx 的 runtime/CLI fixtures、相关
 Terraform mock/render，并用真实已发布 OpenCode 与本地候选做隔离 Responses/回调验收。

@@ -18,13 +18,16 @@ locals {
   bundle_files = { for name in ["install.py", "runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-read.mjs", "task-cli.mjs", "task-acp.mjs", "task-supervisor.mjs", "package.json", "package-lock.json"] :
     name => file("${path.module}/scripts/${name}")
   }
-  # 原始文件用 NUL 分隔，避免 JSON 对源码的引号、换行和 HTML 字符再次转义。
-  bundle = join("\u0000", concat([jsonencode(local.bundle_config)], flatten([
+  # 生成包只包含原始源码；动态设置单独传入，不要求安装者生成文件。
+  bundle = join("\u0000", flatten([
     for name, content in local.bundle_files : [name, content]
-  ])))
-  # Coder passes the script through exec arguments. Keep the embedded source
-  # compressed so it fits Linux's per-argument limit before the installer runs.
-  install_script = templatefile("${path.module}/scripts/install.sh.tftpl", { bundle = base64gzip(local.bundle) })
+  ]))
+  source_bundle = jsondecode(file("${path.module}/scripts/source.json"))
+  install_script = templatefile("${path.module}/scripts/install.sh.tftpl", {
+    bundle = local.source_bundle.data
+    sha256 = sha256(local.bundle)
+    config = base64encode(jsonencode(local.bundle_config))
+  })
   # HOME is deliberately expanded by the workspace shell, never by Terraform.
   command_root = var.install_root == "" ? "\"$HOME\"/.coder-opencode" : "'${replace(var.install_root, "'", "'\"'\"'")}'"
   # Pure input/file expression: safe for init-container use without depending on
@@ -49,8 +52,12 @@ resource "coder_script" "opencode" {
   timeout            = var.install_timeout
   lifecycle {
     precondition {
-      condition     = length(split("\u0000", local.bundle)) == 1 + 2 * length(local.bundle_files)
+      condition     = length(split("\u0000", local.bundle)) == 2 * length(local.bundle_files)
       error_message = "OpenCode source bundle contains an invalid NUL delimiter."
+    }
+    precondition {
+      condition     = local.source_bundle.sha256 == sha256(local.bundle)
+      error_message = "OpenCode source bundle is stale; maintainers must run python3 -B opencode/build_bundle.py before committing."
     }
     precondition {
       # The rendered template is ASCII (including its base64 payload), so this

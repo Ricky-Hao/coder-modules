@@ -29,6 +29,7 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
   launcher 默认继承启动进程环境；模块目录覆盖和回调保护见
   [Launch environment](opencode/README.md#launch-environment)。
   有界任务列表、单任务诊断与离线安装自检见 [只读入口](opencode/TASKS.md#只读查询与离线安装自检)。
+  `doctor` 默认完整校验；`doctor --quick` 只做静态日常核对，明确跳过二进制内容/哈希。
 
 e.g.
 

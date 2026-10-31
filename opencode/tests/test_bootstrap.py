@@ -1,11 +1,12 @@
 """Startup transport regression: real env/bash exec, no provider/model/network."""
 import errno
+import json
 import os
 import subprocess
 import unittest
 
 import test_install as fixtures
-from bootstrap_fixture import SCRIPT_BUDGET, render, unpack, verify_startup
+from bootstrap_fixture import SCRIPT_BUDGET, launch, render, unpack, verify_startup
 
 
 class BootstrapTests(unittest.TestCase):
@@ -33,3 +34,23 @@ class BootstrapTests(unittest.TestCase):
             subprocess.run(['/usr/bin/env', 'bash', '-c', script], env={'PATH': '/usr/bin:/bin'},
                            capture_output=True, timeout=10)
         self.assertEqual(failure.exception.errno, errno.E2BIG)
+
+    def test_committed_source_bundle_and_corruption_refusal_preserve_existing_installation(self):
+        module = fixtures.SCRIPTS.parent
+        checked = subprocess.run(['python3', '-B', str(module / 'build_bundle.py'), '--check'],
+                                 env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        fixture = self.fixture
+        fixture.install()
+        active = os.readlink(fixture.root / 'active')
+        status = (fixture.root / 'status.json').read_bytes()
+        bundle = json.loads((fixtures.SCRIPTS / 'source.json').read_text())
+        template = (fixtures.SCRIPTS / 'install.sh.tftpl').read_text()
+        # 损坏的摘要在执行 installer 及写 status 之前失败。
+        script = (template.replace('${bundle}', bundle['data']).replace('${sha256}', '0' * 64)
+                  .replace('${config}', 'e30='))
+        response = launch(script, fixture.home, fixture.base, fixture.tar, fixture.node)
+        self.assertEqual(response.returncode, 1)
+        self.assertIn('source bundle checksum mismatch', response.stderr)
+        self.assertEqual(os.readlink(fixture.root / 'active'), active)
+        self.assertEqual((fixture.root / 'status.json').read_bytes(), status)
