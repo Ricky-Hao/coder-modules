@@ -96,8 +96,6 @@ test("continue: terminal proof, same session/context intent, explicit permission
   assert.equal(next.selection.variant, "max"); assert.equal(next.permissions.mode, "approve-reads");
   assert.equal((await f.launch({ ...input, key: "fork" }, flags)).error.code, "CONTINUE_NOT_LATEST");
   assert.equal((await f.launch()).request_id, original.request_id);
-  assert.throws(() => f.runner.submit({ key: "bypass", cwd: next.worktree, prompt: "bypass", callback: f.input.callback,
-    session: next.session, ...f.saved(next).selection }), /SESSION_LAUNCH_REQUIRED/);
   const predispatch = f.runner.load(next.task_id);
   f.runner.seal(predispatch, "cancelled", "queued cancellation", "queued_cancellation");
   const afterCancel = await f.launch({ ...input, key: "after-cancel" }, { "--continue-from": next.task_id });
@@ -105,11 +103,10 @@ test("continue: terminal proof, same session/context intent, explicit permission
   assert.equal(f.runner.load(afterCancel.task_id).continuationHandle.backendSessionId, 'fixture-session');
 });
 
-test("legacy and unknown terminal do not authorize continuation", async (t) => {
+test("missing launch metadata and unknown terminal do not authorize continuation", async (t) => {
   const f = fixture(t);
-  const legacy = f.runner.submit({ key: "legacy", cwd: f.repo, prompt: "legacy", callback: f.input.callback });
   const next = { schema_version: 1, key: "next", prompt: "next", callback: f.input.callback };
-  assert.equal((await f.launch(next, { "--continue-from": legacy.task_id })).error.code, "LAUNCH_METADATA_REQUIRED");
+  assert.equal((await f.launch(next, { "--continue-from": `task_${'a'.repeat(64)}` })).error.code, "LAUNCH_METADATA_REQUIRED");
   const original = await f.launch();
   const task = f.runner.load(original.task_id);
   task.state = "ambiguous"; task.resultStatus = "error"; task.terminalSource = "supervision_failure"; f.runner.write(task);
@@ -184,7 +181,7 @@ test("interruption after successful fetch fixes base, branch/worktree recovery v
   assert.equal(final.error, undefined, JSON.stringify(final)); assert.equal(final.base_sha, f.latest);
 });
 
-test("prepared key and session cannot be occupied by low-level submit; directory publish recovers", async (t) => {
+test("directory publish recovers after durable staging identity", async (t) => {
   const f = fixture(t);
   let stopped = false;
   const partial = await f.launch(f.input, {}, { checkpoint: (stage) => {
@@ -194,8 +191,6 @@ test("prepared key and session cannot be occupied by low-level submit; directory
     }
   } });
   assert.equal(partial.accepted, false); assert.equal(stopped, true);
-  assert.throws(() => f.runner.submit({ key: f.input.key, cwd: f.repo, prompt: "different", callback: f.input.callback }), /SUBMIT_CONFLICT/);
-  assert.throws(() => f.runner.bindSession({ cwd: partial.worktree, session: partial.session, ...f.saved(partial).selection }), /SESSION_LAUNCH_REQUIRED/);
   const resumed = await f.launch();
   assert.equal(resumed.error, undefined, JSON.stringify(resumed)); assert.equal(resumed.reused, true);
   assert.equal(fs.existsSync(f.saved(resumed).worktreeStaging), false);

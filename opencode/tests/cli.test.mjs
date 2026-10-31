@@ -15,7 +15,7 @@ const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test(
-  "actual wrapper/CLI: detached submit, private stdin, lost receipt/worker restart, dedupe and status",
+  "actual wrapper/CLI: private launch, lost receipt/worker restart, dedupe and status",
   { timeout: 120000 },
   async (t) => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
@@ -69,7 +69,7 @@ test(
     const readerMarker = 'export function readWorkerHeartbeat(filename) {';
     const supervisorSource = fs.readFileSync(copiedSupervisor, 'utf8');
     assert.ok(supervisorSource.includes(readerMarker));
-    fs.writeFileSync(copiedSupervisor, supervisorSource.replace(readerMarker, `${readerMarker}
+    fs.writeFileSync(copiedSupervisor, 'import fs from "node:fs";\n' + supervisorSource.replace(readerMarker, `${readerMarker}
   const taskId = filename.split('/').at(-2);
   const fault = ${JSON.stringify(heartbeatFaults)} + '/' + taskId;
   if (fs.existsSync(fault)) {
@@ -220,6 +220,32 @@ esac
       });
     });
     await new Promise((resolve) => webhook.listen(0, "127.0.0.1", resolve));
+    const gitAt = (cwd, ...args) => {
+      const value = spawnSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8' });
+      assert.equal(value.status, 0, value.stderr);
+      return value.stdout.trim();
+    };
+    const launchRepo = path.join(base, 'launch-repo'), launchOrigin = path.join(base, 'launch-origin');
+    fs.mkdirSync(launchRepo); fs.mkdirSync(launchOrigin);
+    gitAt(launchOrigin, 'init', '--bare', '--initial-branch=main');
+    gitAt(launchRepo, 'init', '--initial-branch=main');
+    gitAt(launchRepo, 'config', 'user.name', 'Fixture');
+    gitAt(launchRepo, 'config', 'user.email', 'fixture@example.invalid');
+    fs.writeFileSync(path.join(launchRepo, 'tracked'), 'base\n');
+    gitAt(launchRepo, 'add', 'tracked'); gitAt(launchRepo, 'commit', '-m', 'base');
+    gitAt(launchRepo, 'remote', 'add', 'origin', launchOrigin); gitAt(launchRepo, 'push', 'origin', 'main');
+    // 只有调用者 HOME 的 URL rewrite 能解析 origin。
+    gitAt(base, 'config', '--file', path.join(base, '.gitconfig'), `url.${base}/.insteadOf`, 'fixture-origin:');
+    gitAt(launchRepo, 'remote', 'set-url', 'origin', 'fixture-origin:launch-origin');
+    const launchBase = gitAt(launchRepo, 'rev-parse', 'HEAD');
+    const inputFor = (key, prompt, callback, extra = {}) => ({ schema_version: 1, key, prompt, callback,
+      repo_path: launchRepo, branch: `fixture/${key}`, worktree: `work-${key}`, ...extra });
+    const launch = (input, from) => {
+      const file = path.join(base, `${input.key}.json`);
+      if (from) for (const key of ['repo_path', 'branch', 'worktree']) delete input[key];
+      fs.writeFileSync(file, JSON.stringify(input), { mode: 0o600 });
+      return cli(['launch', '--input-file', file, ...(from ? ['--continue-from', from] : [])]);
+    };
     let taskId;
     let primaryError;
     let phase = "initial-submit";
@@ -230,19 +256,9 @@ esac
         callback_id: callbackId,
         callback_url: `http://127.0.0.1:${webhook.address().port}/api/agents/task-callbacks`,
       });
-      fs.writeFileSync(
-        path.join(base, "prompt.txt"),
-        "Produce one final response.",
-      );
-      const submitArgs = [
-        "submit",
-        "--key",
-        "same-local-key",
-        "--prompt-file",
-        path.join(base, "prompt.txt"),
-      ];
+      const initialInput = inputFor('same-local-key', 'Produce one final response.', JSON.parse(registration));
       const start = Date.now();
-      const submitted = cli(submitArgs, registration);
+      const submitted = launch(initialInput);
       assert.equal(submitted.status, 0, submitted.stderr);
       assert.ok(Date.now() - start < 2000);
       const accepted = JSON.parse(submitted.stdout);
@@ -313,9 +329,10 @@ esac
       assert.equal(malformed.stderr.includes(callbackId), false);
       assert.equal(malformed.stderr.includes("Produce one final response."), false);
       fs.writeFileSync(taskFile, beforeRead);
-      const replay = cli(submitArgs, registration);
+      const replay = launch(initialInput);
       assert.equal(replay.status, 0, replay.stderr);
-      assert.deepEqual(JSON.parse(replay.stdout), accepted);
+      assert.equal(JSON.parse(replay.stdout).request_id, accepted.request_id);
+      assert.equal(JSON.parse(replay.stdout).reused, true);
       assert.equal(fs.readFileSync(executions, "utf8"), "prompt\n");
       const stored = JSON.parse(
         fs.readFileSync(
@@ -348,28 +365,16 @@ esac
           await pause(40);
         }
       };
-      const submit = (key, prompt, flags = []) => {
-        const promptFile = path.join(base, `${key}.txt`);
-        fs.writeFileSync(promptFile, prompt);
+      let reviewTail;
+      const launchReview = (key, prompt, extra = {}) => {
         const callback = {
           callback_id: `tcb_${key.padEnd(43, "q").slice(0, 43)}`,
           callback_url: JSON.parse(registration).callback_url,
         };
-        const result = cli(
-          [
-            "submit",
-            "--key",
-            key,
-            "--prompt-file",
-            promptFile,
-            "--session",
-            "review-branch",
-            ...flags,
-          ],
-          JSON.stringify(callback),
-        );
+        const result = launch(inputFor(key, prompt, callback, extra), reviewTail);
         assert.equal(result.status, 0, result.stderr);
-        return JSON.parse(result.stdout).task_id;
+        reviewTail = JSON.parse(result.stdout).task_id;
+        return reviewTail;
       };
       const delivered = async (id) => {
         try { await until(() => load(id).state === "delivered", `delivered:${id}`); }
@@ -398,28 +403,26 @@ esac
         }
         return load(id);
       };
-      const denied = submit("default-write", "write fixture");
+      const denied = launchReview("default-write", "write fixture");
       const deniedRecord = await delivered(denied);
+      const reviewWorktree = deniedRecord.cwd;
       assert.match(
         JSON.parse(deniedRecord.body).output,
         /Write denied; turn 1/,
       );
       assert.equal(
-        fs.existsSync(path.join(base, "authorized-write.txt")),
+        fs.existsSync(path.join(reviewWorktree, "authorized-write.txt")),
         false,
       );
       assert.equal(deniedRecord.permissions.mode, "deny-all");
-      const authorized = submit("authorized-write", "write fixture then wait", [
-        "--permission-mode",
-        "approve-all",
-      ]);
+      const authorized = launchReview("authorized-write", "write fixture then wait", { permissions: { mode: 'approve-all' } });
       await until(
         () =>
-          fs.existsSync(path.join(base, "authorized-write.txt")) &&
+          fs.existsSync(path.join(reviewWorktree, "authorized-write.txt")) &&
           load(authorized).state === "running",
       );
       assert.equal(
-        fs.readFileSync(path.join(base, "authorized-write.txt"), "utf8"),
+        fs.readFileSync(path.join(reviewWorktree, "authorized-write.txt"), "utf8"),
         "turn 2",
       );
       // Crash only our detached driver; the original ACP request continues.
@@ -445,27 +448,18 @@ esac
       );
       assert.notEqual(authorizedRecord.requestId, deniedRecord.requestId);
       const conservative = await delivered(
-        submit("default-again", "write fixture"),
+        launchReview("default-again", "write fixture", { permissions: { mode: 'deny-all' } }),
       );
       assert.match(
         JSON.parse(conservative.body).output,
         /Write denied; turn 3/,
       );
       assert.equal(
-        fs.readFileSync(path.join(base, "authorized-write.txt"), "utf8"),
+        fs.readFileSync(path.join(reviewWorktree, "authorized-write.txt"), "utf8"),
         "turn 2",
       );
-      const policyFile = path.join(base, "policy.json");
-      fs.writeFileSync(policyFile, JSON.stringify({ autoDeny: ["edit"] }), {
-        mode: 0o600,
-      });
       const policyRecord = await delivered(
-        submit("explicit-policy", "write fixture", [
-          "--permission-mode",
-          "approve-all",
-          "--permission-policy-file",
-          policyFile,
-        ]),
+        launchReview("explicit-policy", "write fixture", { permissions: { mode: 'approve-all', policy: { autoDeny: ['edit'] } } }),
       );
       assert.match(
         JSON.parse(policyRecord.body).output,
@@ -473,16 +467,26 @@ esac
       );
       assert.deepEqual(policyRecord.permissions.policy, { autoDeny: ["edit"] });
       const continuity = await delivered(
-        submit("review-followup", "continuity"),
+        launchReview("review-followup", "continuity"),
       );
       assert.match(JSON.parse(continuity.body).output, /Session turn 5/);
       assert.equal(
         continuity.handle.backendSessionId,
         authorizedRecord.handle.backendSessionId,
       );
-      const waiting = submit("active-request", "wait for cancellation");
+      const waiting = launchReview("active-request", "wait for cancellation");
       await until(() => load(waiting).state === "running");
-      const cancelledQueued = submit("cancelled-queued", "continuity");
+      // launch 不允许从未结束轮次续接；这里直接检验内部提交原语与 acpx 队列取消隔离。
+      const internalRunner = new TaskRunner({ root: path.join(root, 'runtime/tasks') });
+      const submitQueued = (key, prompt, source = waiting) => {
+        const record = load(source);
+        const accepted = internalRunner.submit({ key, prompt, cwd: record.cwd, session: record.sessionName,
+          model: record.model, modelConfig: record.modelConfig, modelProfile: record.modelProfile,
+          callback: { ...JSON.parse(registration), callback_id: `tcb_${key.padEnd(43, 'q')}` } });
+        assert.equal(cli(['recover', accepted.task_id]).status, 0);
+        return accepted.task_id;
+      };
+      const cancelledQueued = submitQueued("cancelled-queued", "continuity");
       await until(() => load(cancelledQueued).state === "dispatching");
       assert.equal(cli(["cancel", cancelledQueued]).status, 0);
       assert.equal(
@@ -490,7 +494,7 @@ esac
         "cancelled",
       );
       assert.equal(load(waiting).state, "running");
-      const queued = submit("queued-request", "continuity");
+      const queued = submitQueued("queued-request", "continuity");
       await until(() => load(queued).state === "dispatching");
       await pause(200);
       // Recovery/cancel has no in-process turn object and must target A,
@@ -507,7 +511,7 @@ esac
       assert.match(JSON.parse(queuedResult.body).output, /Session turn 7/);
       assert.equal((await delivered(waiting)).resultStatus, "cancelled");
       assert.equal(cli(["cancel", waiting]).status, 1);
-      const afterCancel = await delivered(submit("after-cancel", "continuity"));
+      const afterCancel = await delivered(submitQueued("after-cancel", "continuity"));
       assert.match(JSON.parse(afterCancel.body).output, /Session turn 8/);
       const notifications = new Map();
       for (const item of seen.slice(2)) {
@@ -531,13 +535,11 @@ esac
       );
       // Each session selects only once; queued/follow-up workers send no model controls.
       assert.equal(fs.readFileSync(path.join(base, 'controls'), 'utf8'), 'model\nmodel\n');
-      const modelFile = path.join(base, 'model.txt');
-      fs.writeFileSync(modelFile, 'model selection');
       const registrationFor = (letter) => JSON.stringify({ callback_id: `tcb_${letter.repeat(43)}`,
         callback_url: JSON.parse(registration).callback_url });
-      const modelArgs = ['submit', '--key', 'copilot-model', '--session', 'copilot-session', '--prompt-file', modelFile,
-        '--model', 'copilot/gpt-6-astra', '--variant', 'high'];
-      const chosen = JSON.parse(cli(modelArgs, registrationFor('c')).stdout);
+      const modelInput = inputFor('copilot-model', 'model selection', JSON.parse(registrationFor('c')),
+        { provider: 'copilot', model: 'gpt-6-astra', variant: 'high' });
+      const chosen = JSON.parse(launch(modelInput).stdout);
       const chosenRecord = await delivered(chosen.task_id);
       const selection = JSON.parse(JSON.parse(chosenRecord.body).output);
       assert.equal(selection.model, 'copilot/gpt-6-astra'); assert.equal(selection.effort, 'high');
@@ -546,32 +548,32 @@ esac
       assert.equal(selection.inheritedEnvironment, true);
       assert.deepEqual(JSON.parse(cli(['status', chosen.task_id]).stdout).model, 'copilot/gpt-6-astra');
       assert.equal(JSON.parse(cli(['status', chosen.task_id]).stdout).variant, 'high');
-      assert.equal(cli([...modelArgs.slice(0, -1), 'max'], registrationFor('c')).status, 1);
-      assert.equal(cli(['submit', '--key', 'conflicting-provider', '--session', 'copilot-session', '--prompt-file', modelFile], registrationFor('d')).status, 1);
-      assert.deepEqual(JSON.parse(cli(modelArgs, registrationFor('c')).stdout), chosen);
+      assert.equal(launch({ ...modelInput, variant: 'max' }).status, 1);
+      assert.equal(launch(inputFor('conflicting-provider', 'model selection', JSON.parse(registrationFor('d')),
+        { provider: 'codex' }), chosen.task_id).status, 1);
+      assert.equal(JSON.parse(launch(modelInput).stdout).request_id, chosen.request_id);
       const beforeRefusal = fs.readFileSync(executions, 'utf8');
       env.TASK_FIXTURE_REFUSE_MODEL = 'copilot/gpt-6.1-sol';
-      const refused = JSON.parse(cli(['submit', '--key', 'refused-model', '--prompt-file', modelFile,
-        '--model', 'copilot/gpt-6.1-sol'], registrationFor('f')).stdout);
+      const refused = JSON.parse(launch(inputFor('refused-model', 'model selection', JSON.parse(registrationFor('f')),
+        { provider: 'copilot', model: 'gpt-6.1-sol' })).stdout);
       await delivered(refused.task_id);
       assert.equal(fs.readFileSync(executions, 'utf8'), beforeRefusal);
       assert.equal(load(refused.task_id).state, 'delivered');
       assert.equal(load(refused.task_id).resultStatus, 'error');
       assert.equal(cli(['cancel', refused.task_id]).status, 1);
       delete env.TASK_FIXTURE_REFUSE_MODEL;
-      const faultSubmit = (key, prompt, flags = []) => {
-        fs.writeFileSync(modelFile, prompt);
-        const result = cli(['submit', '--key', key, '--prompt-file', modelFile, ...flags],
-          JSON.stringify({ callback_id: `tcb_${key.padEnd(43, 'v')}`, callback_url: JSON.parse(registration).callback_url }));
+      const faultLaunch = (key, prompt) => {
+        const result = launch(inputFor(key, prompt,
+          { callback_id: `tcb_${key.padEnd(43, 'v')}`, callback_url: JSON.parse(registration).callback_url }));
         assert.equal(result.status, 0, result.stderr);
         return JSON.parse(result.stdout).task_id;
       };
-      const failed = await delivered(faultSubmit('provider-failed', 'provider failed'));
+      const failed = await delivered(faultLaunch('provider-failed', 'provider failed'));
       assert.equal(failed.resultStatus, 'error');
       assert.equal(failed.executionError, 'REQUEST_FAILED');
       assert.equal(failed.terminalSource, 'watchSession.turn_result');
       assert.equal(failed.body.includes('synthetic provider.internal'), false);
-      const exited = await delivered(faultSubmit('agent-exit', 'agent exit'));
+      const exited = await delivered(faultLaunch('agent-exit', 'agent exit'));
       assert.equal(exited.resultStatus, 'error');
       assert.equal(exited.terminalSource, 'watchSession.turn_result');
       env.OPENCODE_TASK_PROGRESS_MS = '500';
@@ -579,7 +581,7 @@ esac
       const healthyToolId = `task_${createHash('sha256').update('healthy-tool').digest('hex')}`;
       fs.writeFileSync(path.join(heartbeatFaults, healthyToolId), 'once');
       const toolBegan = Date.now();
-      const slow = await delivered(faultSubmit('healthy-tool', 'long tool'));
+      const slow = await delivered(faultLaunch('healthy-tool', 'long tool'));
       assert.equal(slow.resultStatus, 'success');
       assert.equal(JSON.parse(slow.body).output, 'Slow tool completed');
       assert.equal(fs.readFileSync(path.join(base, 'heartbeat-read-errors.ndjson'), 'utf8').trim().split('\n')
@@ -608,7 +610,7 @@ esac
       console.error(JSON.stringify({ fixture_phase: phase, at: Date.now() }));
       const thoughtWitness = await witnessFor('healthy-thought', progressControl);
       const beforeHealthControls = executionCount();
-      const thoughtId = faultSubmit('healthy-thought', 'recover thought progress');
+      const thoughtId = faultLaunch('healthy-thought', 'recover thought progress');
       await until(() => {
         const record = load(thoughtId);
         return record.handle && peerEvents(record).some((event) => event.type === 'thought_ready');
@@ -693,7 +695,7 @@ while True:
       phase = 'alive-original-stall';
       console.error(JSON.stringify({ fixture_phase: phase, at: Date.now() }));
       const stallWitness = await witnessFor('alive-stall');
-      const stalledId = faultSubmit('alive-stall', 'silent forever', ['--session', 'alive-stall-session']);
+      const stalledId = faultLaunch('alive-stall', 'silent forever');
       await until(() => {
         const record = load(stalledId);
         // running 可先于 peer 消费请求；同时等到合成 peer 的接收证据。
@@ -719,7 +721,7 @@ while True:
       assertOriginalAlive();
       // 同 session 的另一请求保持排队，卡死检测不得误取消或自动放行它。
       env.OPENCODE_TASK_PROGRESS_MS = '60000';
-      const behindStall = faultSubmit('behind-stall', 'continuity', ['--session', 'alive-stall-session']);
+      const behindStall = submitQueued('behind-stall', 'continuity', stalledId);
       env.OPENCODE_TASK_PROGRESS_MS = '600';
       await until(() => load(behindStall).state === 'dispatching', 'unrelated same-session request queued');
       fs.writeFileSync(path.join(progressControl, `${startedStall.handle.backendSessionId}.stall`), 'inject permanent silence');
@@ -801,7 +803,7 @@ while True:
       // 持续的真实读取异常只能经连续确认停止自有 driver，再观察原请求；不得重派业务。
       env.OPENCODE_TASK_PROGRESS_MS = '60000';
       const beforeUnreadable = executionCount();
-      const unreadableId = faultSubmit('unreadable-heartbeat', 'silent forever');
+      const unreadableId = faultLaunch('unreadable-heartbeat', 'silent forever');
       await until(() => load(unreadableId).state === 'running' &&
         peerEvents(load(unreadableId)).some((event) => event.type === 'prompt_received'), 'heartbeat fault original received');
       const unreadablePeer = peerEvents(load(unreadableId)).find((event) => event.type === 'prompt_received');
@@ -836,7 +838,7 @@ while True:
       env.OPENCODE_TASK_CONFIRM_MS = '600';
       env.OPENCODE_TASK_WORKER_MS = '300';
       env.OPENCODE_TASK_CONFIRM_MS = '1200';
-      const pausedId = faultSubmit('paused-worker', 'long tool');
+      const pausedId = faultLaunch('paused-worker', 'long tool');
       await until(() => load(pausedId).state === 'running');
       const pausedPid = Number(fs.readFileSync(pidfile(pausedId), 'utf8'));
       const pausedToken = JSON.parse(fs.readFileSync(path.join(root, 'runtime/tasks', pausedId, 'worker.json'), 'utf8')).token;
@@ -851,7 +853,7 @@ while True:
       assert.equal(pausedRecord.workerExit.reason, 'WORKER_EXITED');
       env.OPENCODE_TASK_CONFIRM_MS = '600';
       const beforeStopped = fs.readFileSync(executions, 'utf8').trim().split('\n').length;
-      const stoppedId = faultSubmit('stopped-worker', 'long tool');
+      const stoppedId = faultLaunch('stopped-worker', 'long tool');
       await until(() => load(stoppedId).state === 'running');
       const stoppedPid = Number(fs.readFileSync(pidfile(stoppedId), 'utf8'));
       process.kill(stoppedPid, 'SIGSTOP');
@@ -861,7 +863,7 @@ while True:
       assert.notEqual(Number(fs.readFileSync(pidfile(stoppedId), 'utf8')), stoppedPid);
       assert.equal(fs.readFileSync(executions, 'utf8').trim().split('\n').length, beforeStopped + 1);
       env.OPENCODE_TASK_WORKER_MS = '5000';
-      const lostId = faultSubmit('owner-exit', 'wait for cancellation');
+      const lostId = faultLaunch('owner-exit', 'wait for cancellation');
       await until(() => load(lostId).state === 'running' &&
         peerEvents(load(lostId)).some((event) => event.type === 'prompt_received'), 'owner-exit original received by peer');
       const lostPeer = peerEvents(load(lostId)).find((event) => event.type === 'prompt_received');
@@ -886,26 +888,33 @@ while True:
         const ticks = fs.readFileSync(`/proc/${owned.agent}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/)[19];
         if (ticks === owned.startTicks) process.kill(owned.agent, 'SIGKILL');
       } catch {}
-      const legacyRunner = new TaskRunner({ root: path.join(root, 'runtime/tasks') });
-      const legacy = legacyRunner.submit({ key: 'legacy-unsealed', cwd: base, prompt: 'Synthetic prior task.',
-        callback: JSON.parse(registrationFor('r')) });
-      const legacyRecord = legacyRunner.load(legacy.task_id);
-      legacyRecord.state = 'ambiguous';
-      legacyRunner.write(legacyRecord);
-      const verifiedFile = path.join(base, 'verified.txt');
-      fs.writeFileSync(verifiedFile, 'Independently verified fixture result.');
-      const beforeResolve = fs.readFileSync(executions, 'utf8');
-      const resolved = readerCli(['resolve', legacy.task_id, '--status', 'success', '--output-file', verifiedFile]);
-      assert.equal(resolved.status, 0, resolved.stderr);
-      const resolvedRecord = await delivered(legacy.task_id); // No recover call is allowed to start delivery.
-      assert.equal(resolvedRecord.terminalSource, 'operator_resolution');
-      assert.equal(JSON.parse(resolvedRecord.body).output, 'Independently verified fixture result.');
-      assert.deepEqual(seen.filter((body) => JSON.parse(body).callback_id === legacyRecord.callback.callback_id), [resolvedRecord.body]);
-      assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+      for (const command of ['submit', 'resolve', 'start']) {
+        const removed = readerCli([command]);
+        assert.equal(removed.status, 1);
+        assert.equal(JSON.parse(removed.stderr).error.code, 'INVALID_COMMAND');
+      }
+      const beforeFailureSetup = fs.readFileSync(executions, 'utf8');
+      const currentIntent = { model: load(taskId).model, modelConfig: load(taskId).modelConfig, modelProfile: 'env' };
+      const unsupported = internalRunner.submit({ ...currentIntent, key: 'unsupported-record', cwd: base,
+        prompt: 'Never replay an old record.', callback: JSON.parse(registrationFor('r')) });
+      const unsupportedRecord = internalRunner.load(unsupported.task_id);
+      delete unsupportedRecord.model;
+      unsupportedRecord.state = 'ambiguous';
+      internalRunner.write(unsupportedRecord);
+      const unsupportedBytes = fs.readFileSync(internalRunner.filename(unsupported.task_id));
+      for (const command of ['status', 'result', 'inspect', 'recover', 'cancel']) {
+        const response = readerCli([command, unsupported.task_id]);
+        assert.equal(response.status, 1);
+        assert.equal(JSON.parse(response.stderr).error.code, 'UNSUPPORTED_TASK_RECORD');
+      }
+      const recovery = readerCli(['recover']);
+      assert.equal(recovery.status, 0, recovery.stderr);
+      assert.deepEqual(JSON.parse(recovery.stdout).unsupported, [{ task_id: unsupported.task_id, code: 'UNSUPPORTED_TASK_RECORD' }]);
+      assert.deepEqual(fs.readFileSync(internalRunner.filename(unsupported.task_id)), unsupportedBytes);
       for (const lockName of ['monitor.lock', 'worker.lock']) {
-        const pending = legacyRunner.submit({ key: `launch-failure-${lockName}`, cwd: base, prompt: 'Never dispatched.',
+        const pending = internalRunner.submit({ ...currentIntent, key: `launch-failure-${lockName}`, cwd: base, prompt: 'Never dispatched.',
           callback: JSON.parse(registrationFor(lockName[0])) });
-        const lockPath = legacyRunner.filename(pending.task_id, lockName);
+        const lockPath = internalRunner.filename(pending.task_id, lockName);
         fs.writeFileSync(lockPath, '', { mode: 0o600 });
         const locker = spawn('python3', ['-B', '-c',
           "import fcntl, sys; lock = open(sys.argv[1], 'r+'); fcntl.flock(lock, fcntl.LOCK_EX); print('ready', flush=True); sys.stdin.buffer.read(1)",
@@ -913,19 +922,19 @@ while True:
         const exited = new Promise((resolve) => locker.once('exit', resolve));
         try {
           await new Promise((resolve, reject) => { locker.once('error', reject); locker.stdout.once('data', resolve); });
-          const beforeFailure = fs.readFileSync(legacyRunner.filename(pending.task_id));
+          const beforeFailure = fs.readFileSync(internalRunner.filename(pending.task_id));
           const refused = readerCli(['_fail_launch', pending.task_id]);
           assert.equal(refused.status, 1, JSON.stringify({ phase: 'launch-failure-lock', lockName,
             taskId: pending.task_id, status: refused.status, signal: refused.signal,
             error: refused.error?.message, stdout: refused.stdout, stderr: refused.stderr }));
-          assert.deepEqual(fs.readFileSync(legacyRunner.filename(pending.task_id)), beforeFailure);
+          assert.deepEqual(fs.readFileSync(internalRunner.filename(pending.task_id)), beforeFailure);
         } finally {
           locker.stdin.end();
           await exited;
         }
         let concurrentRecovery;
         if (lockName === 'monitor.lock') interruptCallback = (body) => {
-          if (JSON.parse(body).callback_id !== legacyRunner.load(pending.task_id).callback.callback_id) return false;
+          if (JSON.parse(body).callback_id !== internalRunner.load(pending.task_id).callback.callback_id) return false;
           interruptCallback = undefined;
           concurrentRecovery = readerCli(['recover', pending.task_id]);
           return true; // Lose the first receipt while recover sees this monitor's lock.
@@ -944,27 +953,9 @@ while True:
         const failureBodies = seen.filter((body) => JSON.parse(body).callback_id === launchFailed.callback.callback_id);
         assert.deepEqual(failureBodies, Array(lockName === 'monitor.lock' ? 2 : 1).fill(launchFailed.body));
         if (lockName === 'monitor.lock') assert.equal(concurrentRecovery.status, 0, concurrentRecovery.stderr);
-        assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
+        assert.equal(fs.readFileSync(executions, 'utf8'), beforeFailureSetup);
       }
       phase = 'high-level-launch';
-      const gitAt = (cwd, ...args) => {
-        const value = spawnSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8' });
-        assert.equal(value.status, 0, value.stderr);
-        return value.stdout.trim();
-      };
-      const launchRepo = path.join(base, 'launch-repo'), launchOrigin = path.join(base, 'launch-origin');
-      fs.mkdirSync(launchRepo); fs.mkdirSync(launchOrigin);
-      gitAt(launchOrigin, 'init', '--bare', '--initial-branch=main');
-      gitAt(launchRepo, 'init', '--initial-branch=main');
-      gitAt(launchRepo, 'config', 'user.name', 'Fixture');
-      gitAt(launchRepo, 'config', 'user.email', 'fixture@example.invalid');
-      fs.writeFileSync(path.join(launchRepo, 'tracked'), 'base\n');
-      gitAt(launchRepo, 'add', 'tracked'); gitAt(launchRepo, 'commit', '-m', 'base');
-      gitAt(launchRepo, 'remote', 'add', 'origin', launchOrigin); gitAt(launchRepo, 'push', 'origin', 'main');
-      // 仅调用者 HOME 的 URL rewrite 能解析此 origin；launch 必须保留 Git 配置环境。
-      gitAt(base, 'config', '--file', path.join(base, '.gitconfig'), `url.${base}/.insteadOf`, 'fixture-origin:');
-      gitAt(launchRepo, 'remote', 'set-url', 'origin', 'fixture-origin:launch-origin');
-      const launchBase = gitAt(launchRepo, 'rev-parse', 'HEAD');
       fs.writeFileSync(path.join(launchRepo, 'dirty'), 'unrelated work');
       const launchInput = { schema_version: 1, key: 'launch-high', repo_path: launchRepo,
         branch: 'feat/launch', worktree: 'launch-work', prompt: 'write fixture', permissions: { mode: 'approve-all' },

@@ -43,6 +43,7 @@ test(
     try {
       const runner = new TaskRunner({ root: taskRoot, runtime: first });
       const accepted = runner.submit({
+        model: { id: 'fixture/test' }, modelConfig: path.join(base, 'config.json'), modelProfile: 'external',
         key: "real-acpx-fixture",
         cwd: base,
         prompt: "produce final answer",
@@ -115,10 +116,10 @@ test(
         2,
       );
       second.observeOwner = ({ handle }) => observeOwner(handle.acpxRecordId);
-      second.journalAuthoritative = true;
       const slowRunner = new TaskRunner({ root: taskRoot, runtime: second,
         policy: { ...runner.policy, pollMs: 100, discoveryMs: 5000, probeMs: 500, confirmMs: 200, progressMs: 500, toolMs: 5000 } });
-      const slow = slowRunner.submit({ key: 'real-slow-tool', cwd: base, prompt: 'long tool', callback: {
+      const slow = slowRunner.submit({ model: { id: 'fixture/test' }, modelConfig: path.join(base, 'config.json'), modelProfile: 'external',
+        key: 'real-slow-tool', cwd: base, prompt: 'long tool', callback: {
         callback_id: `tcb_${'a'.repeat(43)}`, callback_url: 'http://127.0.0.1:1/api/agents/task-callbacks' } });
       await slowRunner.execute(slow.task_id);
       const slowRecord = slowRunner.load(slow.task_id);

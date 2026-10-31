@@ -14,7 +14,7 @@ from safety import directory, regular
 MCP_NAMES = ('CONTEXT7', 'FIRECRAWL', 'GITHUB', 'GITHUB_ACTIONS')
 PROVIDERS = ('copilot', 'codex')
 LLM_KEYS = tuple(name.upper() + suffix for name in PROVIDERS for suffix in ('_API_KEY', '_BASE_URL'))
-PROFILE_KEYS = set(LLM_KEYS) | {'LLM_API_KEY', 'LLM_BASE_URL'} | {
+PROFILE_KEYS = set(LLM_KEYS) | {
     f'{name}_MCP_{suffix}' for name in MCP_NAMES
     for suffix in ('URL', 'API_KEY', 'ENABLED', 'AUTH_HEADER', 'AUTH_SCHEME')}
 

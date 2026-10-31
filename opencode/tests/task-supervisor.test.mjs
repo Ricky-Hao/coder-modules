@@ -32,7 +32,10 @@ for (const replacements of [1, 3]) {
     };
     fs.closeSync = (fd) => { closed++; return close(fd); };
     let result;
-    try { result = readWorkerHeartbeat(filename); }
+    try {
+      if (replacements === 3) assert.throws(() => readWorkerHeartbeat(filename), /TASK_RECORD_CHANGED/);
+      else result = readWorkerHeartbeat(filename);
+    }
     finally { fs.fstatSync = stat; fs.closeSync = close; }
     assert.deepEqual(unlinked, replacements === 1 ? [0, 1] : [0, 0, 0]);
     // Each save closes its data and directory fd; each attempted heartbeat fd also closes.
@@ -50,7 +53,7 @@ test("heartbeat still rejects hard links, symlinks, public mode, wrong owner, di
   fs.unlinkSync(hardlink);
   const symlink = path.join(base, "symlink");
   fs.symlinkSync(filename, symlink);
-  assert.throws(() => readWorkerHeartbeat(symlink), (error) => error.code === "ELOOP");
+  assert.throws(() => readWorkerHeartbeat(symlink), /UNSAFE_TASK_FILE/);
   fs.chmodSync(filename, 0o644);
   assert.throws(() => readWorkerHeartbeat(filename), /UNSAFE_TASK_FILE/);
   fs.chmodSync(filename, 0o600);
@@ -61,16 +64,18 @@ test("heartbeat still rejects hard links, symlinks, public mode, wrong owner, di
   }
   assert.throws(() => readWorkerHeartbeat(base), /UNSAFE_TASK_FILE/);
   fs.writeFileSync(filename, "invalid json");
-  assert.throws(() => readWorkerHeartbeat(filename), SyntaxError);
+  assert.throws(() => readWorkerHeartbeat(filename), /INVALID_TASK_RESULT/);
   assert.equal(readWorkerHeartbeat(path.join(base, "absent")), undefined);
   // Check fd closure independently of the error, including parsing failure.
   const open = fs.openSync;
   const stat = fs.fstatSync;
   let rejectedFd;
   fs.openSync = (...args) => { const fd = open(...args); if (args[0] === filename) rejectedFd = fd; return fd; };
-  try { assert.throws(() => readWorkerHeartbeat(filename), SyntaxError); }
+  try { assert.throws(() => readWorkerHeartbeat(filename), /INVALID_TASK_RESULT/); }
   finally { fs.openSync = open; }
   assert.throws(() => stat(rejectedFd), (error) => error.code === "EBADF");
+  fs.writeFileSync(filename, 'x'.repeat(16385));
+  assert.throws(() => readWorkerHeartbeat(filename), /TASK_RECORD_TOO_LARGE/);
 });
 
 test("heartbeat rejects a FIFO without waiting for a writer", (t) => {

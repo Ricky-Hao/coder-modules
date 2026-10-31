@@ -86,7 +86,10 @@ function fixture(t, options = {}) {
     fetcher: options.fetcher,
     policy: options.policy ?? shortPolicy,
   });
+  const intent = { model: { id: 'codex/gpt-6.1-sol', variant: 'max' },
+    modelConfig: path.join(root, 'config.json'), modelProfile: 'env' };
   const accepted = runner.submit({
+    ...intent,
     key: "local-submit-key",
     cwd: root,
     prompt: "Perform the task.",
@@ -96,6 +99,7 @@ function fixture(t, options = {}) {
     root,
     runner,
     runtime,
+    intent,
     id: accepted.task_id,
     accepted,
     executions: () => executions,
@@ -216,46 +220,26 @@ test("result projection reports the effective byte bound and truncation", async 
   assert.ok(Buffer.byteLength(summary.output) <= summary.output_limit_bytes);
 });
 
-test("legacy result records report missing timing and source as unknown", async (t) => {
+test("unsupported records remain unchanged and do not block current recovery", async (t) => {
   const f = fixture(t, { fetcher: async () => ok() });
   await f.runner.execute(f.id);
   await f.runner.deliver(f.runner.load(f.id));
-  const legacy = f.runner.load(f.id);
-  for (const field of [
-    "acceptedAt",
-    "startedAt",
-    "terminalAt",
-    "callbackAttemptedAt",
-    "callbackDeliveredAt",
-    "terminalSource",
-    "outputSource",
-    "outputTruncated",
-  ])
-    delete legacy[field];
-  f.runner.write(legacy);
+  const record = f.runner.load(f.id);
   const taskFile = f.runner.filename(f.id);
-  const beforeRead = fs.readFileSync(taskFile);
-  const summary = f.runner.result(f.id);
-  assert.deepEqual(summary.timing, {
-    time_basis: "unix_epoch_ms_wall_clock",
-    accepted_at: 1000,
-    started_at: null,
-    terminal_at: null,
-    callback_attempted_at: null,
-    callback_delivered_at: null,
-    supervision_failed_at: null,
-  });
-  assert.equal(summary.output, "Done ✓");
-  assert.equal(summary.output_truncated, null);
-  assert.equal(summary.evidence.terminal_source, null);
-  assert.equal(summary.evidence.output_source, null);
-  assert.equal(summary.evidence.callback_receipt.receipt_id, "receipt");
-  assert.deepEqual(fs.readFileSync(taskFile), beforeRead);
-  delete legacy.createdAt;
-  delete legacy.handle.backendSessionId;
-  f.runner.write(legacy);
-  assert.equal(f.runner.result(f.id).timing.accepted_at, null);
-  assert.equal(f.runner.result(f.id).session_id, null);
+  for (const field of ['version', 'model', 'modelConfig', 'modelProfile', 'permissions', 'createdAt', 'outputTruncated']) {
+    const old = { ...record }; delete old[field]; f.runner.write(old);
+    const before = fs.readFileSync(taskFile);
+    assert.throws(() => f.runner.result(f.id), /UNSUPPORTED_TASK_RECORD/);
+    await assert.rejects(f.runner.execute(f.id), /UNSUPPORTED_TASK_RECORD/);
+    await assert.rejects(f.runner.cancel(f.id), /UNSUPPORTED_TASK_RECORD/);
+    const unsupported = [];
+    assert.deepEqual(f.runner.pending(unsupported), []);
+    assert.deepEqual(unsupported, [{ task_id: f.id, code: 'UNSUPPORTED_TASK_RECORD' }]);
+    assert.deepEqual(fs.readFileSync(taskFile), before);
+  }
+  const current = f.runner.submit({ ...f.intent, key: 'current', cwd: f.root, prompt: 'Current task', callback });
+  assert.deepEqual(f.runner.pending([]), [current.task_id]);
+  assert.equal(f.executions(), 1);
 });
 
 test("result never projects nonterminal prompt or live output", (t) => {
@@ -295,14 +279,13 @@ test("stream and final message truncation survive seal and are reset for a new m
   assert.equal(summary.output.endsWith("\uFFFD"), false);
 });
 
-test("result clipping is explicit even for legacy or inconsistent truncation metadata", async (t) => {
+test("result clipping is explicit even for inconsistent truncation metadata", async (t) => {
   const f = fixture(t);
   await f.runner.execute(f.id);
   const record = f.runner.load(f.id);
   record.callback.max_output_bytes = 4;
   record.body = JSON.stringify(callbackBody(callback, "success", "✓✓"));
-  for (const truncated of [false, undefined]) {
-    record.outputTruncated = truncated;
+    record.outputTruncated = false;
     f.runner.write(record);
     const beforeRead = fs.readFileSync(f.runner.filename(f.id));
     const summary = f.runner.result(f.id);
@@ -311,7 +294,6 @@ test("result clipping is explicit even for legacy or inconsistent truncation met
     assert.equal(summary.output_limit_bytes, 4);
     assert.equal(summary.output_truncated, true);
     assert.deepEqual(fs.readFileSync(f.runner.filename(f.id)), beforeRead);
-  }
 });
 
 test("result withholds callback-shaped output and fails safely on malformed metadata", async (t) => {
@@ -356,26 +338,24 @@ test("result withholds callback-shaped output and fails safely on malformed meta
   }
 });
 
-test("old outbox recovery preserves exact sealed bytes and does not invent lifecycle times", async (t) => {
+test("outbox recovery preserves exact sealed bytes and lifecycle times", async (t) => {
   const bodies = [];
   const f = fixture(t, { fetcher: async (_url, init) => { bodies.push(init.body); return ok(); } });
   await f.runner.execute(f.id);
-  const legacy = f.runner.load(f.id);
-  legacy.body = JSON.stringify(JSON.parse(legacy.body), null, 2) + "\n";
-  for (const field of ["createdAt", "startedAt", "terminalAt", "terminalSource", "outputSource", "outputTruncated"])
-    delete legacy[field];
-  f.runner.write(legacy);
+  const sealed = f.runner.load(f.id);
+  sealed.body = JSON.stringify(JSON.parse(sealed.body), null, 2) + "\n";
+  f.runner.write(sealed);
   f.advance(5000);
-  f.runner.seal(legacy, "error", "Must never replace sealed text");
+  f.runner.seal(sealed, "error", "Must never replace sealed text");
   await f.runner.execute(f.id);
   await f.runner.deliver(f.runner.load(f.id));
   const summary = f.runner.result(f.id);
-  assert.deepEqual(bodies, [legacy.body]);
-  assert.equal(f.runner.load(f.id).body, legacy.body);
+  assert.deepEqual(bodies, [sealed.body]);
+  assert.equal(f.runner.load(f.id).body, sealed.body);
   assert.equal(summary.output, "Done ✓");
-  assert.equal(summary.timing.accepted_at, null);
-  assert.equal(summary.timing.started_at, null);
-  assert.equal(summary.timing.terminal_at, null);
+  assert.equal(summary.timing.accepted_at, 1000);
+  assert.equal(summary.timing.started_at, 1000);
+  assert.equal(summary.timing.terminal_at, 1000);
   assert.equal(summary.timing.callback_attempted_at, 6000);
   assert.equal(summary.timing.callback_delivered_at, 6000);
   assert.equal(f.executions(), 1);
@@ -422,6 +402,7 @@ test("lost receipt and restart retry identical bytes without executing again; Re
 test("submit replay dedupes locally and changed payload conflicts", async (t) => {
   const f = fixture(t);
   const replay = f.runner.submit({
+    ...f.intent,
     key: "local-submit-key",
     cwd: f.root,
     prompt: "Perform the task.",
@@ -432,6 +413,7 @@ test("submit replay dedupes locally and changed payload conflicts", async (t) =>
   assert.throws(
     () =>
       f.runner.submit({
+        ...f.intent,
         key: "local-submit-key",
         cwd: f.root,
         prompt: "Changed",
@@ -447,6 +429,7 @@ test("submit replay dedupes locally and changed payload conflicts", async (t) =>
 test("permissions and shared cwd/session are immutable submit identity", async (t) => {
   const f = fixture(t);
   const common = {
+    ...f.intent,
     key: "authorized-run",
     cwd: f.root,
     prompt: "Perform authorized edits.",
@@ -491,9 +474,9 @@ test("permissions and shared cwd/session are immutable submit identity", async (
   );
 });
 
-test("model intent binds dedupe/session and survives recovery; old records stay readable", async (t) => {
+test("model intent binds dedupe/session and survives recovery", async (t) => {
   const f = fixture(t);
-  const common = { key: 'model-intent', prompt: 'Perform the task.', cwd: f.root, callback,
+  const common = { ...f.intent, key: 'model-intent', prompt: 'Perform the task.', cwd: f.root, callback,
     model: { id: 'copilot/gpt-6-astra', variant: 'high' }, modelConfig: path.join(f.root, 'immutable.json') };
   const accepted = f.runner.submit(common);
   assert.deepEqual(f.runner.submit(common), accepted);
@@ -523,17 +506,6 @@ test("model intent binds dedupe/session and survives recovery; old records stay 
   assert.deepEqual(recovered.load(accepted.task_id), completed);
   assert.equal(f.executions(), 0);
   assert.deepEqual(recovered.load(named.task_id).model, common.model);
-  // The original fixture record has no selection fields or new fingerprint inputs.
-  const legacy = f.runner.load(f.id);
-  assert.equal(legacy.model, undefined);
-  await recovered.execute(f.id);
-  assert.equal(recovered.load(f.id).model, undefined);
-  f.runner.submit({ key: 'legacy-session', prompt: 'old request', cwd: f.root, callback, session: 'legacy' });
-  const sessionFile = fs.readdirSync(path.join(f.root, '.sessions')).filter((name) => name !== 'owner.json')
-    .map((name) => path.join(f.root, '.sessions', name)).find((file) => JSON.parse(fs.readFileSync(file, 'utf8')).name === 'legacy');
-  const before = fs.readFileSync(sessionFile);
-  assert.throws(() => f.runner.submit({ ...common, key: 'no-adoption', session: 'legacy' }), /SESSION_MODEL_CONFLICT/);
-  assert.deepEqual(fs.readFileSync(sessionFile), before);
 });
 
 test("cancellation targets only the stored request; mismatched handles fail closed", async (t) => {
@@ -616,7 +588,7 @@ test("journal recovery matches original requestId and saves output with cursor; 
   assert.equal(f.executions(), 0);
 });
 
-test("uncertain dispatch remains explicit; resolve seals only verified operator output", async (t) => {
+test("uncertain dispatch stays ambiguous and never replays the prompt", async (t) => {
   const f = fixture(t);
   f.runtime.startTurn = () => {
     throw new Error("uncertain");
@@ -625,14 +597,7 @@ test("uncertain dispatch remains explicit; resolve seals only verified operator 
   assert.equal(f.runner.status(f.id).state, "ambiguous");
   await f.runner.execute(f.id);
   assert.equal(f.runner.status(f.id).state, "ambiguous");
-  f.runner.resolve(f.id, "error", "Verified interrupted result");
-  assert.equal(f.runner.status(f.id).state, "outbox");
-  assert.equal(f.runner.result(f.id).evidence.terminal_source, "operator_resolution");
-  assert.equal(f.runner.result(f.id).evidence.output_source, "operator_verified");
-  assert.throws(
-    () => f.runner.resolve(f.id, "success", "different"),
-    /TASK_NOT_AMBIGUOUS/,
-  );
+  assert.equal(f.runner.result(f.id).result_status, null);
 });
 
 test("cancel queued task never dispatches; bounded UTF-8 output and input guards", async (t) => {
@@ -652,6 +617,7 @@ test("cancel queued task never dispatches; bounded UTF-8 output and input guards
   assert.throws(
     () =>
       f.runner.submit({
+        ...f.intent,
         key: "other",
         cwd: f.root,
         prompt: callback.callback_id,
@@ -776,7 +742,6 @@ test("matching original journal entry cannot disable liveness discovery; unknown
     assert.equal(f.executions(), 0);
     assert.equal(f.runner.load(f.id).body, bodies[0]);
     assert.equal(f.runner.pending().length, 0);
-    assert.throws(() => f.runner.resolve(f.id, "success", "different"), /TASK_NOT_AMBIGUOUS/);
   });
 
 for (const kind of ["silent", "tool", "retry"]) {
@@ -1051,7 +1016,7 @@ for (const restarted of [false, true]) {
   });
 }
 
-test("health configuration rejects invalid bounds and legacy health stays unknown", (t) => {
+test("health configuration rejects invalid bounds and an unobserved task has no health sample", (t) => {
   assert.deepEqual(healthPolicy(), HEALTH_DEFAULTS);
   assert.throws(() => healthPolicy({ OPENCODE_TASK_WORKER_MS: "100" }), /INVALID_TASK_HEALTH_POLICY/);
   assert.throws(() => healthPolicy({ OPENCODE_TASK_POLL_MS: "NaN" }), /INVALID_TASK_HEALTH_POLICY/);

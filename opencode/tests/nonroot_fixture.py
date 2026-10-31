@@ -82,7 +82,10 @@ def main(work, node, pvc):
             task = tasks / task_id
             task.mkdir(mode=0o700)
             record = task / 'task.json'
-            record.write_text(json.dumps({'version': 1, 'id': task_id, 'requestId': 'old-request',
+            record.write_text(json.dumps({'version': 1, 'id': task_id, 'requestId': 'fixture-request',
+                'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
+                'modelConfig': str(root / 'runtime/fixture-config.json'), 'modelProfile': 'env',
+                'permissions': {'mode': 'deny-all', 'policy': {}}, 'createdAt': 1000, 'outputTruncated': False,
                 'state': 'outbox', 'callback': {'callback_id': 'tcb_' + 'q' * 43,
                 'callback_url': f'http://127.0.0.1:{server.server_port}/api/agents/task-callbacks'},
                 'body': json.dumps({'version': 1, 'callback_id': 'tcb_' + 'q' * 43,

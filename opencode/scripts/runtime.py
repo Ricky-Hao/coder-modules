@@ -22,13 +22,17 @@ RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_S
             'OPENCODE_MODULE_MONITOR_PID', 'OPENCODE_MODULE_TASK_LOCKS', 'OPENCODE_MODULE_LAUNCH_LOCK'}
 
 
-def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None, submit=False):
+def filtered_environment(environ, preserve=()):
+    # 回调不进入模型环境。
+    return {k: value for k, value in environ.items() if k not in RESERVED - set(preserve)
+            and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
+            and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
+
+
+def environment(environ, root, profile='none', workspace_id=None, arguments=(), task=None):
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
-    # 回调不进入模型环境。
-    child = {k: value for k, value in environ.items() if k not in RESERVED
-             and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
-             and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
+    child = filtered_environment(environ)
     state = root / 'runtime'
     child.setdefault('PATH', '/usr/bin:/bin')
     child.update({'HOME': str(state / 'home'),
@@ -36,55 +40,34 @@ def environment(environ, root, profile='none', workspace_id=None, arguments=(), 
                   'XDG_CACHE_HOME': str(state / 'cache'), 'XDG_STATE_HOME': str(state / 'state'),
                   'TMPDIR': str(state / 'tmp'), 'OPENCODE_CONFIG_DIR': str(state / 'config/opencode'),
                   'OPENCODE_DISABLE_AUTOUPDATE': 'true'})
-    config_path = task.get('modelConfig') if task else child.get('OPENCODE_MODULE_CONFIG')
+    config_path = task['modelConfig'] if task else child.get('OPENCODE_MODULE_CONFIG')
     model = task.get('model') if task else None
-    model_profile = task['modelProfile'] if task else 'env' if profile == 'env' and not config_path else 'external'
-    model_flag = arguments[arguments.index('--model') + 1] if submit and '--model' in arguments else None
-    variant_flag = arguments[arguments.index('--variant') + 1] if submit and '--variant' in arguments else None
     if profiles.harmless(list(arguments)):
         return child
     config = None
     if config_path:
-        # No interpolation or file generation. Secrets must remain {env:NAME} references.
+        # 不展开秘密；配置只保留 {env:NAME} 引用。
         path = Path(config_path).absolute()
         config = json.loads(path.read_text())
         child['OPENCODE_CONFIG'] = str(path)
     elif profile == 'env':
-        provider = (model['id'] if model else model_flag or 'codex/').split('/', 1)[0]
-        config = profiles.configuration(child, VERSION, provider)
-    if task and model_profile == 'env':
-        # A saved task config is external to discovery but still uses the bundled env contract.
+        config = profiles.configuration(child, VERSION)
+    if task and task['modelProfile'] == 'env':
+        # 快照位于自动发现目录外；仍校验该任务的 env 契约。
         profiles.configuration(child, VERSION, model['id'].split('/', 1)[0])
-    if submit and config is not None:
-        model = profiles.task_configuration(config, model_flag, variant_flag)
-    elif submit and (model_flag is not None or variant_flag is not None):
-        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
-    if config is not None and (submit or not config_path):
+    if config is not None and not config_path:
         child['OPENCODE_CONFIG'] = str(profiles.materialize(root, workspace_id, config))
     if model is not None:
         if profiles.selection(config['model']) != model:
             raise ValueError('TASK_MODEL_CONFIG_CONFLICT')
-        child['OPENCODE_MODULE_TASK_SELECTION'] = json.dumps(model, sort_keys=True)
-        child['OPENCODE_MODULE_TASK_CONFIG'] = child['OPENCODE_CONFIG']
-        child['OPENCODE_MODULE_TASK_PROFILE'] = model_profile
     if config is not None:
-        selected = config.get('model')
-        if selected is not None:
-            # An explicit model without a variant must not inherit a stale variant.
+        if config.get('model') is not None:
+            selected = profiles.selection(config['model'])
+            # 显式模型不能继承环境中残留的 variant。
             child.pop('OPENCODE_ACP_REQUIRED_VARIANT', None)
-        if isinstance(selected, str):
-            target, separator, variant = selected.partition('#')
-            child['OPENCODE_ACP_REQUIRED_MODEL'] = target
-            if separator:
-                if not variant or '#' in variant:
-                    raise ValueError('invalid configured model variant')
-                child['OPENCODE_ACP_REQUIRED_VARIANT'] = variant
-        elif isinstance(selected, dict):
-            child['OPENCODE_ACP_REQUIRED_MODEL'] = selected['providerID'] + '/' + selected['model']
+            child['OPENCODE_ACP_REQUIRED_MODEL'] = selected['id']
             if selected.get('variant'):
                 child['OPENCODE_ACP_REQUIRED_VARIANT'] = selected['variant']
-        elif selected is not None:
-            raise ValueError('invalid configured model selection')
     target = child.get('OPENCODE_ACP_REQUIRED_MODEL')
     if target and not re.fullmatch(r'[^/\s]+/\S+', target):
         raise ValueError('invalid explicit provider/model target')
@@ -104,10 +87,9 @@ def acpx_arguments(arguments):
     return [*defaults, *arguments]
 
 
-def launch_selection(settings):
-    """从 stdio 解析选择；复用 profile 校验与快照，不读取任务业务输入。"""
-    request = json.loads(sys.stdin.buffer.read(65537))
-    source = dict(os.environ)
+def launch_selection(settings, request):
+    """解析非秘密选择，复用 profile 校验与快照。"""
+    source = filtered_environment(os.environ)
     saved = request.get('saved')
     if saved:
         regular(Path(saved['modelConfig']))
@@ -119,25 +101,19 @@ def launch_selection(settings):
         config = json.loads((VERSION / 'profile-env.json').read_text())
     else:
         raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    profile = saved['modelProfile'] if saved else 'external' if config_path else 'env'
     default = saved['model'] if saved else profiles.selection(config.get('model'))
     provider, model = default['id'].split('/', 1)
     target = request.get('provider', provider) + '/' + request.get('model', model)
     changed = target != default['id'] if saved else 'provider' in request or 'model' in request
-    arguments = ['submit']
-    if changed or saved:
-        arguments.extend(['--model', target])
     variant = request.get('variant', default.get('variant') if saved and not changed else None)
-    if variant is not None:
-        arguments.extend(['--variant', variant])
-    child = environment(source, Path(settings['install_root']), settings.get('runtime_profile', 'none'),
-                        settings['workspace_id'], arguments, submit=True)
-    if 'OPENCODE_MODULE_TASK_SELECTION' not in child:
-        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
-    if saved and saved['modelProfile'] == 'env':
-        profiles.configuration(child, VERSION, json.loads(child['OPENCODE_MODULE_TASK_SELECTION'])['id'].split('/', 1)[0])
-    print(json.dumps({'model': json.loads(child['OPENCODE_MODULE_TASK_SELECTION']),
-                      'modelConfig': child['OPENCODE_MODULE_TASK_CONFIG'],
-                      'modelProfile': saved['modelProfile'] if saved else child['OPENCODE_MODULE_TASK_PROFILE']}))
+    if profile == 'env':
+        current = profiles.configuration(source, VERSION, target.split('/', 1)[0])
+        if not saved:
+            config = current
+    model = profiles.task_configuration(config, target if changed or saved else None, variant)
+    snapshot = profiles.materialize(Path(settings['install_root']), settings['workspace_id'], config)
+    return {'model': model, 'modelConfig': str(snapshot), 'modelProfile': profile}
 
 
 def follow_monitor():
@@ -205,7 +181,7 @@ def main():
         return
     if tool == 'opencode-task' and arguments == ['_selection']:
         try:
-            launch_selection(settings)
+            print(json.dumps(launch_selection(settings, json.loads(sys.stdin.buffer.read(65537)))))
             return 0
         except (OSError, ValueError, KeyError, TypeError):
             print(json.dumps({'error': {'code': 'LAUNCH_SELECTION_INVALID'}}))
@@ -232,7 +208,7 @@ def main():
         finally:
             os.close(runtime_fd)
         lockpath = tasks / 'submit.lock'
-        if arguments[:1] in (['resolve'], ['_fail_launch']):
+        if arguments[:1] == ['_fail_launch']:
             if len(arguments) < 2 or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
                 raise ValueError('invalid task finalization')
             lockpath = directory(tasks / arguments[1]) / 'worker.lock'
@@ -254,22 +230,18 @@ def main():
                 follow_monitor()
             if arguments[0] != '_worker' or task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
                 task_arguments = ['--help']  # 被动观察免凭据。
-            elif task_state.get('model'):
+            else:
                 task = task_state
                 session_lock = tasks / ('.model-' + hashlib.sha256(task_state['sessionKey'].encode()).hexdigest() + '.lock')
-            elif profile == 'env' and not os.environ.get('OPENCODE_MODULE_CONFIG'):
-                # 旧记录不套用新模型默认。
-                print('TASK_MODEL_UNRECORDED: use the original installed launcher or original external config for this queued task.', file=sys.stderr)
-                raise SystemExit(1)
-        elif arguments[:1] != ['submit']:
+        else:
             task_arguments = ['--help']
-        if arguments[:1] in (['submit'], ['launch'], ['_worker'], ['_observe'], ['_supervise'], ['resolve'], ['_fail_launch']):
+        if arguments[:1] in (['launch'], ['_worker'], ['_observe'], ['_supervise'], ['_fail_launch']):
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
             if os.fstat(task_lock).st_mode & 0o077:
                 raise ValueError('task lock must be private')
             try:
-                fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] in (['submit'], ['launch']) else fcntl.LOCK_NB))
+                fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] == ['launch'] else fcntl.LOCK_NB))
             except BlockingIOError:
                 if arguments[:1] == ['_supervise']:
                     if arguments[2:] == ['--ready']:
@@ -289,17 +261,13 @@ def main():
     if tool == 'opencode-task' and arguments[:1] == ['launch']:
         # Git 沿调用者的 HOME/SSH/PATH；选择和 worker 再走各自的模块环境。
         caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
-        child = {k: v for k, v in os.environ.items() if k not in RESERVED - caller_paths
-                 and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
-                 and not re.search(r'tcb_[A-Za-z0-9_-]{43}', v)}
+        child = filtered_environment(os.environ, caller_paths)
         child['OPENCODE_MODULE_LAUNCH_LOCK'] = str(task_lock)
     else:
-        child = environment(os.environ, root, profile,
-                          settings['workspace_id'], task_arguments, task,
-                          submit=tool == 'opencode-task' and arguments[:1] == ['submit'])
+        child = environment(os.environ, root, profile, settings['workspace_id'], task_arguments, task)
     if selection_lock is not None:
         child['OPENCODE_MODULE_SESSION_LOCK'] = str(selection_lock)
-    if tool == 'opencode-task' and arguments[:1] in (['resolve'], ['_fail_launch']):
+    if tool == 'opencode-task' and arguments[:1] == ['_fail_launch']:
         child['OPENCODE_MODULE_TASK_LOCKS'] = json.dumps([task_lock, monitor_lock])
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')

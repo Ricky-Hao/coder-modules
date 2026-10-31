@@ -69,7 +69,6 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     const runtime = createSharedAcpRuntime({ cwd: base, permissionMode: "deny-all", nonInteractivePermissions: "deny", authPolicy: "skip",
       ttlMs: 1000, agentRegistry: createAgentRegistry({ overrides: { opencode: [process.env.OPENCODE_FIXTURE_BINARY, "acp"] } }) });
     runtime.observeOwner = ({ handle }) => observeOwner(handle.acpxRecordId);
-    runtime.journalAuthoritative = true;
     const watchSession = runtime.watchSession.bind(runtime);
     runtime.watchSession = async function* (options) {
       for await (const event of watchSession(options)) {
@@ -85,6 +84,7 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     let handle;
     try {
       const submit = (key, letter) => runner.submit({ key, cwd: base, prompt: "Synthetic fixture: answer one short sentence.", session: "original",
+        model: { id: 'codex/gpt-6.1-sol', variant: 'max' }, modelConfig: configFile, modelProfile: 'external',
         callback: { callback_id: `tcb_${letter.repeat(43)}`, callback_url: endpoint + "/api/agents/task-callbacks" } }).task_id;
       const failed = submit("failed-response", "f");
       await runner.execute(failed);

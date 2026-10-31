@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-let TaskRunner, deliveryState, healthPolicy, privateFile, within;
+let TaskRunner, healthPolicy, within;
 let launchDriver, supervise, workerHeartbeat, inspectTask, listTasks, readError, readJson;
 
 const version = path.dirname(fileURLToPath(import.meta.url));
@@ -11,7 +11,6 @@ let root, loaded = false;
 const args = process.argv.slice(2);
 const command = args.shift();
 const allowed = new Set([
-  "submit",
   "launch",
   "status",
   "result",
@@ -19,7 +18,6 @@ const allowed = new Set([
   "inspect",
   "cancel",
   "recover",
-  "resolve",
   "_worker",
   "_observe",
   "_supervise",
@@ -27,7 +25,7 @@ const allowed = new Set([
 ]);
 const help =
   "opencode-task launch --input-file PRIVATE_JSON [--continue-from TASK_ID]\n" +
-  "opencode-task submit --key KEY --prompt-file FILE [OPTIONS]\nopencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task inspect TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20] [--scan-limit 100] [--cursor CURSOR]\nopencode-task doctor [--quick]\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\nopencode-task resolve TASK_ID --status success|error|cancelled --output-file FILE\nlist/inspect/doctor 只读，inspect 无 output。list 上限 50/200。doctor 默认完整校验；--quick 不读二进制内容/哈希。提交选项及完整边界见 TASKS.md；权限覆盖须已有授权。";
+  "opencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task inspect TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20] [--scan-limit 100] [--cursor CURSOR]\nopencode-task doctor [--quick]\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\nlist/inspect/doctor 只读，inspect 无 output。list 上限 50/200。doctor 默认完整校验；--quick 不读二进制内容/哈希。完整边界见 TASKS.md；权限覆盖须已有授权。";
 
 async function spawnWorker(id, action = "_supervise") {
   const child = spawn("python3", ["-B", path.join(version, "runtime.py"), "opencode-task", action, id, "--ready"], {
@@ -62,33 +60,6 @@ function options(values, names) {
   }
   return result;
 }
-function readBounded(filename, max, privateOnly = false) {
-  if (privateOnly) privateFile(filename);
-  const fd =
-    filename === null
-      ? 0
-      : fs.openSync(filename, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-  try {
-    const buffer = Buffer.alloc(max + 1);
-    let count = 0;
-    while (count < buffer.length) {
-      const received = fs.readSync(
-        fd,
-        buffer,
-        count,
-        buffer.length - count,
-        null,
-      );
-      if (!received) break;
-      count += received;
-    }
-    if (count > max) throw new Error("INPUT_TOO_LARGE");
-    return buffer.subarray(0, count).toString("utf8");
-  } finally {
-    if (fd !== 0) fs.closeSync(fd);
-  }
-}
-
 async function main() {
   if (["--help", "help", undefined].includes(command)) {
     console.log(help);
@@ -113,58 +84,12 @@ async function main() {
       const value = await launchTask(runner, options(args, ["--input-file", "--continue-from"]), { version, spawnWorker });
       console.log(JSON.stringify(value));
       if (value.error) process.exitCode = 1;
-    } else if (command === "submit") {
-      const flags = options(args, [
-        "--key",
-        "--prompt-file",
-        "--callback-file",
-        "--session",
-        "--model",
-        "--variant",
-        "--permission-mode",
-        "--permission-policy-file",
-      ]);
-      if (!flags["--key"] || !flags["--prompt-file"])
-        throw new Error("INVALID_ARGUMENTS");
-      const prompt = readBounded(flags["--prompt-file"], 1048576);
-      const callback = JSON.parse(
-        readBounded(
-          flags["--callback-file"] ?? null,
-          4096,
-          Boolean(flags["--callback-file"]),
-        ),
-      );
-      const accepted = runner.submit({
-        key: flags["--key"],
-        prompt,
-        cwd: process.cwd(),
-        callback,
-        session: flags["--session"],
-        model: process.env.OPENCODE_MODULE_TASK_SELECTION
-          ? JSON.parse(process.env.OPENCODE_MODULE_TASK_SELECTION) : undefined,
-        modelConfig: process.env.OPENCODE_MODULE_TASK_CONFIG,
-        modelProfile: process.env.OPENCODE_MODULE_TASK_PROFILE,
-        permissionMode: flags["--permission-mode"],
-        permissionPolicy: flags["--permission-policy-file"]
-          ? JSON.parse(
-              readBounded(flags["--permission-policy-file"], 32768, true),
-            )
-          : undefined,
-      });
-      if (!["delivered", "rejected"].includes(deliveryState(runner.load(accepted.task_id)))) {
-        try {
-          await spawnWorker(accepted.task_id);
-        } catch (error) {
-          await spawnWorker(accepted.task_id, "_fail_launch").catch(() => {});
-          throw error;
-        }
-      }
-      console.log(JSON.stringify(accepted));
     } else if (command === "recover") {
       if (args.length > 1) throw new Error("INVALID_ARGUMENTS");
-      const pending = args.length ? [args[0]] : runner.pending();
+      const unsupported = [];
+      const pending = args.length ? [args[0]] : runner.pending(unsupported);
       for (const id of pending) { runner.load(id); await spawnWorker(id); }
-      console.log(JSON.stringify({ version: 1, recovering: pending.length }));
+      console.log(JSON.stringify({ version: 1, recovering: pending.length, unsupported }));
     } else {
       const id = args.shift();
       if (["status", "result", "inspect"].includes(command)) {
@@ -192,10 +117,9 @@ async function main() {
       }
       if (["_worker", "_observe"].includes(command)) {
         await runner.execute(id, { observeOnly: command === "_observe" });
-        let record = runner.load(id);
+        const record = runner.load(id);
         if (record.state === "ambiguous" && !record.body) {
           runner.fail(record, record.executionError ?? "REQUEST_UNOBSERVABLE");
-          record = runner.load(id);
         }
         beat.close();
       } else if (command === "_fail_launch") {
@@ -203,26 +127,12 @@ async function main() {
         if (stored.state === "queued" && !stored.workerAttemptedAt && !stored.body) {
           runner.fail(stored, "SUPERVISOR_START_FAILED");
         }
-        // Keep monitor.lock through retries; worker.lock is no longer needed after sealing.
+        // 重试期间保留 monitor.lock；封存后释放 worker.lock。
         const [workerLock] = JSON.parse(process.env.OPENCODE_MODULE_TASK_LOCKS);
         fs.closeSync(workerLock);
         delete process.env.OPENCODE_MODULE_TASK_LOCKS;
         if (args[0] === "--ready") fs.writeSync(3, "ready\n");
         await supervise(runner, id, (action, taskId, token) => launchDriver(version, taskId, token, action));
-      } else if (command === "resolve") {
-        const flags = options(args, ["--status", "--output-file"]);
-        if (!flags["--status"] || !flags["--output-file"])
-          throw new Error("INVALID_ARGUMENTS");
-        runner.resolve(
-          id,
-          flags["--status"],
-          readBounded(flags["--output-file"], 32768),
-        );
-        // 交给 monitor 前释放两把锁。
-        for (const lock of JSON.parse(process.env.OPENCODE_MODULE_TASK_LOCKS ?? "[]")) fs.closeSync(lock);
-        delete process.env.OPENCODE_MODULE_TASK_LOCKS;
-        await spawnWorker(id);
-        console.log(JSON.stringify(runner.status(id)));
       } else if (command !== "_supervise") {
         if (args.length) throw new Error("INVALID_ARGUMENTS");
         if (command === "cancel") {
@@ -243,7 +153,7 @@ async function main() {
 
 try {
   ({ inspectTask, listTasks, readError, readJson } = await import("./task-read.mjs"));
-  ({ TaskRunner, deliveryState, healthPolicy, privateFile, within } = await import("./task.mjs"));
+  ({ TaskRunner, healthPolicy, within } = await import("./task.mjs"));
   ({ launchDriver, supervise, workerHeartbeat } = await import("./task-supervisor.mjs"));
   loaded = true;
   await main();
