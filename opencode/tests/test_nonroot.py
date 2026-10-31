@@ -6,9 +6,10 @@ import subprocess
 import tempfile
 import unittest
 
+NODE = os.environ.get('NODE_FIXTURE_BINARY') or shutil.which('node')
 
 class NonrootTests(unittest.TestCase):
-    @unittest.skipUnless(os.getuid() == 0 and shutil.which('node'), '需要 root 降权及已有 Node，不下载工具')
+    @unittest.skipUnless(os.getuid() == 0 and NODE, '需要 root 降权及已有 Node，不下载工具')
     def test_nonroot_startup_cache_pvc_and_readonly_commands(self):
         module = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='opencode-nonroot-', dir='/tmp') as temporary:
@@ -19,7 +20,7 @@ class NonrootTests(unittest.TestCase):
             for file in source.rglob('*'):
                 file.chmod(0o755 if file.is_dir() else 0o644)
             node = base / 'node'
-            shutil.copyfile(shutil.which('node'), node)
+            shutil.copyfile(NODE, node)
             node.chmod(0o755)
             work = base / 'work'
             work.mkdir(mode=0o700)

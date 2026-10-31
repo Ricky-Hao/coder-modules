@@ -1,53 +1,9 @@
 /** 仅供隔离 CLI 夹具：独立采样短暂状态，清理时等待自有出生身份停止写入。 */
 import fs from "node:fs";
 import path from "node:path";
-import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-if (!isMainThread && workerData?.kind === "health-witness") {
-  let suspected;
-  let resumed = false;
-  const timer = setInterval(() => {
-    if (!fs.existsSync(workerData.taskFile)) return;
-    const record = JSON.parse(fs.readFileSync(workerData.taskFile, "utf8"));
-    const snapshot = { state: record.state, requestId: record.requestId, health: record.health,
-      sessionId: record.handle?.backendSessionId, bodyPresent: Boolean(record.body),
-      assistantOutput: Boolean(record.output), at: Date.now() };
-    if (suspected === undefined && record.health?.assessment === "suspected" &&
-        record.health.suspectedReason === "PROGRESS_UNCONFIRMED") {
-      suspected = record.health.eventSequence;
-      parentPort.postMessage({ type: "suspected", snapshot });
-      if (workerData.resumeDirectory) {
-        const evidence = path.join(workerData.resumeDirectory, `${snapshot.sessionId}.suspected.json`);
-        fs.writeFileSync(evidence + ".tmp", JSON.stringify({ suspectedAt: snapshot.health.suspectedAt }));
-        fs.renameSync(evidence + ".tmp", evidence);
-        fs.writeFileSync(path.join(workerData.resumeDirectory, snapshot.sessionId), "resume synthetic thought");
-      }
-    } else if (suspected !== undefined && !resumed && record.health?.assessment === "observing" &&
-        record.health.eventSequence > suspected) {
-      resumed = true;
-      parentPort.postMessage({ type: "resumed", snapshot });
-    }
-    if (record.body) {
-      parentPort.postMessage({ type: "sealed", snapshot });
-      clearInterval(timer);
-      parentPort.close();
-    }
-  }, 10);
-  parentPort.postMessage({ type: "ready" });
-}
-
-export async function startHealthWitness(taskFile, resumeDirectory) {
-  const events = {};
-  const worker = new Worker(new URL(import.meta.url), { workerData: { kind: "health-witness", taskFile, resumeDirectory } });
-  await new Promise((resolve, reject) => {
-    worker.on("message", ({ type, snapshot }) => { events[type] = snapshot ?? true; if (type === "ready") resolve(); });
-    worker.on("error", (error) => { events.error = error.message; reject(error); });
-    worker.on("exit", (code) => { if (code) events.error ??= `health witness exit ${code}`; });
-  });
-  return { events, close: () => worker.terminate() };
-}
 
 export function processBirth(pid) {
   try {
@@ -70,7 +26,7 @@ const spawn = (...args) => {
   if (child.pid) {
     try {
       const ticks = fixtureFs.readFileSync('/proc/' + child.pid + '/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19];
-      const role = args[1]?.find((arg) => ['_worker', '_observe', '_supervise', '_fail_launch'].includes(arg)) ?? 'spawned';
+      const role = args[1]?.find((arg) => arg === '_run') ?? 'spawned';
       const taskId = args[1]?.find((arg) => /^task_[a-f0-9]{64}$/.test(arg));
       fixtureFs.appendFileSync(${JSON.stringify(filename)}, JSON.stringify({ pid: child.pid, ticks, role, taskId }) + '\\n');
     } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code)) throw error; }
@@ -156,9 +112,8 @@ export async function stopFixtureProcesses(base, version) {
   const errors = [];
   const attempt = async (action) => { try { return await action(); } catch (error) { errors.push(error); } };
   const spawning = await attempt(() => descendants(drivers())) ?? [];
-  await attempt(() => stop(drivers().filter(({ role }) => ["_supervise", "_fail_launch"].includes(role))));
-  // monitor 已退出，不能再出生替换 worker；重新读取清单，覆盖 _observe 及失败启动。
-  await attempt(() => stop([...spawning, ...descendants(drivers()), ...drivers()]));
+  // 已无替换 worker；一次等待停止全部自有控制进程，再处理 acpx owner/agent。
+  await attempt(() => stop([...spawning, ...drivers()]));
   const peers = () => readLines(path.join(base, "processes"));
   const queues = path.join(base, "toolset/runtime/home/.acpx/queues");
   const leases = await attempt(() => fs.existsSync(queues) ? fs.readdirSync(queues).filter((name) => name.endsWith(".lock")).map((name) =>

@@ -9,7 +9,8 @@ import {
   createAgentRegistry,
 } from "../scripts/node_modules/acpx/dist/runtime.js";
 import { TaskRunner } from "../scripts/task.mjs";
-import { observeOwner } from "../scripts/task-acp.mjs";
+import { createTaskRuntime } from "../scripts/task-acp.mjs";
+import net from "node:net";
 import { createHash } from "node:crypto";
 
 test(
@@ -60,7 +61,7 @@ test(
       );
       const record = runner.load(accepted.task_id);
       handle = record.handle;
-      assert.equal(record.state, "outbox");
+      assert.equal(record.state, "completed");
       assert.equal(JSON.parse(record.body).output, "Pinned ACP result");
       await first.shutdown();
       second = createSharedAcpRuntime(options);
@@ -115,15 +116,14 @@ test(
           .split("\n").length,
         2,
       );
-      second.observeOwner = ({ handle }) => observeOwner(handle.acpxRecordId);
       const slowRunner = new TaskRunner({ root: taskRoot, runtime: second,
-        policy: { ...runner.policy, pollMs: 100, discoveryMs: 5000, probeMs: 500, confirmMs: 200, progressMs: 500, toolMs: 5000 } });
+        pollMs: 100, noProgressMs: 5000 });
       const slow = slowRunner.submit({ model: { id: 'fixture/test' }, modelConfig: path.join(base, 'config.json'), modelProfile: 'external',
         key: 'real-slow-tool', cwd: base, prompt: 'long tool', callback: {
         callback_id: `tcb_${'a'.repeat(43)}`, callback_url: 'http://127.0.0.1:1/api/agents/task-callbacks' } });
       await slowRunner.execute(slow.task_id);
       const slowRecord = slowRunner.load(slow.task_id);
-      assert.equal(slowRecord.state, 'outbox', JSON.stringify({ health: slowRecord.health, error: slowRecord.executionError }));
+      assert.equal(slowRecord.state, 'completed');
       assert.equal(slowRunner.result(slow.task_id).output, 'Slow tool completed');
       await second.close({ handle: slowRecord.handle, reason: 'slow fixture cleanup' });
     } finally {
@@ -138,8 +138,8 @@ test(
   },
 );
 
-test('owner observation is read-only, rejects stale heartbeat and reused PID birth identity', async () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'owner-proof-'));
+test('pinned cancel adapter checks socket and generation, only sends target request and leaves owner bytes unchanged', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cancel-proof-'));
   const previous = process.env.HOME;
   process.env.HOME = base;
   try {
@@ -150,24 +150,40 @@ test('owner observation is read-only, rejects stale heartbeat and reused PID bir
     const startTicks = fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\s+/)[19];
     const proof = { kind: 'linux-proc', bootId: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
       pidNamespace: fs.readlinkSync('/proc/self/ns/pid'), timeNamespace: fs.readlinkSync('/proc/self/ns/time'), startTicks };
+    const digest = (text, length) => createHash('sha256').update(text).digest('hex').slice(0, length);
+    const socketDir = `/tmp/acpx-${digest(base, 10)}`;
+    fs.mkdirSync(socketDir, { mode: 0o700 });
+    const socketPath = `${socketDir}/${digest(recordId, 24)}.sock`;
     const owner = { sessionId: recordId, pid: process.pid, ownerGeneration: 1, queueDepth: 0,
       createdAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(),
-      socketPath: '/synthetic/no-socket', processIdentity: proof };
-    const inspect = async (value) => {
-      fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
-      const before = fs.readFileSync(file);
-      const observed = await observeOwner(recordId);
+      socketPath, processIdentity: proof };
+    fs.writeFileSync(file, JSON.stringify(owner), { mode: 0o600 });
+    const before = fs.readFileSync(file), received = [];
+    let generation = 1;
+    const server = net.createServer((socket) => socket.on('data', (data) => {
+      const message = JSON.parse(data.toString()); received.push(message);
+      socket.end(JSON.stringify({ type: 'cancel_result', requestId: message.requestId, ownerGeneration: generation, cancelled: true }) + '\n');
+    }));
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    const config = path.join(base, 'config.json'); fs.writeFileSync(config, '{}', { mode: 0o600 });
+    const record = { cwd: base, sessionKey: 'cancel-session', requestId: 'original-request', permissions: { mode: 'deny-all', policy: {} },
+      model: { id: 'fixture/test' }, modelConfig: config, modelProfile: 'external' };
+    const runtime = createTaskRuntime(base, record);
+    const handle = { backend: 'acpx-shared', cwd: base, sessionKey: record.sessionKey, acpxRecordId: recordId };
+    try {
+      assert.equal(await runtime.cancelRequest({ handle, requestId: record.requestId }), true);
+      generation = 2;
+      await assert.rejects(runtime.cancelRequest({ handle, requestId: record.requestId }), /CANCEL_UNCONFIRMED/);
+      await assert.rejects(runtime.cancelRequest({ handle, requestId: 'someone-else' }), /SESSION_IDENTITY_CONFLICT/);
+      fs.writeFileSync(file, JSON.stringify({ ...owner, socketPath: '/untrusted/socket' }));
+      await assert.rejects(runtime.cancelRequest({ handle, requestId: record.requestId }), /UNSAFE_OWNER_SOCKET/);
+      fs.writeFileSync(file, before);
+      assert.equal(received.length, 2);
+      assert.ok(received.every((value) => value.type === 'cancel_prompt' && value.targetRequestId === record.requestId));
       assert.deepEqual(fs.readFileSync(file), before);
-      return observed;
-    };
-    assert.equal((await inspect(owner)).owner, 'lease_current');
-    assert.equal((await inspect({ ...owner, heartbeatAt: new Date(Date.now() - 60000).toISOString() })).owner, 'unavailable');
-    assert.equal((await inspect({ ...owner, heartbeatAt: new Date(Date.now() + 60000).toISOString() })).owner, 'unavailable');
-    const reused = await inspect({ ...owner, processIdentity: { ...proof, startTicks: String(BigInt(startTicks) + 1n) } });
-    assert.equal(reused.process, 'gone');
-    assert.equal(reused.owner, 'unavailable');
-    const foreign = await inspect({ ...owner, processIdentity: { ...proof, pidNamespace: 'pid:[1]' } });
-    assert.equal(foreign.process, 'unknown');
+    } finally {
+      await runtime.shutdown(); await new Promise((resolve) => server.close(resolve)); fs.rmSync(socketDir, { recursive: true });
+    }
   } finally {
     if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous;
     fs.rmSync(base, { recursive: true, force: true });

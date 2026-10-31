@@ -6,8 +6,6 @@ from pathlib import Path
 import re
 import sys
 import fcntl
-import hashlib
-import signal
 
 # 固定本次版本。
 VERSION = Path(__file__).resolve().parent
@@ -17,14 +15,13 @@ import profiles
 
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
-            'OPENCODE_DISABLE_AUTOUPDATE', 'OPENCODE_MODULE_TASK_SELECTION',
-            'OPENCODE_MODULE_TASK_CONFIG', 'OPENCODE_MODULE_TASK_PROFILE', 'OPENCODE_MODULE_SESSION_LOCK',
-            'OPENCODE_MODULE_MONITOR_PID', 'OPENCODE_MODULE_TASK_LOCKS', 'OPENCODE_MODULE_LAUNCH_LOCK'}
+            'OPENCODE_DISABLE_AUTOUPDATE'}
 
 
 def filtered_environment(environ, preserve=()):
     # 回调不进入模型环境。
     return {k: value for k, value in environ.items() if k not in RESERVED - set(preserve)
+            and (not k.startswith('OPENCODE_MODULE_') or k == 'OPENCODE_MODULE_CONFIG' or k in preserve)
             and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
             and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
 
@@ -116,22 +113,10 @@ def launch_selection(settings, request):
     return {'model': model, 'modelConfig': str(snapshot), 'modelProfile': profile}
 
 
-def follow_monitor():
-    # Linux clears PDEATHSIG on fork: an acpx owner survives its replaceable driver.
-    # Set it before any blocking lock/setup, and close the parent-exit race.
-    import ctypes
-    parent = os.getppid()
-    expected = int(os.environ.get('OPENCODE_MODULE_MONITOR_PID', parent))
-    if parent != expected or parent == 1 or ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
-        raise ValueError('task monitor unavailable')
-    if os.getppid() != parent:
-        raise SystemExit(1)
-
-
 def main():
     os.umask(0o077)
     tool, arguments = sys.argv[1], sys.argv[2:]
-    readonly = tool == 'opencode-task' and (arguments[:1] in (['list'], ['inspect'], ['status'], ['result'], ['doctor'])
+    readonly = tool == 'opencode-task' and (arguments[:1] in (['list'], ['status'], ['result'], ['doctor'])
                                            or not arguments or arguments == ['help'] or profiles.harmless(arguments))
     if readonly:
         from diagnostics import ReadError, doctor, error_code, read_json, task_root
@@ -144,7 +129,7 @@ def main():
                 return 0 if value['ok'] else 1
             if arguments[:1] == ['doctor']:
                 raise ReadError('INVALID_ARGUMENTS')
-            if arguments[:1] in (['list'], ['inspect'], ['status'], ['result']):
+            if arguments[:1] in (['list'], ['status'], ['result']):
                 task_root(root, settings)
             # 查询没有初始化、锁文件或 profile materialize；Node 只运行命令投影。
             binary = VERSION / 'node/bin/node'
@@ -187,7 +172,6 @@ def main():
             print(json.dumps({'error': {'code': 'LAUNCH_SELECTION_INVALID'}}))
             return 1
     task_arguments = arguments
-    session_lock = None
     if tool == 'opencode-task':
         tasks = root / 'runtime/tasks'
         # 锁覆盖 owner 创建与 submit 去重。
@@ -208,34 +192,14 @@ def main():
         finally:
             os.close(runtime_fd)
         lockpath = tasks / 'submit.lock'
-        if arguments[:1] == ['_fail_launch']:
+        if arguments[:1] == ['_run']:
             if len(arguments) < 2 or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
-                raise ValueError('invalid task finalization')
-            lockpath = directory(tasks / arguments[1]) / 'worker.lock'
-            monitor_path = tasks / arguments[1] / 'monitor.lock'
-            monitor_lock = os.open(monitor_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            regular(monitor_path)
-            if os.fstat(monitor_lock).st_mode & 0o077:
-                raise ValueError('task lock must be private')
-            fcntl.flock(monitor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            os.set_inheritable(monitor_lock, True)
-        if arguments[:1] in (['_worker'], ['_observe'], ['_supervise']):
-            if len(arguments) not in (2, 3) or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
-                raise ValueError('invalid task worker')
+                raise ValueError('invalid task control')
             task_dir = directory(tasks / arguments[1])
-            lockpath = task_dir / ('monitor.lock' if arguments[0] == '_supervise' else 'worker.lock')
+            lockpath = task_dir / 'control.lock'
             regular(task_dir / 'task.json')
-            task_state = json.loads((task_dir / 'task.json').read_text())
-            if arguments[0] != '_supervise':
-                follow_monitor()
-            if arguments[0] != '_worker' or task_state['state'] != 'queued' or os.path.lexists(task_dir / 'cancel.json'):
-                task_arguments = ['--help']  # 被动观察免凭据。
-            else:
-                task = task_state
-                session_lock = tasks / ('.model-' + hashlib.sha256(task_state['sessionKey'].encode()).hexdigest() + '.lock')
-        else:
-            task_arguments = ['--help']
-        if arguments[:1] in (['launch'], ['_worker'], ['_observe'], ['_supervise'], ['_fail_launch']):
+        task_arguments = ['--help']  # 控制/恢复免凭据；实际 agent 启动才校验已存选择的环境。
+        if arguments[:1] in (['launch'], ['_run']):
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
             if os.fstat(task_lock).st_mode & 0o077:
@@ -243,32 +207,19 @@ def main():
             try:
                 fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] == ['launch'] else fcntl.LOCK_NB))
             except BlockingIOError:
-                if arguments[:1] == ['_supervise']:
-                    if arguments[2:] == ['--ready']:
+                if arguments[:1] == ['_run']:
+                    if '--ready' in arguments[2:]:
                         os.write(3, b'ready\n')
                     return
-                if arguments[:1] in (['_worker'], ['_observe']):
-                    raise SystemExit(75)
                 raise
             os.set_inheritable(task_lock, True)
-    # 只锁初始化与选择。
-    selection_lock = None
-    if session_lock is not None:
-        selection_lock = os.open(session_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        regular(session_lock)
-        fcntl.flock(selection_lock, fcntl.LOCK_EX)
-        os.set_inheritable(selection_lock, True)
     if tool == 'opencode-task' and arguments[:1] == ['launch']:
-        # Git 沿调用者的 HOME/SSH/PATH；选择和 worker 再走各自的模块环境。
+        # Git 沿调用者的 HOME/SSH/PATH；选择和 agent 再走各自的模块环境。
         caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
         child = filtered_environment(os.environ, caller_paths)
         child['OPENCODE_MODULE_LAUNCH_LOCK'] = str(task_lock)
     else:
         child = environment(os.environ, root, profile, settings['workspace_id'], task_arguments, task)
-    if selection_lock is not None:
-        child['OPENCODE_MODULE_SESSION_LOCK'] = str(selection_lock)
-    if tool == 'opencode-task' and arguments[:1] == ['_fail_launch']:
-        child['OPENCODE_MODULE_TASK_LOCKS'] = json.dumps([task_lock, monitor_lock])
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')
     if tool == 'opencode':

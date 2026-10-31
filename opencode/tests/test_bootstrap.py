@@ -15,7 +15,7 @@ class BootstrapTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
 
-    def test_actual_exec_first_repeat_cache_and_private_task_recovery_startup(self):
+    def test_actual_exec_first_repeat_cache_preserves_tasks_without_automatic_recovery(self):
         fixture = self.fixture
         script = render(fixture.bundle)
         self.assertLessEqual(len(script.encode()), SCRIPT_BUDGET)
@@ -23,7 +23,7 @@ class BootstrapTests(unittest.TestCase):
         fixture_dir = fixture.base / 'execution'
         fixture.bundle['config']['install_root'] = str(fixture_dir / 'mount/toolset')
         result = verify_startup(render(fixture.bundle), fixture_dir)
-        self.assertEqual(result['startup_recover_invocations'], 2)
+        self.assertEqual(result['startup_recover_invocations'], 0)
 
     @unittest.skipUnless(os.sysconf('SC_PAGESIZE') == 4096, 'negative control requires the rollout kernel page size')
     def test_rollout_sized_single_argument_is_rejected_before_execution(self):

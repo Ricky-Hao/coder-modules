@@ -15,7 +15,7 @@ locals {
     release_sha256  = local.release.sha256
     runtime_profile = var.runtime_profile
   }
-  bundle_files = { for name in ["install.py", "runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-read.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs", "task-supervisor.mjs", "package.json", "package-lock.json"] :
+  bundle_files = { for name in ["install.py", "runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-read.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs", "package.json", "package-lock.json"] :
     name => file("${path.module}/scripts/${name}")
   }
   # 生成包只包含原始源码；动态设置单独传入，不要求安装者生成文件。
