@@ -385,7 +385,7 @@ is migrated or deleted.
 
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
-node --test opencode/tests/task.test.mjs
+node --test opencode/tests/task.test.mjs opencode/tests/task-supervisor.test.mjs
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/runtime.test.mjs
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs
@@ -431,17 +431,34 @@ confirm 800 毫秒；首次 POST 须在最后进展后的 1400～4600 毫秒内�
 时错过短暂状态。等待任务 handle 就绪及 peer 实际接收后，由阻塞子进程触发静默；记录真实阻塞起止，并核对怀疑发生在
 阻塞期间、阻塞结束已越过该次怀疑的确认期限。父测试至少阻塞 1.8 秒，peer 恢复后仍持续 thought，待核对健康跨度超过
 progress + confirm 后才放行成功终态。最后只有一次 success callback，全程没有 assistant 文字；已有长工具
-对照继续跨普通静默边界成功。CLI 的 `healthy-tool`、`thought-after-suspicion`、
-`alive-original-stall` 诊断只输出合成标识、策略、观测时间与次数，可由上述命令复核。
+对照继续跨普通静默边界成功，并在一次心跳读取异常后保持同一 driver 成功。CLI 的 `healthy-tool`、
+`thought-after-suspicion`、`alive-original-stall`、`persistent-heartbeat-read-error` 诊断只输出合成标识、
+策略、观测时间与次数，可由上述命令复核。
 这些是本地故障注入证据，不证明真实 Provider 卡死或生产误报率；正常长思考与永久卡住仍可能
 暂时不可区分。业务无需自动恢复，监护接续原请求也不等于重做业务。
+
+心跳通过 `O_NOFOLLOW | O_NONBLOCK` 打开，在同一 fd 上 `fstat` 校验普通文件、当前 UID、私有
+mode 和单一链接，再从该 fd 读 JSON。合法原子替换可能在 lookup/stat 之间使旧 inode 的
+`nlink` 变成 0；仅在其他安全属性合格时关闭并重开当前路径，最多三次。三次均被替换或文件
+暂缺时不更新最后有效进展时间，原 worker 静默期限和连续确认继续计时。真实越界文件、坏 JSON
+和其他读错误仍被拒绝，转为 `WORKER_HEARTBEAT_UNREADABLE` 怀疑；有效样本可撤销怀疑，持续
+错误经至少两次采样及完整 confirm 后只停止自有未回收 child、等其退出再观察原请求。接续观察
+仍不可读时封存监督 error 并由原 outbox 投递，不重发业务，不假定业务已失败。读取异常与
+心跳超时的 reason 切换会重启确认，不能沿用另一个原因的怀疑时间。
+最后有效心跳超过 worker 期限后固定按超时确认，避免读错误和文件暂缺交替出现时反复续期。
+
+定向测试用真实 rename 在已打开 fd 的 stat 前替换文件，稳定取得实际 `nlink=0`，验证重读与
+三次上限；硬链接、symlink、错误权限/属主、目录、FIFO、坏 JSON 仍拒绝。原读取路径的两个
+真实子进程并发复现捕获 `nlink=0`、mode 0600、当前 UID 的误报；修复后五秒并发检查同时验证
+重试和 sequence 推进。完整 CLI 注入一次/持续读取异常，验证恢复与确认后的 error/202/delivered、
+自有 driver 退出后仅被动观察、业务一次及无取消；不会代调封存或投递方法。
 
 夹具清理先保留原失败及阶段，再按出生身份停止自有 monitor、worker、owner/agent，等待它们
 退出或进入不可写的僵尸状态后才删临时目录。复制脚本的父 spawn 点立即登记 child 出生身份，
 精确匹配 version、active 及 wrapper 启动路径，覆盖尚未完成 Node 初始化的自有子进程和暂停的
 worker；无法确认停止则保留临时目录并报错。清理异常会另行诊断，不覆盖首错；只有清理失败
 也必须使测试失败。回归用真实子进程验证 TERM 后延迟重建目录、SIGSTOP、PID 出生身份不符和
-首错保留（含诊断自身抛错），未改生产监督逻辑或原等待上限。旧夹具只发 TERM 就立即删目录，
+首错保留（含诊断自身抛错），清理不更改生产监督状态或原等待上限。旧夹具只发 TERM 就立即删目录，
 存在可证的并发写入竞态；旧 finally 在已有首错时可能用 ENOTEMPTY 覆盖它。sing-box 固定
 `7f7b749` 的原 TAP 尚未取得，是否存在首错及其内容未知，不能据此认定生产检测失败或确定首错。
 前轮单次 fixture timeout 的根因同样仍未确定。
@@ -449,7 +466,16 @@ worker；无法确认停止则保留临时目录并报错。清理异常会另�
 原始进程及 journal 证据不足，原因未证。失败诊断会补充原请求终态摘要、已登记进程的出生
 身份/状态与正常退出记录；写入者停止后仍保留失败夹具目录，成功运行才删除。
 另一次同 session 后续请求停在 queued 的现场确认 monitor 在启动后约 0.45 秒以 code 1 退出，
-尚无对应异常证据；复制脚本新增 `uncaughtExceptionMonitor` 记录，不拦截 Node 默认退出。
+该次未取得异常栈。后续 sing-box 固定 `3b2fa59` 夹具/已安装 `7f7b749` 脚本捕获
+`privateFile(worker.json) → timer → UNSAFE_TASK_FILE` 导致 monitor code 1 退出；与已复现的
+路径 stat 竞态一致，但现场未保存该次 stat，不能将旧的每次超时都归因于它。复制脚本的
+`uncaughtExceptionMonitor` 只记录异常，不拦截 Node 默认退出。
+
+peer 独立记录自身出生身份；只有父关系、父出生身份和本夹具命令都稳定匹配时才记为 owner。
+启动时已被收养则记录 `invalidOwner`，不能用 PID 1 代填。清理同时硬拒绝 PID 1、宿主和非法
+PID，不放宽命令/出生检查；owner 校验失败仍尝试收尾已确认 agent，最终保留目录并报原错误。
+空 cmdline 只能等待、不能发信号或视为退出；命令确认后才发送一次 TERM 并给予两秒退出宽限，
+每批清理最多六秒，仍不可核实时失败保留目录。合成收养、延迟退出写入及空命令回归核对这些边界。
 
 双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
 去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用

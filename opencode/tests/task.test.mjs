@@ -896,6 +896,130 @@ test("monitor seals a worker spawn error and delivers without needing a working 
   assert.equal(f.executions(), 0);
 });
 
+for (const persistent of [false, true]) {
+  test(`monitor ${persistent ? "confirms" : "recovers from"} unreadable heartbeat without escaping its timer`,
+    { timeout: 2000 }, async (t) => {
+      const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+      const heartbeat = f.runner.filename(f.id, "worker.json");
+      const open = fs.openSync;
+      let reads = 0;
+      let stopped = 0;
+      let launches = 0;
+      let firstErrorAt;
+      let stoppedAt;
+      if (persistent) {
+        const record = f.runner.load(f.id);
+        record.state = "running";
+        record.originalObserved = true;
+        record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+        f.runner.write(record);
+      }
+      fs.openSync = (...args) => {
+        if (args[0] === heartbeat && (persistent || reads++ === 0)) {
+          firstErrorAt ??= performance.now();
+          throw Object.assign(new Error("synthetic unreadable heartbeat"), { code: "EACCES" });
+        }
+        return open(...args);
+      };
+      try {
+        await supervise(f.runner, f.id, (_action, _id, token) => {
+          launches++;
+          const child = new EventEmitter();
+          child.exitCode = child.signalCode = null;
+          child.kill = (signal) => {
+            stopped++; stoppedAt = performance.now(); child.signalCode = signal;
+            setImmediate(() => child.emit("exit", null));
+          };
+          save(heartbeat, { token, sequence: 0 });
+          if (!persistent) setTimeout(async () => {
+            await f.runner.execute(f.id);
+            child.exitCode = 0; child.emit("exit", 0);
+          }, 90);
+          return child;
+        });
+      } finally { fs.openSync = open; }
+      assert.equal(launches, 1);
+      assert.equal(stopped, persistent ? 1 : 0);
+      if (persistent) {
+        assert.ok(stoppedAt - firstErrorAt >= shortPolicy.confirmMs);
+        const record = f.runner.load(f.id);
+        assert.equal(record.workerExit.reason, "WORKER_HEARTBEAT_UNREADABLE");
+        assert.equal(record.notificationState, "delivered");
+        assert.equal(f.runner.result(f.id).result_status, null);
+        assert.equal(f.executions(), 0);
+      } else {
+        assert.equal(f.runner.result(f.id).result_status, "success");
+        assert.equal(f.executions(), 1);
+      }
+    });
+}
+
+for (const firstCode of ["ENOENT", "EACCES"]) {
+  test(`monitor restarts confirmation when heartbeat reason changes after ${firstCode}`, { timeout: 2000 }, async (t) => {
+    const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+    const record = f.runner.load(f.id);
+    record.state = "running";
+    record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+    f.runner.write(record);
+    let tick = 0;
+    f.runner.tick = () => tick;
+    const open = fs.openSync;
+    const heartbeat = f.runner.filename(f.id, "worker.json");
+    let reads = 0;
+    fs.openSync = (...args) => {
+      if (args[0] !== heartbeat) return open(...args);
+      const sample = reads++;
+      tick = (firstCode === "ENOENT" ? [130, 150, 170, 190, 210] : [80, 100, 130, 150, 170])[sample];
+      if (firstCode === "ENOENT" && sample === 1) return open(...args);
+      const code = sample < 2 ? firstCode : firstCode === "ENOENT" ? "EACCES" : "ENOENT";
+      throw Object.assign(new Error("synthetic observation transition"), { code });
+    };
+    try {
+      await supervise(f.runner, f.id, (_action, _id, token) => {
+        save(heartbeat, { token, sequence: 0 });
+        const child = new EventEmitter();
+        child.exitCode = child.signalCode = null;
+        child.kill = (signal) => { child.signalCode = signal; setImmediate(() => child.emit("exit", null)); };
+        return child;
+      });
+    } finally { fs.openSync = open; }
+    assert.equal(reads, 5); // 有效进展/原因切换后，新怀疑仍须走完独立确认窗。
+    assert.equal(f.runner.load(f.id).workerExit.reason, firstCode === "ENOENT" ? "WORKER_HEARTBEAT_UNREADABLE" : "WORKER_UNRESPONSIVE");
+    assert.equal(f.runner.load(f.id).notificationState, "delivered");
+    assert.equal(f.executions(), 0);
+  });
+}
+
+test("alternating read failures cannot renew an expired worker heartbeat budget", { timeout: 2000 }, async (t) => {
+  const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });
+  const record = f.runner.load(f.id);
+  record.state = "running";
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey });
+  f.runner.write(record);
+  let tick = 0;
+  let reads = 0;
+  f.runner.tick = () => tick;
+  const open = fs.openSync;
+  const heartbeat = f.runner.filename(f.id, "worker.json");
+  fs.openSync = (...args) => {
+    if (args[0] !== heartbeat) return open(...args);
+    tick = ++reads * 10;
+    throw Object.assign(new Error("synthetic alternating read failure"), { code: reads % 2 ? "EACCES" : "ENOENT" });
+  };
+  try {
+    await supervise(f.runner, f.id, () => {
+      const child = new EventEmitter();
+      child.exitCode = child.signalCode = null;
+      child.kill = (signal) => { child.signalCode = signal; setImmediate(() => child.emit("exit", null)); };
+      return child;
+    });
+  } finally { fs.openSync = open; }
+  assert.equal(reads, 17);
+  assert.equal(f.runner.load(f.id).workerExit.reason, "WORKER_UNRESPONSIVE");
+  assert.equal(f.runner.load(f.id).notificationState, "delivered");
+  assert.equal(f.executions(), 0);
+});
+
 for (const restarted of [false, true]) {
   test(`monitor ${restarted ? "restart" : "worker exit"} observes only the original request`, { timeout: 2000 }, async (t) => {
     const f = fixture(t, { policy: shortPolicy, fetcher: async () => ok() });

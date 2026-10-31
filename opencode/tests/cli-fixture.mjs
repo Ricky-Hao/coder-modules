@@ -98,8 +98,9 @@ export async function stopFixtureProcesses(base, version) {
     ...[version, path.join(root, "active")].flatMap((directory) =>
       ["runtime.py", "task-cli.mjs", "node/bin/node", "opencode"].map((name) => path.join(directory, name)))]);
   const readLines = (file) => fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").slice(0, -1).map(JSON.parse) : [];
-  const verified = new Set();
-  const live = (proof) => {
+  const live = (proof, purpose = "wait") => {
+    if (!Number.isSafeInteger(proof.pid) || proof.pid <= 1 || proof.pid === process.pid ||
+        typeof proof.ticks !== 'string' || !/^\d+$/.test(proof.ticks)) throw new Error('unsafe fixture process identity');
     const birth = processBirth(proof.pid);
     if (!birth || birth.ticks !== proof.ticks || ["Z", "X"].includes(birth.state)) return false;
     let argv;
@@ -107,26 +108,31 @@ export async function stopFixtureProcesses(base, version) {
     catch (error) { if (["ENOENT", "ESRCH"].includes(error.code)) return false; throw error; }
     const current = processBirth(proof.pid);
     if (!current || current.ticks !== proof.ticks || ["Z", "X"].includes(current.state)) return false;
-    // 退出期间 cmdline 可先清空、stat 稍后才变 Z；只继续等待先前已核对的同一出生身份。
-    if (argv.every((arg) => !arg)) return verified.has(`${proof.pid}:${proof.ticks}`);
+    // exec/退出期间 cmdline 可为空：仍是活进程，命令未核实时只等待、绝不发信号。
+    if (argv.every((arg) => !arg)) return purpose !== "signal";
     if (!argv.some((arg) => allowed.has(arg))) throw new Error(`fixture process command mismatch: ${proof.pid}`);
-    verified.add(`${proof.pid}:${proof.ticks}`);
     return true;
   };
   const stop = async (proofs) => {
     const targets = [...new Map(proofs.map((proof) => [`${proof.pid}:${proof.ticks}`, proof])).values()];
-    const signal = (value) => {
-      for (const proof of targets) if (live(proof)) {
-        try { process.kill(proof.pid, value); } catch (error) { if (error.code !== "ESRCH") throw error; }
+    const terminated = new Map();
+    const killed = new Set();
+    const deadline = performance.now() + 6000;
+    while (targets.some(live)) {
+      const at = performance.now();
+      for (const proof of targets) if (live(proof, "signal")) {
+        const key = `${proof.pid}:${proof.ticks}`;
+        const first = !terminated.has(key);
+        if (first || at - terminated.get(key) >= 2000 && !killed.has(key)) {
+          try { process.kill(proof.pid, first ? "SIGTERM" : "SIGKILL"); }
+          catch (error) { if (error.code !== "ESRCH") throw error; }
+          if (first) terminated.set(key, at);
+          else killed.add(key);
+        }
       }
-    };
-    signal("SIGTERM");
-    let deadline = performance.now() + 2000;
-    while (targets.some(live) && performance.now() < deadline) await pause(20);
-    signal("SIGKILL"); // 覆盖仍在 SIGSTOP 的本夹具进程，每次信号前重新核对出生身份。
-    deadline = performance.now() + 2000;
-    while (targets.some(live) && performance.now() < deadline) await pause(20);
-    if (targets.some(live)) throw new Error("fixture processes still writing; temporary root retained");
+      if (performance.now() >= deadline) throw new Error("fixture processes still writing or unverified; temporary root retained");
+      await pause(20);
+    }
   };
   const drivers = () => readLines(path.join(base, "drivers.ndjson"));
   // 也捕获尚在 runtime.py 初始化、来不及写 Node 出生清单的自有子进程。
@@ -146,18 +152,23 @@ export async function stopFixtureProcesses(base, version) {
     for (const proof of parents) visit(proof);
     return [...found.values()];
   };
-  const spawning = descendants(drivers());
-  await stop(drivers().filter(({ role }) => ["_supervise", "_fail_launch"].includes(role)));
+  const errors = [];
+  const attempt = async (action) => { try { return await action(); } catch (error) { errors.push(error); } };
+  const spawning = await attempt(() => descendants(drivers())) ?? [];
+  await attempt(() => stop(drivers().filter(({ role }) => ["_supervise", "_fail_launch"].includes(role))));
   // monitor 已退出，不能再出生替换 worker；重新读取清单，覆盖 _observe 及失败启动。
-  await stop([...spawning, ...descendants(drivers()), ...drivers()]);
+  await attempt(() => stop([...spawning, ...descendants(drivers()), ...drivers()]));
   const peers = () => readLines(path.join(base, "processes"));
   const queues = path.join(base, "toolset/runtime/home/.acpx/queues");
-  const leases = fs.existsSync(queues) ? fs.readdirSync(queues).filter((name) => name.endsWith(".lock")).map((name) =>
-    JSON.parse(fs.readFileSync(path.join(queues, name), "utf8"))) : [];
-  await stop([...peers().map((proof) => ({ pid: proof.owner, ticks: proof.ownerStartTicks })),
+  const leases = await attempt(() => fs.existsSync(queues) ? fs.readdirSync(queues).filter((name) => name.endsWith(".lock")).map((name) =>
+    JSON.parse(fs.readFileSync(path.join(queues, name), "utf8"))) : []) ?? [];
+  await attempt(() => stop([...peers().filter((proof) => !proof.invalidOwner && proof.owner > 1 && proof.owner !== process.pid)
+    .map((proof) => ({ pid: proof.owner, ticks: proof.ownerStartTicks })),
     ...leases.filter((lease) => lease.processIdentity?.kind === "linux-proc").map((lease) =>
-      ({ pid: lease.pid, ticks: lease.processIdentity.startTicks }))]);
-  await stop(peers().map((proof) => ({ pid: proof.agent, ticks: proof.startTicks })));
+      ({ pid: lease.pid, ticks: lease.processIdentity.startTicks }))]));
+  // 不可信 parent 不是 owner；真正 owned writer 命令不符仍报错并保留 root，同时收尾已确认 agent。
+  await attempt(() => stop(peers().map((proof) => ({ pid: proof.agent, ticks: proof.startTicks }))));
+  if (errors.length) throw errors[0];
 }
 
 export async function finishFixture(primaryError, cleanup, diagnostic) {

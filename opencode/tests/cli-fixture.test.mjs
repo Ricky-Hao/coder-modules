@@ -117,3 +117,149 @@ test("cleanup failure retains the original failure object and reports both failu
   await assert.rejects(finishFixture(primary, async () => { throw cleanup; }, brokenDiagnostic), (error) => error === primary);
   await assert.rejects(finishFixture(null, async () => { throw cleanup; }, brokenDiagnostic), (error) => error === cleanup);
 });
+
+for (const mismatch of [false, true]) {
+  test(`adopted peer cleanup ${mismatch ? "retains an unverified owner error" : "never signals PID 1 or its host"}`,
+    { timeout: 10000 }, async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "cli-adopted-"));
+      const version = path.join(base, "toolset/versions/fixture");
+      fs.mkdirSync(path.join(version, "node/bin"), { recursive: true });
+      const node = path.join(version, "node/bin/node");
+      fs.symlinkSync(process.execPath, node);
+      const control = path.join(base, "parent-gone");
+      const bootstrap = path.join(base, "bootstrap.mjs");
+      fs.writeFileSync(bootstrap, `import fs from 'node:fs';
+import path from 'node:path';
+process.on('SIGTERM', () => setTimeout(() => {
+  fs.mkdirSync(${JSON.stringify(path.join(base, 'toolset/runtime/late-agent'))}, { recursive: true });
+  fs.writeFileSync(${JSON.stringify(path.join(base, 'toolset/runtime/late-agent/done'))}, 'late agent write');
+  process.exit(0);
+}, 150));
+const deadline = performance.now() + 3000;
+while (!fs.existsSync(${JSON.stringify(control)})) {
+  if (performance.now() > deadline) throw new Error('adoption gate timed out');
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+await import(${JSON.stringify(new URL('./acp.fixture.mjs', import.meta.url).href)});
+setInterval(() => {}, 100);
+`);
+      const parentCode = `const {spawn} = require('node:child_process');
+const child = spawn(${JSON.stringify(node)}, [${JSON.stringify(bootstrap)}], {detached:true, stdio:'ignore'});
+console.log(child.pid); child.unref();`;
+      let agent;
+      let birth;
+      let sentinel;
+      const nativeKill = process.kill;
+      try {
+        const parent = spawn(process.execPath, ['-e', parentCode], { env: { PATH: process.env.PATH,
+          TASK_FIXTURE_PROCESS_LOG: path.join(base, 'processes') }, stdio: ['ignore', 'pipe', 'pipe'] });
+        let output = '';
+        parent.stdout.on('data', (value) => { output += value; });
+        assert.equal(await new Promise((resolve) => parent.once('close', resolve)), 0);
+        agent = Number(output.trim());
+        birth = processBirth(agent);
+        assert.ok(birth);
+        fs.writeFileSync(control, 'parent exited');
+        const deadline = performance.now() + 3000;
+        while (!fs.existsSync(path.join(base, 'processes')) && performance.now() < deadline) await pause(5);
+        const proof = JSON.parse(fs.readFileSync(path.join(base, 'processes'), 'utf8'));
+        assert.equal(proof.agent, agent);
+        assert.equal(proof.startTicks, birth.ticks);
+        assert.equal(proof.invalidOwner, true);
+        assert.equal(proof.owner, null);
+        assert.equal(proof.ownerStartTicks, null);
+        assert.notEqual(proof.observedParent, parent.pid);
+        const extra = [{ ...proof, owner: 1, ownerStartTicks: processBirth(1).ticks, invalidOwner: undefined },
+          { ...proof, owner: process.pid, ownerStartTicks: processBirth(process.pid).ticks, invalidOwner: undefined }];
+        if (mismatch) {
+          sentinel = spawn('python3', ['-B', '-c', 'import time; time.sleep(30)'], { stdio: 'ignore' });
+          extra.push({ ...proof, owner: sentinel.pid, ownerStartTicks: processBirth(sentinel.pid).ticks, invalidOwner: false });
+        }
+        fs.appendFileSync(path.join(base, 'processes'), extra.map(JSON.stringify).join('\n') + '\n');
+        const signalled = [];
+        process.kill = (pid, signal) => {
+          assert.equal(pid, agent, 'only the registered synthetic agent may be signalled');
+          signalled.push(pid);
+          return nativeKill(pid, signal);
+        };
+        if (mismatch) await assert.rejects(stopFixtureProcesses(base, version), /fixture process command mismatch/);
+        else await stopFixtureProcesses(base, version);
+        process.kill = nativeKill;
+        assert.ok(signalled.length > 0);
+        assertStopped({ pid: agent, ticks: birth.ticks });
+        assert.ok(fs.existsSync(path.join(base, 'toolset/runtime/late-agent/done')));
+        if (mismatch) {
+          assert.equal(sentinel.exitCode, null);
+          assert.equal(sentinel.signalCode, null);
+          assert.ok(fs.existsSync(base));
+        }
+      } finally {
+        process.kill = nativeKill;
+        if (agent && processBirth(agent)?.ticks === birth?.ticks && !['Z', 'X'].includes(processBirth(agent)?.state))
+          nativeKill(agent, 'SIGKILL');
+        if (sentinel && sentinel.exitCode === null && sentinel.signalCode === null) {
+          const exit = new Promise((resolve) => sentinel.once('exit', resolve));
+          sentinel.kill('SIGKILL'); await exit;
+        }
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+}
+
+for (const persistent of [false, true]) {
+  test(`empty cmdline ${persistent ? "retains the root without signalling" : "waits for verification then gives TERM grace"}`,
+    { timeout: 10000 }, async () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "cli-empty-command-"));
+      const version = path.join(base, 'toolset/versions/fixture');
+      fs.mkdirSync(version, { recursive: true });
+      const script = path.join(version, 'runtime.py');
+      fs.writeFileSync(script, `import signal, sys, time
+from pathlib import Path
+def end(signum, frame):
+    time.sleep(0.15)
+    Path(sys.argv[1]).joinpath('done').write_text('TERM completed')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, end)
+print('ready', flush=True)
+while True: time.sleep(0.01)
+`);
+      const child = spawn('python3', ['-B', script, base], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const exit = new Promise((resolve) => child.once('exit', resolve));
+      const read = fs.readFileSync;
+      const kill = process.kill;
+      let empty = true;
+      const signals = [];
+      try {
+        await new Promise((resolve) => child.stdout.once('data', resolve));
+        const proof = { pid: child.pid, ticks: processBirth(child.pid).ticks, role: '_worker' };
+        fs.writeFileSync(path.join(base, 'drivers.ndjson'), JSON.stringify(proof) + '\n');
+        fs.readFileSync = (...args) => args[0] === `/proc/${child.pid}/cmdline` && empty ? '' : read(...args);
+        process.kill = (pid, signal) => {
+          assert.equal(pid, child.pid); assert.equal(empty, false);
+          signals.push(signal); return kill(pid, signal);
+        };
+        let completed = false;
+        const cleanup = stopFixtureProcesses(base, version).finally(() => { completed = true; });
+        if (persistent) {
+          await assert.rejects(cleanup, /still writing or unverified/);
+          assert.deepEqual(signals, []);
+          assert.ok(fs.existsSync(base));
+          assert.equal(child.exitCode, null);
+        } else {
+          await pause(60);
+          assert.equal(completed, false);
+          assert.deepEqual(signals, []);
+          empty = false;
+          await cleanup;
+          assertStopped(proof);
+          assert.deepEqual(signals, ['SIGTERM']);
+          assert.ok(fs.existsSync(path.join(base, 'done')));
+        }
+      } finally {
+        fs.readFileSync = read; process.kill = kill;
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        await exit;
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+}

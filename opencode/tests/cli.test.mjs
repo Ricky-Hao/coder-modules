@@ -60,6 +60,22 @@ test(
       const copied = path.join(version, name);
       fs.writeFileSync(copied, recordFixtureSpawns(fs.readFileSync(copied, 'utf8'), path.join(base, 'drivers.ndjson')));
     }
+    const heartbeatFaults = path.join(base, 'heartbeat-read-faults');
+    fs.mkdirSync(heartbeatFaults, { mode: 0o700 });
+    const copiedSupervisor = path.join(version, 'task-supervisor.mjs');
+    const readerMarker = 'export function readWorkerHeartbeat(filename) {';
+    const supervisorSource = fs.readFileSync(copiedSupervisor, 'utf8');
+    assert.ok(supervisorSource.includes(readerMarker));
+    fs.writeFileSync(copiedSupervisor, supervisorSource.replace(readerMarker, `${readerMarker}
+  const taskId = filename.split('/').at(-2);
+  const fault = ${JSON.stringify(heartbeatFaults)} + '/' + taskId;
+  if (fs.existsSync(fault)) {
+    const mode = fs.readFileSync(fault, 'utf8');
+    if (mode === 'once') fs.unlinkSync(fault);
+    fs.appendFileSync(${JSON.stringify(path.join(base, 'heartbeat-read-errors.ndjson'))},
+      JSON.stringify({ taskId, pid: process.pid, mode, at: Date.now() }) + '\\n');
+    throw Object.assign(new Error('synthetic heartbeat read failure'), { code: 'EACCES' });
+  }`));
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -557,12 +573,18 @@ esac
       assert.equal(exited.terminalSource, 'watchSession.turn_result');
       env.OPENCODE_TASK_PROGRESS_MS = '500';
       env.OPENCODE_TASK_TOOL_MS = '5000';
+      const healthyToolId = `task_${createHash('sha256').update('healthy-tool').digest('hex')}`;
+      fs.writeFileSync(path.join(heartbeatFaults, healthyToolId), 'once');
       const toolBegan = Date.now();
       const slow = await delivered(faultSubmit('healthy-tool', 'long tool'));
       assert.equal(slow.resultStatus, 'success');
       assert.equal(JSON.parse(slow.body).output, 'Slow tool completed');
+      assert.equal(fs.readFileSync(path.join(base, 'heartbeat-read-errors.ndjson'), 'utf8').trim().split('\n')
+        .map(JSON.parse).filter((event) => event.taskId === healthyToolId).length, 1);
+      assert.equal(new Set(fs.readFileSync(path.join(base, 'drivers.ndjson'), 'utf8').trim().split('\n').map(JSON.parse)
+        .filter((event) => event.taskId === healthyToolId && ['_worker', '_observe'].includes(event.role)).map((event) => event.pid)).size, 1);
       t.diagnostic(JSON.stringify({ scenario: 'healthy-tool', progress_ms: 500, confirm_ms: 600, tool_ms: 5000,
-        elapsed_ms: Date.now() - toolBegan, result_status: slow.resultStatus }));
+        heartbeat_read_errors: 1, driver_attempts: 1, elapsed_ms: Date.now() - toolBegan, result_status: slow.resultStatus }));
 
       // 真实 detached worker/monitor 自动完成判断、封存和 HTTP 投递，测试只读任务文件。
       env.OPENCODE_TASK_PROGRESS_MS = '600';
@@ -681,9 +703,9 @@ while True:
       assert.ok(originalPeer);
       const incarnation = lines(path.join(base, 'processes')).find((proof) => proof.agent === originalPeer.agent);
       assert.equal(incarnation.owner, originalPeer.owner);
-      const assertOriginalAlive = () => {
-        for (const [pid, ticks, command] of [[incarnation.agent, incarnation.startTicks, fixturePeer],
-          [incarnation.owner, incarnation.ownerStartTicks, path.join(version, 'node_modules/acpx')]]) {
+      const assertOriginalAlive = (proof = incarnation) => {
+        for (const [pid, ticks, command] of [[proof.agent, proof.startTicks, fixturePeer],
+          [proof.owner, proof.ownerStartTicks, path.join(version, 'node_modules/acpx')]]) {
           const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/);
           assert.equal(stat[19], ticks);
           assert.notEqual(stat[0], 'Z');
@@ -772,6 +794,41 @@ while True:
         business_executions: 1, http_posts: 2, receiver_notifications: 1, receipt_status: 202,
         exact_bytes: true, cancel_events: 0, same_session_followup: 'queued' }));
       interruptCallback = undefined;
+
+      // 持续的真实读取异常只能经连续确认停止自有 driver，再观察原请求；不得重派业务。
+      env.OPENCODE_TASK_PROGRESS_MS = '60000';
+      const beforeUnreadable = executionCount();
+      const unreadableId = faultSubmit('unreadable-heartbeat', 'silent forever');
+      await until(() => load(unreadableId).state === 'running' &&
+        peerEvents(load(unreadableId)).some((event) => event.type === 'prompt_received'), 'heartbeat fault original received');
+      const unreadablePeer = peerEvents(load(unreadableId)).find((event) => event.type === 'prompt_received');
+      const unreadableBirth = lines(path.join(base, 'processes')).find((proof) => proof.agent === unreadablePeer.agent);
+      assertOriginalAlive(unreadableBirth);
+      fs.writeFileSync(path.join(heartbeatFaults, unreadableId), 'persistent');
+      await until(() => load(unreadableId).notificationState === 'delivered', 'unreadable heartbeat error delivered');
+      const unreadable = load(unreadableId);
+      assertOriginalAlive(unreadableBirth);
+      assert.equal(unreadable.workerExit.reason, 'WORKER_HEARTBEAT_UNREADABLE');
+      assert.equal(unreadable.notificationKind, 'supervision_failure');
+      assert.equal(unreadable.state, 'ambiguous');
+      assert.equal(unreadable.resultStatus, undefined);
+      assert.equal(JSON.parse(unreadable.body).status, 'error');
+      assert.match(JSON.parse(unreadable.body).output, /unknown.*WORKER_HEARTBEAT_UNREADABLE/);
+      assert.equal(callbacks(unreadable).length, 1);
+      assert.equal(executionCount(), beforeUnreadable + 1);
+      assert.equal(peerEvents(unreadable).some((event) => event.type === 'cancel'), false);
+      assert.equal(journalEntries(unreadable).some((event) => event.type === 'turn_result' && event.request_id === unreadable.requestId), false);
+      const readErrors = lines(path.join(base, 'heartbeat-read-errors.ndjson')).filter((event) => event.taskId === unreadableId);
+      const attemptsFor = (role) => new Set(lines(path.join(base, 'drivers.ndjson'))
+        .filter((event) => event.taskId === unreadableId && event.role === role).map((event) => event.pid)).size;
+      assert.ok(readErrors.length >= 4);
+      assert.equal(attemptsFor('_worker'), 1);
+      assert.equal(attemptsFor('_observe'), 1);
+      assert.ok(unreadable.supervisionFailedAt - readErrors[0].at >= 2 * unreadable.health.policy.confirmMs);
+      t.diagnostic(JSON.stringify({ scenario: 'persistent-heartbeat-read-error', read_errors: readErrors.length,
+        confirmation_ms: unreadable.health.policy.confirmMs, elapsed_ms: unreadable.callbackDeliveredAt - readErrors[0].at,
+        initial_drivers: 1, observer_drivers: 1, business_executions: 1, http_posts: 1,
+        callback_status: 'error', callback_state: 'delivered', owner_agent_alive_with_same_birth: true, cancel_events: 0 }));
       env.OPENCODE_TASK_PROGRESS_MS = '10000';
       env.OPENCODE_TASK_CONFIRM_MS = '600';
       env.OPENCODE_TASK_WORKER_MS = '300';
@@ -886,6 +943,7 @@ while True:
       // 全部断言完成后才清理 fixture；finally 会等待自有进程退出，再删除临时目录。
       assert.deepEqual(callbacks(load(stalledId)), [stalled.body, stalled.body]);
       assert.equal(peerEvents(stalled).some((event) => event.type === 'cancel'), false);
+      assert.deepEqual(lines(path.join(base, 'driver-errors.ndjson')), []);
     } catch (error) {
       primaryError = error;
       // 先保留首错与阶段；即使随后清理失败，原 stack 仍作为测试失败返回。
