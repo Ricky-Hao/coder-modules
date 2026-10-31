@@ -7,8 +7,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { createSharedAcpRuntime, createAgentRegistry } from "../scripts/node_modules/acpx/dist/runtime.js";
-import { TaskRunner, HEALTH_DEFAULTS } from "../scripts/task.mjs";
-import { observeOwner } from "../scripts/task-acp.mjs";
+import { TaskRunner } from "../scripts/task.mjs";
 
 test("published OpenCode: HTTP 200 response.failed becomes request failure; same session can continue",
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
@@ -68,7 +67,6 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
       OPENCODE_ACP_REQUIRED_MODEL: "codex/gpt-6.1-sol", OPENCODE_ACP_REQUIRED_VARIANT: "max" });
     const runtime = createSharedAcpRuntime({ cwd: base, permissionMode: "deny-all", nonInteractivePermissions: "deny", authPolicy: "skip",
       ttlMs: 1000, agentRegistry: createAgentRegistry({ overrides: { opencode: [process.env.OPENCODE_FIXTURE_BINARY, "acp"] } }) });
-    runtime.observeOwner = ({ handle }) => observeOwner(handle.acpxRecordId);
     const watchSession = runtime.watchSession.bind(runtime);
     runtime.watchSession = async function* (options) {
       for await (const event of watchSession(options)) {
@@ -79,8 +77,7 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     };
     const taskRoot = path.join(base, "tasks");
     fs.mkdirSync(taskRoot, { mode: 0o700 });
-    const runner = new TaskRunner({ root: taskRoot, runtime,
-      policy: { ...HEALTH_DEFAULTS, pollMs: 100, probeMs: 2000, discoveryMs: 5000, setupMs: 30000, progressMs: 30000 } });
+    const runner = new TaskRunner({ root: taskRoot, runtime, pollMs: 100, noProgressMs: 30000 });
     let handle;
     try {
       const submit = (key, letter) => runner.submit({ key, cwd: base, prompt: "Synthetic fixture: answer one short sentence.", session: "original",

@@ -41,7 +41,7 @@ function fixture(t) {
   fs.writeFileSync(path.join(repo, "dirty"), "keep unrelated work");
   const runner = new TaskRunner({ root: tasks });
   let launches = 0;
-  const options = { version, spawnWorker: async () => { launches++; } };
+  const options = { version, spawnControl: async () => { launches++; } };
   const input = { schema_version: 1, key: "new", repo_path: repo, branch: "feat/new", worktree: "new-work",
     prompt: "Do the bounded task.", callback: { callback_id: `tcb_${"x".repeat(43)}`, callback_url: "https://callback.example.invalid/api/agents/task-callbacks", expires_at: "native-registration-extra" } };
   const inputFile = path.join(base, "input.json");
@@ -109,7 +109,7 @@ test("missing launch metadata and unknown terminal do not authorize continuation
   assert.equal((await f.launch(next, { "--continue-from": `task_${'a'.repeat(64)}` })).error.code, "LAUNCH_METADATA_REQUIRED");
   const original = await f.launch();
   const task = f.runner.load(original.task_id);
-  task.state = "ambiguous"; task.resultStatus = "error"; task.terminalSource = "supervision_failure"; f.runner.write(task);
+  task.state = "ambiguous"; task.notificationKind = "no_progress"; f.runner.write(task);
   assert.equal((await f.launch(next, { "--continue-from": original.task_id })).error.code, "CONTINUE_BUSY_OR_UNKNOWN");
 });
 
@@ -117,6 +117,7 @@ test("all validation precedes Git writes; conflicts and private-file boundaries"
   const f = fixture(t), before = git(f.repo, "show-ref");
   for (const change of [{ branch: "../escape" }, { branch: "--option" }, { worktree: "../escape" }, { worktree: "/absolute" },
     { base_sha: f.old }, { permissions: { mode: "anything" } }, { prompt: f.input.callback.callback_id },
+    { no_progress_timeout_seconds: 0 }, { no_progress_timeout_seconds: 86401 }, { no_progress_timeout_seconds: "900" },
     { prompt: `unrelated bearer tcb_${'z'.repeat(43)}` },
     { callback: { ...f.input.callback, callback_url: "https://user:secret@example.invalid/api/agents/task-callbacks" } },
     { callback: { ...f.input.callback, callback_url: "https://CALLBACK.EXAMPLE.INVALID:443/api/agents/task-callbacks" },
@@ -127,10 +128,10 @@ test("all validation precedes Git writes; conflicts and private-file boundaries"
     assert.equal(git(f.repo, "show-ref"), before);
   }
   fs.mkdirSync(path.join(f.base, "new-work"));
-  assert.equal((await f.launch()).error.code, "LAUNCH_OBJECT_CONFLICT");
+   assert.equal((await f.launch()).error.code, "LAUNCH_OBJECT_CONFLICT");
   fs.rmdirSync(path.join(f.base, "new-work"));
   git(f.repo, "branch", "feat/new");
-  assert.equal((await f.launch()).error.code, "LAUNCH_OBJECT_CONFLICT");
+  assert.equal((await f.launch()).error.code, "GIT_PREPARATION_INTERRUPTED");
   write(f.inputFile, f.input); fs.chmodSync(f.inputFile, 0o644);
   assert.equal((await launchTask(f.runner, { "--input-file": f.inputFile }, f.options)).error.code, "UNSAFE_TASK_FILE");
   fs.chmodSync(f.inputFile, 0o600);
@@ -161,39 +162,35 @@ test("fetch failure does not use cached main and never returns raw stderr", asyn
   assert.equal(git(f.repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"), f.old);
 });
 
-test("interruption after successful fetch fixes base, branch/worktree recovery verifies ownership", async (t) => {
-  const f = fixture(t);
-  let interrupted = false;
-  const first = await f.launch(f.input, {}, { checkpoint: (stage) => {
-    if (stage === "fetch" && !interrupted) {
-      const file = path.join(f.tasks, ".launches", `task_${digest(f.input.key)}.json`);
-      if (JSON.parse(fs.readFileSync(file)).durations.fetch !== undefined) { interrupted = true; throw new Error("interrupted"); }
-    }
-  } });
-  assert.equal(first.accepted, false); assert.equal(interrupted, true);
-  git(f.origin, "update-ref", "refs/heads/main", f.old);
-  let branchStop = false;
-  const second = await f.launch(f.input, {}, { checkpoint: (stage) => {
-    if (stage === "worktree_directory" && !branchStop) { branchStop = true; throw new Error("interrupted"); }
-  } });
-  assert.equal(second.base_sha, f.latest); assert.equal(second.accepted, false);
-  const final = await f.launch();
-  assert.equal(final.error, undefined, JSON.stringify(final)); assert.equal(final.base_sha, f.latest);
-});
+for (const stopAt of ["fetch", "branch", "worktree_directory", "worktree", "input", "submit"]) {
+  test(`partial Git preparation at ${stopAt} fails closed and preserves every existing object`, async (t) => {
+    const f = fixture(t);
+    const partial = await f.launch(f.input, {}, { checkpoint: (stage) => {
+      if (stage === stopAt) throw new Error("synthetic interruption");
+    } });
+    assert.equal(partial.accepted, false);
+    const snapshot = () => JSON.stringify({ refs: git(f.repo, "show-ref"), worktrees: git(f.repo, "worktree", "list", "--porcelain"),
+      intent: f.saved(partial), directory: fs.existsSync(path.join(f.base, "new-work"))
+        ? fs.readdirSync(path.join(f.base, "new-work")) : null });
+    const before = snapshot();
+    const retried = await f.launch();
+    assert.equal(retried.error.code, "GIT_PREPARATION_INTERRUPTED"); assert.equal(snapshot(), before);
+    assert.equal(f.launches(), 0);
+  });
+}
 
-test("directory publish recovers after durable staging identity", async (t) => {
-  const f = fixture(t);
-  let stopped = false;
-  const partial = await f.launch(f.input, {}, { checkpoint: (stage) => {
-    const file = path.join(f.tasks, ".launches", `task_${digest(f.input.key)}.json`);
-    if (stage === "worktree_directory" && JSON.parse(fs.readFileSync(file)).worktreeIdentity && !stopped) {
-      stopped = true; throw new Error("interrupted after durable staging identity");
-    }
-  } });
-  assert.equal(partial.accepted, false); assert.equal(stopped, true);
-  const resumed = await f.launch();
-  assert.equal(resumed.error, undefined, JSON.stringify(resumed)); assert.equal(resumed.reused, true);
-  assert.equal(fs.existsSync(f.saved(resumed).worktreeStaging), false);
+test("late canonical success authorizes continuation while sealed notification remains unchanged", async (t) => {
+  const f = fixture(t), original = await f.launch();
+  const record = f.runner.load(original.task_id);
+  record.state = "running"; record.dispatchedAt = Date.now();
+  record.handle = { backend: "acpx-shared", cwd: record.cwd, sessionKey: record.sessionKey,
+    acpxRecordId: "fixture-record", backendSessionId: "fixture-session" };
+  f.runner.notify(record); const body = record.body;
+  const next = { schema_version: 1, key: "late-next", prompt: "next", callback: f.input.callback };
+  assert.equal((await f.launch(next, { "--continue-from": original.task_id })).error.code, "CONTINUE_BUSY_OR_UNKNOWN");
+  f.runner.seal(record, "success", "late", "watchSession.turn_result");
+  assert.equal(f.runner.load(original.task_id).body, body);
+  assert.equal((await f.launch(next, { "--continue-from": original.task_id })).error, undefined);
 });
 
 test("Git routing environment cannot redirect an authorized repository", async (t) => {
@@ -217,6 +214,17 @@ test("submit response loss recovers original task without invoking submit again"
   f.runner.submit = () => { throw new Error("MUST NOT RESUBMIT"); };
   const retry = await f.launch();
   assert.equal(retry.error, undefined, JSON.stringify(retry)); assert.equal(retry.request_id, first.request_id);
+});
+
+test("unsupported launch metadata is preserved and never projected as private output", async (t) => {
+  const f = fixture(t), original = await f.launch();
+  const file = path.join(f.tasks, ".launches", `${original.task_id}.json`);
+  write(file, { version: 1, key: f.input.callback.callback_id, worktree: "PRIVATE-PATH" });
+  const bytes = fs.readFileSync(file), result = await f.launch();
+  assert.equal(result.error.code, "UNSUPPORTED_LAUNCH_RECORD");
+  assert.equal(JSON.stringify(result).includes("tcb_"), false);
+  assert.equal(JSON.stringify(result).includes("PRIVATE-PATH"), false);
+  assert.deepEqual(fs.readFileSync(file), bytes);
 });
 
 test("new selections resolve provider/model defaults and standalone variant", async (t) => {

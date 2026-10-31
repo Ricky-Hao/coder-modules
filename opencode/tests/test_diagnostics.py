@@ -48,7 +48,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(value['runtime']['acpx'], '0.21.1')
         self.assertFalse(value['runtime']['executed'])
         self.assertEqual(value['profile']['source'], 'external')
-        self.assertIn('inspect', value['features']['readonly_commands'])
+        self.assertNotIn('inspect', value['features']['readonly_commands'])
         self.assertIn('provider_health', value['not_checked'])
         for secret in (str(self.root), 'PRIVATE-CONFIG', 'SYNTHETIC-NEVER-PRINT'):
             self.assertNotIn(secret, response.stdout + response.stderr)
@@ -130,7 +130,7 @@ class DoctorTests(unittest.TestCase):
         self.assertIsNone(value['runtime'])
         self.assertEqual(snapshot(self.root), before)
 
-    def test_launch_store_is_optional_private_and_preserved(self):
+    def test_doctor_does_not_scan_task_history(self):
         tasks = self.root / 'runtime/tasks'
         if not tasks.exists():
             tasks.mkdir(mode=0o700)
@@ -144,11 +144,11 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(self.call(quick=True).returncode, 0)
         self.assertEqual(snapshot(self.root), before)
         store.chmod(0o755)
-        self.assertEqual(self.call(quick=True).returncode, 1)
+        self.assertEqual(self.call(quick=True).returncode, 0)
         store.chmod(0o700)
         store.rename(tasks / '.saved-launches')
         store.symlink_to(tasks / '.saved-launches', target_is_directory=True)
-        self.assertEqual(self.call(quick=True).returncode, 1)
+        self.assertEqual(self.call(quick=True).returncode, 0)
 
     def test_env_profile_reports_names_without_keys_or_generated_configuration(self):
         self.fixture.bundle['config']['runtime_profile'] = 'env'

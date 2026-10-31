@@ -31,12 +31,19 @@ exact npm lock 保留；不升级全局 Node/npm。
 ## 版本维护边界
 
 原生 acpx 共享执行、watch cursor/request ID 和 session 队列仍使用公共 runtime。
-私有 `ipc-BbYFsKOj.js` 的只读 lease/进程出生检查及取消 wire format 固定于 0.21.1，
+私有 `ipc-BbYFsKOj.js` 仅保留请求级取消的 socket/generation 身份校验，wire format 固定于 0.21.1，
 升级必须重验。请求级取消避开原生 helper 的 owner 清理回退；不调用 session-wide cancel。
 OpenCode model/effort 控制不补齐 acpx 请求/profile/effort 的原子绑定，续接切换仍拒绝。
 新任务默认 codex/Sol/max、同 Provider title/low；四变量契约见 [PROVIDERS.md](PROVIDERS.md)。
 
-## 本轮隔离验证与保留失败
+## 轻量控制层边界
+
+每任务一个自建控制进程，删除监护/替换 worker、心跳、owner 健康推断和多阶段健康计时。
+统一无原请求事件默认 900 秒，超时通知后继续观察并另存晚到 canonical 结果。
+安装不自动 recover；Git 准备中断保留现场并拒绝自动续完。当前持久格式为 version=2，
+旧数据原字节保留，不迁移。删除旧保证不等于查明下列历史失败原因。
+
+## 前轮隔离验证与保留失败
 
 - 首次 runtime/CLI 夹具依赖已删除的业务 fs import，注入改为独立 import 后，完整 CLI 单跑通过。
   随后的并行 Node 全套为 92/93，CLI 等待 heartbeat fault 原请求接收记录超时；串行全套为
@@ -71,7 +78,8 @@ OpenCode model/effort 控制不补齐 acpx 请求/profile/effort 的原子绑定
   7f7b749 安装捕获 privateFile(worker.json)→timer→UNSAFE_TASK_FILE，与已复现的 stat
   原子替换竞态一致，不能将每次旧超时都归于它。
 - 上轮 `_fail_launch` 的 worker.lock 拒绝用例曾有一次未解释的 5 秒超时。
-  原证据保留在 `/mnt/opencode/tasks/opencode-task-launch/`，本次继续保留该安全用例。
+  原证据保留在 `/mnt/opencode/tasks/opencode-task-launch/`。轻量版删除该入口及其监护保证，
+  原超时原因仍未查明；新 control.lock 的互斥另行验证。
 - 历史 doctor 大二进制静态样本：OpenCode 223516848、Node 124902584 字节；一次 full
   显式读 348735004 字节/约 0.398 秒，quick 315572 字节/约 0.004 秒，二进制读取为 0。
   是热缓存各一次的本地读取证据，不是冷存储、生产速度或吞吐承诺。

@@ -23,7 +23,7 @@ def main(work, node, pvc):
             target = work / mode
             fixture.bundle['config']['install_root'] = '' if mode == 'home' else str(target / 'mount/toolset')
             result = verify_startup(render(fixture.bundle), target)
-            assert result['uid'] == 65534 and result['startup_recover_invocations'] == 2
+            assert result['uid'] == 65534 and result['startup_recover_invocations'] == 0
 
         fixture.root = pvc / 'toolset'
         fixture.bundle['config']['install_root'] = str(fixture.root)
@@ -42,8 +42,7 @@ def main(work, node, pvc):
 
         def query(*args, ok=True):
             response = subprocess.run([str(root / 'bin/opencode-task'), *args], cwd=work,
-                                      env={'PATH': '/usr/bin:/bin', 'OPENCODE_TASK_POLL_MS': 'invalid',
-                                           'OPENCODE_MODULE_CONFIG': '/PRIVATE-DO-NOT-OPEN'},
+                                      env={'PATH': '/usr/bin:/bin', 'OPENCODE_MODULE_CONFIG': '/PRIVATE-DO-NOT-OPEN'},
                                       capture_output=True, text=True, timeout=10)
             assert response.returncode == (0 if ok else 1), response.stdout + response.stderr
             assert 'PRIVATE-' not in response.stdout + response.stderr
@@ -56,12 +55,14 @@ def main(work, node, pvc):
             assert snapshot(root) == before
 
         tasks = root / 'runtime/tasks'
-        tasks.rename(root / 'runtime/saved-tasks')
+        assert not tasks.exists()
         before = snapshot(root)
-        for args in (('list',), ('inspect', 'task_' + 'a' * 64)):
+        for args in (('list',), ('status', 'task_' + 'a' * 64)):
             assert query(*args, ok=False)['error']['code'] == 'TASK_STORE_MISSING'
         assert snapshot(root) == before and not tasks.exists()
-        (root / 'runtime/saved-tasks').rename(tasks)
+        tasks.mkdir(mode=0o700)
+        (tasks / 'owner.json').write_text(json.dumps({'schema': 1, 'uid': os.getuid(), 'workspace_id': fixture.bundle['config']['workspace_id']}))
+        (tasks / 'owner.json').chmod(0o600)
 
         calls = []
 
@@ -82,11 +83,15 @@ def main(work, node, pvc):
             task = tasks / task_id
             task.mkdir(mode=0o700)
             record = task / 'task.json'
-            record.write_text(json.dumps({'version': 1, 'id': task_id, 'requestId': 'fixture-request',
+            record.write_text(json.dumps({'version': 2, 'id': task_id, 'requestId': 'fixture-request',
+                'cwd': str(work), 'prompt': 'synthetic prompt', 'sessionKey': 'fixture-session',
                 'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
                 'modelConfig': str(root / 'runtime/fixture-config.json'), 'modelProfile': 'env',
-                'permissions': {'mode': 'deny-all', 'policy': {}}, 'createdAt': 1000, 'outputTruncated': False,
-                'state': 'outbox', 'callback': {'callback_id': 'tcb_' + 'q' * 43,
+                'permissions': {'mode': 'deny-all', 'policy': {}}, 'createdAt': 1000,
+                'progress': {'at': 1000, 'tick': 0, 'clock': None}, 'noProgressMs': 900000,
+                'result': {'status': 'success', 'output': 'sealed fixture output', 'truncated': False,
+                           'at': 2000, 'source': 'turn.result', 'outputSource': 'assistant_output'},
+                'state': 'completed', 'callbackState': 'outbox', 'notificationKind': 'request_result', 'callback': {'callback_id': 'tcb_' + 'q' * 43,
                 'callback_url': f'http://127.0.0.1:{server.server_port}/api/agents/task-callbacks'},
                 'body': json.dumps({'version': 1, 'callback_id': 'tcb_' + 'q' * 43,
                                     'status': 'success', 'output': 'sealed fixture output'}), 'nextAttemptAt': 0}))
@@ -94,13 +99,12 @@ def main(work, node, pvc):
             before = snapshot(root)
             page = query('list')
             assert page['items'] and page['items'][0]['task_id'] == task_id, page['errors']
-            inspected = query('inspect', task_id)
-            assert inspected['health'] is None
-            assert inspected['execution']['agent_alive'] == 'unknown'
-            assert inspected['durations']['accepted_to_started']['ms'] is None
+            inspected = query('status', task_id)
+            assert inspected['result_status'] == 'success'
+            assert inspected['callback_state'] == 'outbox'
             assert snapshot(root) == before and not calls
             record.chmod(0o640)
-            assert query('inspect', task_id, ok=False)['error']['code'] == 'UNSAFE_TASK_FILE'
+            assert query('status', task_id, ok=False)['error']['code'] == 'UNSAFE_TASK_FILE'
             record.chmod(0o600)
             assert not (tasks / 'submit.lock').exists()
             assert not (root / 'runtime/module-profiles').exists()

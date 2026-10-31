@@ -5,8 +5,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { TaskRunner, HEALTH_DEFAULTS, save } from "../scripts/task.mjs";
-import { inspectTask, listTasks, readJson, RECORD_BYTES, PAGE_BYTES } from "../scripts/task-read.mjs";
+import { TaskRunner, save } from "../scripts/task.mjs";
+import { listTasks, readJson, RECORD_BYTES, PAGE_BYTES } from "../scripts/task-read.mjs";
 
 const callback = { callback_id: `tcb_${"q".repeat(43)}`, callback_url: "http://localhost:1/api/agents/task-callbacks" };
 const intent = { model: { id: 'codex/gpt-6.1-sol', variant: 'max' }, modelConfig: '/fixture/config.json', modelProfile: 'env' };
@@ -57,7 +57,6 @@ test("directory-cookie pagination bounds scan/response, filters, and samples cha
   assert.deepEqual(selected.items.map((item) => item.task_id), [ids[1]]);
   const afterChange = snapshot(root);
   listTasks(runner);
-  inspectTask(runner, ids[0]);
   runner.status(ids[0]);
   runner.result(ids[0]);
   assert.deepEqual(snapshot(root), afterChange);
@@ -87,25 +86,18 @@ test("empty, missing, unsupported, malformed and unsafe records have explicit bo
   const { root, runner, id } = fixture(t, 0);
   assert.deepEqual(listTasks(runner).items, []);
   assert.equal(listTasks(runner).coverage.complete, true);
-  assert.throws(() => inspectTask(runner, `task_${"0".repeat(64)}`), { code: "ENOENT" });
+  assert.throws(() => runner.status(`task_${"0".repeat(64)}`), { code: "ENOENT" });
   const ids = [];
   for (let index = 0; index < 8; index++) {
     const key = `task_${String(index).repeat(64)}`;
     ids.push(key);
     fs.mkdirSync(path.join(root, key), { mode: 0o700 });
-    save(path.join(root, key, "task.json"), { ...intent, version: 1, id: key, requestId: "request", state: "queued", callback,
-      createdAt: 10000, permissions: { mode: 'deny-all', policy: {} } });
+    save(path.join(root, key, "task.json"), { ...intent, version: 2, id: key, requestId: "request", sessionKey: "fixture-session",
+      cwd: root, prompt: "PRIVATE-PROMPT", state: "queued", callback,
+      createdAt: 10000, noProgressMs: 900000, progress: { at: 10000, tick: 0, clock: null }, permissions: { mode: 'deny-all', policy: {} } });
   }
-  const pending = inspectTask(runner, ids[0]);
-  assert.equal(pending.health, null);
+  const pending = runner.status(ids[0]);
   assert.equal(pending.timing.started_at, null);
-  assert.equal(pending.durations.accepted_to_started.ms, null);
-  assert.equal(pending.callback.retry_count, null);
-  for (const bad of [[], null, "PRIVATE-RAW-ERROR"]) {
-    save(runner.filename(ids[0], "worker.json"), bad);
-    assert.throws(() => inspectTask(runner, ids[0]), /INVALID_TASK_RESULT/);
-  }
-  fs.unlinkSync(runner.filename(ids[0], "worker.json"));
   fs.writeFileSync(runner.filename(ids[1]), '{"PRIVATE-RAW-ERROR":');
   fs.chmodSync(runner.filename(ids[2]), 0o644);
   fs.linkSync(runner.filename(ids[3]), path.join(root, "hardlink"));
@@ -125,7 +117,7 @@ test("empty, missing, unsupported, malformed and unsafe records have explicit bo
   assert.ok(page.errors.some((entry) => entry.code === "TASK_NOT_FOUND"));
   assert.equal(JSON.stringify(page).includes("PRIVATE-RAW-ERROR"), false);
   fs.chmodSync(path.join(root, ids[0]), 0o755);
-  assert.throws(() => inspectTask(runner, ids[0]), /UNSAFE_TASK_DIRECTORY/);
+  assert.throws(() => runner.status(ids[0]), /UNSAFE_TASK_DIRECTORY/);
   assert.equal(id, undefined);
 });
 
@@ -191,40 +183,28 @@ test("record and aggregate read budgets stop without losing the unexamined curso
   assert.equal(next.items.length, 2);
   assert.equal(new Set([...page.items, ...next.items].map((item) => item.task_id)).size, 6);
   fs.truncateSync(runner.filename(ids[0]), RECORD_BYTES + 1);
-  assert.throws(() => inspectTask(runner, ids[0]), /TASK_RECORD_TOO_LARGE/);
+  assert.throws(() => runner.status(ids[0]), /TASK_RECORD_TOO_LARGE/);
 });
 
-test("inspect separates stale observations, wall-clock differences and unknown business outcomes", (t) => {
+test("status separates callback notification from canonical result without reading old health samples", (t) => {
   const { runner, id } = fixture(t);
   const record = runner.load(id);
   Object.assign(record, { state: "ambiguous", createdAt: 10000, startedAt: 9000,
-    outputTruncated: false,
-    supervisionFailedAt: 20000, callbackDeliveredAt: 30000, attempts: 2,
-    notificationKind: "supervision_failure", notificationState: "delivered", resultStatus: "success",
+    notificationAt: 20000, callbackDeliveredAt: 30000, attempts: 2,
+    notificationKind: "no_progress", callbackState: "delivered",
     body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "error", output: "PRIVATE-OUTPUT" }),
-    executionError: "PRIVATE-RAW-ERROR", deliveryError: "PRIVATE-RAW-ERROR",
-    health: { phase: "supervision_failed", observedAt: 1000, lastEventAt: 110000, lastProbeAt: 2000,
-      owner: "lease_current", ownerProcess: "alive", journal: "available", assessment: "unavailable",
-      progress: "provider_retry", retryUntil: 120000, policy: HEALTH_DEFAULTS } });
+    executionError: "PRIVATE-RAW-ERROR", deliveryError: "PRIVATE-RAW-ERROR" });
   save(runner.filename(id), record);
   save(runner.filename(id, "monitor.json"), { at: 1000, workerAssessment: "suspected", workerSuspectedAt: 500 });
   save(runner.filename(id, "worker.json"), { at: 110000 });
   const before = fs.readFileSync(runner.filename(id));
-  const inspected = inspectTask(runner, id);
+  const inspected = runner.status(id);
   assert.equal(inspected.result_status, null);
-  assert.equal(inspected.callback.status, "error");
-  assert.equal(inspected.callback.retry_count, 2);
-  assert.equal(inspected.callback.next_attempt_at, null);
-  assert.equal(inspected.callback.delivery_error, "UNKNOWN_RECORDED_CODE");
-  assert.equal(inspected.durations.started_to_terminal.ms, null);
-  assert.equal(inspected.durations.accepted_to_started.basis, "wall_clock_reversed");
-  assert.equal(inspected.durations.supervision_failure_to_delivery.ms, 10000);
-  assert.equal(inspected.observations.health.freshness, "stale");
-  assert.equal(inspected.observations.worker.freshness, "future_timestamp");
-  assert.equal(inspected.observations.worker.age_ms, null);
-  assert.equal(inspected.health.agent, "unknown");
-  assert.equal(inspected.execution.agent_alive, "unknown");
-  assert.equal(inspected.execution.deadlock, "unknown");
+  assert.equal(inspected.callback_status, "error");
+  assert.equal(inspected.callback_state, "delivered");
+  assert.equal(inspected.delivery_error, "UNKNOWN_RECORDED_CODE");
+  assert.equal(inspected.timing.terminal_at, null);
+  assert.equal(inspected.health, undefined);
   for (const secret of ["PRIVATE-OUTPUT", "PRIVATE-PROMPT", "PRIVATE-RAW-ERROR", callback.callback_id, callback.callback_url])
     assert.equal(JSON.stringify(inspected).includes(secret), false, secret);
   assert.deepEqual(fs.readFileSync(runner.filename(id)), before);
@@ -242,16 +222,16 @@ test("installed launcher queries do not initialize storage, materialize profiles
   fs.mkdirSync(path.join(version, "node/bin"), { recursive: true, mode: 0o700 });
   fs.copyFileSync(process.execPath, path.join(version, "node/bin/node"));
   const scripts = new URL("../scripts/", import.meta.url);
-  for (const name of ["runtime.py", "safety.py", "profiles.py", "diagnostics.py", "task-cli.mjs", "task.mjs", "task-read.mjs", "task-supervisor.mjs"])
+  for (const name of ["runtime.py", "safety.py", "profiles.py", "diagnostics.py", "task-cli.mjs", "task.mjs", "task-read.mjs"])
     fs.copyFileSync(new URL(name, scripts), path.join(version, name));
   save(path.join(version, "settings.json"), { install_root: root, workspace_id: "readonly-fixture", runtime_profile: "env" });
   save(path.join(root, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "readonly-fixture" });
   fs.symlinkSync(path.relative(root, version), path.join(root, "active"));
   fs.writeFileSync(path.join(root, "bin/opencode-task"), `#!/usr/bin/env bash\nexec python3 -B '${root}/active/runtime.py' opencode-task "$@"\n`, { mode: 0o700 });
   const query = (...args) => spawnSync(path.join(root, "bin/opencode-task"), args, { cwd: base,
-    env: { PATH: "/usr/bin:/bin", OPENCODE_TASK_POLL_MS: "invalid", OPENCODE_MODULE_CONFIG: "/DO-NOT-OPEN/private-config" }, encoding: "utf8", timeout: 5000 });
+    env: { PATH: "/usr/bin:/bin", OPENCODE_MODULE_CONFIG: "/DO-NOT-OPEN/private-config" }, encoding: "utf8", timeout: 5000 });
   let before = snapshot(root);
-  for (const args of [["list"], ["inspect", `task_${"0".repeat(64)}`], ["status", `task_${"0".repeat(64)}`], ["result", `task_${"0".repeat(64)}`]]) {
+  for (const args of [["list"], ["status", `task_${"0".repeat(64)}`], ["result", `task_${"0".repeat(64)}`]]) {
     const response = query(...args);
     assert.equal(response.status, 1, response.stderr);
     assert.equal(JSON.parse(response.stderr).error.code, "TASK_STORE_MISSING");
@@ -264,11 +244,13 @@ test("installed launcher queries do not initialize storage, materialize profiles
   const runner = new TaskRunner({ root: tasks });
   const accepted = runner.submit({ ...intent, key: "readonly", prompt: "PRIVATE-PROMPT", callback, cwd: base });
   const record = runner.load(accepted.task_id);
-  Object.assign(record, { state: "outbox", resultStatus: "success", attempts: 0, nextAttemptAt: 0, outputTruncated: false,
+  Object.assign(record, { state: "completed", result: { status: "success", output: "SEALED RESULT", truncated: false,
+    at: 100000, source: "turn.result", outputSource: "assistant_output" }, attempts: 0, nextAttemptAt: 0,
+    callbackState: "outbox", notificationKind: "request_result",
     body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "success", output: "SEALED RESULT" }) });
   save(runner.filename(accepted.task_id), record);
   before = snapshot(root);
-  for (const args of [["list"], ["inspect", accepted.task_id], ["status", accepted.task_id], ["result", accepted.task_id]]) {
+  for (const args of [["list"], ["status", accepted.task_id], ["result", accepted.task_id]]) {
     const response = query(...args);
     assert.equal(response.status, 0, response.stderr);
     const value = JSON.parse(response.stdout);

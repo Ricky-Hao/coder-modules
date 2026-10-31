@@ -22,7 +22,7 @@ NODE_SHA256 = '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce'
 NODE_URL = 'https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz'
 ACPX_VERSION = '0.21.1'
 TARGET = 'opencode-linux-x64-baseline'
-PAYLOAD_FILES = {'install.py', 'runtime.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
+PAYLOAD_FILES = {'install.py', 'runtime.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}
 
 
@@ -307,10 +307,7 @@ def install(bundle):
             finally:
                 temp.unlink(missing_ok=True)
             shell_path['install'](user_home, str(root / 'bin'))
-            # Recover only module-owned records. The command detaches workers;
-            # installation does not wait on model turns or callback networking.
-            subprocess.run([str(root / 'bin/opencode-task'), 'recover'], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            # 安装只管理工具；任务观察与 outbox 补投须显式 recover。
             status('ready')
             print('OpenCode, acpx and opencode-task installation verified; status: ' + str(root / 'status.json'))
         except BaseException as exc:

@@ -91,7 +91,8 @@ def verify_startup(script, fixture_dir):
     first = launch(script, home, fixture_dir, release, node)
     assert first.returncode == 0, first.stderr
     active = os.readlink(root / 'active')
-    assert (root / 'runtime/state/fixture-startup-recoveries').read_text() == '1'
+    assert not (root / 'runtime/state/fixture-startup-recoveries').exists()
+    (root / 'runtime/tasks').mkdir(mode=0o700)
     task = root / 'runtime/tasks' / ('task_' + 'a' * 64)
     task.mkdir(mode=0o700)
     task_state = task / 'task.json'
@@ -106,7 +107,7 @@ def verify_startup(script, fixture_dir):
     repeated = launch(script, home, fixture_dir, release, node, offline=True)
     assert repeated.returncode == 0, repeated.stderr
     assert os.readlink(root / 'active') == active
-    assert (root / 'runtime/state/fixture-startup-recoveries').read_text() == '2'
+    assert not (root / 'runtime/state/fixture-startup-recoveries').exists()
     assert json.loads((root / 'status.json').read_text())['state'] == 'ready'
     assert preserved == {path: (path.read_bytes(), path.stat().st_uid, path.stat().st_mode) for path in preserved}
     assert sibling_state == (sibling.stat().st_uid, sibling.stat().st_mode, (sibling / 'preserved').read_bytes())
@@ -118,7 +119,7 @@ def verify_startup(script, fixture_dir):
             'root_mode': oct(root.stat().st_mode & 0o777),
             'task_mode': oct(task.parent.stat().st_mode & 0o777),
             'first_and_cached_startup': 'passed', 'downloads': 2,
-            'startup_recover_invocations': 2, 'runtime_and_sibling_preservation': 'passed'}
+            'startup_recover_invocations': 0, 'runtime_and_sibling_preservation': 'passed'}
 
 
 def execute_fixture():

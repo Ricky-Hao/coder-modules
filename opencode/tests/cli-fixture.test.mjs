@@ -38,7 +38,7 @@ while True: time.sleep(0.01)
     const exit = new Promise((resolve) => child.once("exit", resolve));
     children.push({ child, exit });
     await new Promise((resolve, reject) => { child.once("error", reject); child.stdout.once("data", resolve); });
-    return { child, exit, output: () => output, proof: { pid: child.pid, ticks: processBirth(child.pid).ticks, role: "_worker" } };
+    return { child, exit, output: () => output, proof: { pid: child.pid, ticks: processBirth(child.pid).ticks, role: "_run" } };
   };
   try {
     const writer = await launch();
@@ -82,7 +82,7 @@ test("parent spawn records detached children before their own entry; active and 
   assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
   for (const name of [path.join(root, "bin/opencode"), path.join(version, "opencode")])
     fs.writeFileSync(name, `trap 'exit 0' TERM\nexec 9<> '${fifo}'\nread -r -u 9 value\n`);
-  const entries = [["python3", ["-B", path.join(root, "active/runtime.py"), "_supervise"]],
+  const entries = [["python3", ["-B", path.join(root, "active/runtime.py"), "_run"]],
     ["bash", [path.join(root, "bin/opencode")]], ["bash", [path.join(root, "active/opencode")]],
     ["bash", [path.join(version, "opencode")]]];
   try {
@@ -228,18 +228,19 @@ while True: time.sleep(0.01)
       const read = fs.readFileSync;
       const kill = process.kill;
       let empty = true;
+      let completed = false;
       const signals = [];
       try {
         await new Promise((resolve) => child.stdout.once('data', resolve));
-        const proof = { pid: child.pid, ticks: processBirth(child.pid).ticks, role: '_worker' };
+        const proof = { pid: child.pid, ticks: processBirth(child.pid).ticks, role: '_run' };
         fs.writeFileSync(path.join(base, 'drivers.ndjson'), JSON.stringify(proof) + '\n');
         fs.readFileSync = (...args) => args[0] === `/proc/${child.pid}/cmdline` && empty ? '' : read(...args);
         process.kill = (pid, signal) => {
           assert.equal(pid, child.pid); assert.equal(empty, false);
           signals.push(signal); return kill(pid, signal);
         };
-        let completed = false;
-        const cleanup = stopFixtureProcesses(base, version).finally(() => { completed = true; });
+        let cleanupCompleted = false;
+        const cleanup = stopFixtureProcesses(base, version).finally(() => { cleanupCompleted = true; });
         if (persistent) {
           await assert.rejects(cleanup, /still writing or unverified/);
           assert.deepEqual(signals, []);
@@ -247,7 +248,7 @@ while True: time.sleep(0.01)
           assert.equal(child.exitCode, null);
         } else {
           await pause(60);
-          assert.equal(completed, false);
+          assert.equal(cleanupCompleted, false);
           assert.deepEqual(signals, []);
           empty = false;
           await cleanup;
@@ -255,11 +256,12 @@ while True: time.sleep(0.01)
           assert.deepEqual(signals, ['SIGTERM']);
           assert.ok(fs.existsSync(path.join(base, 'done')));
         }
+        completed = true;
       } finally {
         fs.readFileSync = read; process.kill = kill;
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
         await exit;
-        fs.rmSync(base, { recursive: true, force: true });
+        if (completed) fs.rmSync(base, { recursive: true, force: true });
       }
     });
 }

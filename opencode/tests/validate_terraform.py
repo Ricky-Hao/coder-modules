@@ -119,7 +119,7 @@ run "executable_dedicated_startup" {
         sizes.append({'script': number, 'bytes': size, 'budget': SCRIPT_BUDGET})
         configs.append(bundle['config'])
         assert set(bundle['files']) == {'install.py', 'runtime.py', 'safety.py', 'profiles.py',
-                                        'profile-env.json', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs',
+                                        'profile-env.json', 'shell_path.py', 'task.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs',
                                         'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():
             assert text.encode() == (module / 'scripts' / name).read_bytes()
@@ -160,7 +160,7 @@ run "stale_source_bundle" {
         source.write_bytes(original)
     (scratch / 'startup-evidence.json').write_text(json.dumps({'sizes': sizes, 'execution': execution}, indent=2) + '\n')
     print(json.dumps({'sizes': sizes, 'execution': execution}, indent=2))
-    print('PASS: cached init, validate, mock plans, budget rejection, rendered env/bash -c execution, install/cache/recovery/preservation; no apply')
+    print('PASS: cached init, validate, mock plans, budget rejection, rendered env/bash -c execution, install/cache/preservation without automatic recovery; no apply')
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 export const RECORD_BYTES = 8 * 1024 * 1024;
 export const PAGE_BYTES = 32 * 1024 * 1024;
 export const SNAPSHOT_BYTES = 16384;
-const states = ["queued", "dispatching", "running", "ambiguous", "outbox", "delivered", "rejected"];
+const states = ["queued", "preparing", "dispatching", "running", "ambiguous", "completed"];
 
 export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = false } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -48,7 +48,7 @@ export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = 
 export function readError(error) {
   const known = ["UNSAFE_TASK_FILE", "UNSAFE_TASK_DIRECTORY", "INVALID_TASK_RESULT", "INVALID_TASK_ID",
     "TASK_RECORD_TOO_LARGE", "TASK_READ_BUDGET", "TASK_RECORD_CHANGED", "CURSOR_STALE", "INVALID_CURSOR",
-    "INVALID_ARGUMENTS", "TASK_DIRECTORY_UNREADABLE", "UNSUPPORTED_TASK_RECORD"];
+    "INVALID_ARGUMENTS", "TASK_DIRECTORY_UNREADABLE", "UNSUPPORTED_TASK_RECORD", "UNSUPPORTED_SESSION_RECORD"];
   if (known.includes(error.message)) return error.message;
   if (error.code === "ENOENT") return "TASK_NOT_FOUND";
   if (["ELOOP", "ENOTDIR"].includes(error.code)) return "UNSAFE_TASK_DIRECTORY";
@@ -97,10 +97,10 @@ export function listTasks(runner, flags = {}) {
     if (entry.id) {
       try {
         const record = runner.load(entry.id, { budget });
-        const summary = runner.resultRecord(record, { output: false, health: false });
+        const summary = runner.resultRecord(record, { output: false });
         checked++;
         if ((state === undefined || summary.state === state) && (session === undefined || summary.session_name === session)) {
-          const { evidence, health, ...item } = summary;
+          const { evidence, ...item } = summary;
           items.push(item);
         }
       } catch (error) {
@@ -122,62 +122,4 @@ export function listTasks(runner, flags = {}) {
     exhausted, complete: exhausted && errors.length === 0, stop_reason: stopped ?? (exhausted ? "end" : "scan_limit"),
     remaining_records: null, consistency: "per_record_samples",
   }, next_cursor: next };
-}
-
-function interval(start, end) {
-  if (start === null || end === null) return { ms: null, basis: "missing_timestamp" };
-  if (end < start) return { ms: null, basis: "wall_clock_reversed" };
-  return { ms: Number.isSafeInteger(end - start) ? end - start : null, basis: "wall_clock_difference" };
-}
-
-function sample(at, now, staleAfter) {
-  if (at == null) return { at: null, age_ms: null, freshness: "unknown", stale_after_ms: staleAfter };
-  if (at > now) return { at, age_ms: null, freshness: "future_timestamp", stale_after_ms: staleAfter };
-  return { at, age_ms: now - at, freshness: staleAfter == null ? "unknown" : now - at > staleAfter ? "stale" : "recent",
-    stale_after_ms: staleAfter };
-}
-
-export function inspectTask(runner, id) {
-  const record = runner.load(id);
-  const result = runner.statusRecord(record);
-  const health = result.health;
-  const now = runner.now();
-  const at = result.timing;
-  const attempted = Number.isSafeInteger(record.workerAttemptedAt) ? record.workerAttemptedAt : null;
-  const dispatched = Number.isSafeInteger(record.dispatchedAt) ? record.dispatchedAt : null;
-  const poll = health?.policy_ms?.pollMs;
-  const probe = health?.policy_ms?.probeMs;
-  const observationLimit = poll != null && probe != null ? 2 * (poll + probe) : null;
-  const count = (value) => {
-    if (value == null) return null;
-    if (!Number.isSafeInteger(value) || value < 0) throw new Error("INVALID_TASK_RESULT");
-    return value;
-  };
-  return { ...result, read_only: true, inspected_at: now,
-    execution: { worker_attempted_at: attempted, dispatched_at: dispatched,
-      original_request_observed: typeof record.originalObserved === "boolean" ? record.originalObserved : null,
-      queue_membership: "unknown", agent_alive: "unknown", deadlock: "unknown" },
-    durations: Object.fromEntries([
-      ["accepted_to_started", at.accepted_at, at.started_at], ["started_to_terminal", at.started_at, at.terminal_at],
-      ["accepted_to_worker_attempt", at.accepted_at, attempted], ["worker_attempt_to_dispatch", attempted, dispatched],
-      ["dispatch_to_started", dispatched, at.started_at],
-      ["terminal_to_callback_attempt", at.terminal_at, at.callback_attempted_at],
-      ["terminal_to_callback_delivery", at.terminal_at, at.callback_delivered_at],
-      ["supervision_failure_to_delivery", at.supervision_failed_at, at.callback_delivered_at],
-    ].map(([name, start, end]) => [name, interval(start, end)])),
-    observations: {
-      health: sample(health?.observed_at, now, observationLimit),
-      owner_probe: sample(health?.last_probe_at, now, observationLimit),
-      last_event: sample(health?.last_event_at, now, null),
-      monitor: sample(health?.monitor_heartbeat_at, now, poll == null ? null : 2 * poll),
-      worker: sample(health?.worker_heartbeat_at, now, health?.policy_ms?.workerMs ?? null),
-      owner: sample(health?.owner_heartbeat_at, now, 15000),
-    },
-    callback: { state: result.callback_state, kind: result.callback_kind, status: result.callback_status,
-      retry_count: count(record.attempts),
-      next_attempt_at: result.callback_state === "outbox" && Number.isSafeInteger(record.nextAttemptAt) ? record.nextAttemptAt : null,
-      delivery_error: runner.safeCode(record.deliveryError),
-    },
-    not_checked: ["live_health", "journal_contents"],
-    guidance: "历史样本不证明实时健康；墙钟差值不是执行耗时证明；不自动重发。" };
 }

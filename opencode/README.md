@@ -109,11 +109,11 @@ python3 -B opencode/build_bundle.py --check
 实际渲染脚本的 plan-time 上限为 **65536 字节**，不调整此预算。Linux 4096 字节页环境下，
 单参数含终止符上限为 131072 字节，须为 Coder wrapper 留空间。`bash -n` 或执行脚本文件
 不能代替真实 `env bash -c` 参数边界检查。源码/settings 增长后须重新运行真实 Terraform render，
-同时验证首次/缓存启动、恢复和数据保留。历史 E2BIG 及旧体积记录见 [UPGRADE.md](UPGRADE.md)。
+同时验证首次/缓存启动和数据保留，确认不自动恢复任务。历史 E2BIG 及旧体积记录见 [UPGRADE.md](UPGRADE.md)。
 
-当前清理候选原文 payload 为 196129 字节，标准 XZ 为 46160、base64 为 61548 字节。
-实际 Terraform HOME/固定专用根/含引号路径分别为 62741/62769/62785 字节；
-本轮全部配置最大 **62869/65536，余量 2667 字节**。余量仍有限，较长 settings 可被 plan 拒绝。
+当前轻量候选原文 payload 为 164654 字节，标准 XZ 为 40032、base64 为 53376 字节。
+实际 Terraform HOME/固定专用根/含引号路径分别为 54569/54597/54613 字节；
+本轮全部配置最大 **54689/65536，余量 10847 字节**。较长 settings 仍可被 plan 拒绝。
 
 ## 固定工具与输入
 
@@ -205,7 +205,7 @@ python3 -B opencode/tests/validate_terraform.py --terraform /path/to/terraform -
 ```
 
 需要 Terraform 1.7+ 和缓存 provider；执行 init、validate、mock plan/render、超预算拒绝、
-真实 Linux `env bash -c` 首次/缓存启动及恢复/数据保留，不 apply 或使用集群。
+真实 Linux `env bash -c` 首次/缓存启动和数据保留，确认无自动恢复，不 apply 或使用集群。
 Python fixtures 另核 root/UID65534、安全 PVC group、PATH 和私有文件边界。
 本地检查不证明真实服务健康，也不发布、激活模板或重启 Workspace。
 

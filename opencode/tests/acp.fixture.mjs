@@ -129,42 +129,14 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       send({ id: request.id, error: { code: -32603, message: "synthetic provider.internal",
         data: { service: "session", errorName: "provider.internal" } } });
     } else if (text === "agent exit") process.exit(23);
-    else if (text === "silent forever") {
-      // 先保持进展，待同 session 跟随请求排队后再注入永久静默，终态永不返回。
+    else if (text === "controlled task") {
+      // 调用者控制静默和晚到终态，不由监督逻辑替夹具作决定。
       active = { request, timer: setInterval(() => {
-        if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.stall`))) {
+        if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.finish`))) {
           clearInterval(active.timer);
-          fixtureEvent("silent_started", request.params.sessionId);
-        } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+          finish("Controlled result");
+        } else if (!fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.stall`))) send({ method: "session/update", params: { sessionId: request.params.sessionId,
           update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault progress." } } } });
-      }, 100) };
-    } else if (text === "recover thought progress") {
-      fixtureEvent("thought_ready", request.params.sessionId);
-      let quiet = false;
-      let resumed;
-      active = { request, timer: setInterval(() => {
-        if (!quiet) {
-          if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.quiet`))) {
-            quiet = true;
-            fixtureEvent("quiet_started", request.params.sessionId);
-          } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
-            update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault thought." } } } });
-          return;
-        }
-        // 测试观察到 suspected 后，仅解除合成 peer 的静默，不改任务状态。
-        if (!fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, request.params.sessionId))) return;
-        if (resumed === undefined) {
-          resumed = performance.now();
-          fixtureEvent("thought_resumed", request.params.sessionId);
-        }
-        if (performance.now() - resumed >= 1600 &&
-            fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.finish`))) {
-          clearInterval(active.timer);
-          fixtureEvent("thought_completed", request.params.sessionId);
-          reply({ stopReason: "end_turn" }); // 全程没有 assistant 文字。
-          active = undefined;
-        } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
-          update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic progress." } } } });
       }, 100) };
     }
     else if (text === "long tool") {

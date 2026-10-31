@@ -248,11 +248,11 @@ class StartupTests(unittest.TestCase):
         self.fixture.bundle['config']['install_root'] = str(root)
         self.fixture.install()
         manifest = json.loads((root / 'active/installed.json').read_text())
-        for name in ('task.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs', 'task-supervisor.mjs'):
+        for name in ('task.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs'):
             self.assertIn(name, manifest['files'])
         self.assertIn('opencode-task', {p.name for p in (root / 'bin').iterdir()})
         task = root / 'runtime/tasks' / ('task_' + 'a' * 64)
-        task.mkdir(mode=0o700)
+        task.mkdir(mode=0o700, parents=True)
         (task / 'task.json').write_bytes(b'preserve private task bytes')
         (task / 'task.json').chmod(0o600)
         old = root / 'runtime/home/.acpx/old-session'
@@ -297,11 +297,14 @@ class StartupTests(unittest.TestCase):
         root = self.fixture.root
         task_id = 'task_' + 'b' * 64
         task = root / 'runtime/tasks' / task_id
-        task.mkdir(mode=0o700)
+        task.mkdir(mode=0o700, parents=True)
+        (task.parent / 'owner.json').write_text(json.dumps({'schema': 1, 'uid': os.getuid(),
+                                                          'workspace_id': self.fixture.bundle['config']['workspace_id']}))
+        (task.parent / 'owner.json').chmod(0o600)
         for name, value in (('task.json', {'state': 'queued'}), ('cancel.json', {'requested': True})):
             (task / name).write_text(json.dumps(value))
             (task / name).chmod(0o600)
-        result = subprocess.run([str(root / 'bin/opencode-task'), '_worker', task_id],
+        result = subprocess.run([str(root / 'bin/opencode-task'), '_run', task_id],
                                 env={'PATH': '/usr/bin:/bin'}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
