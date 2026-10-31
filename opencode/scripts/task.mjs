@@ -175,13 +175,147 @@ export function bounded(value, max = OUTPUT_BYTES) {
     .replace(/\uFFFD$/, "");
 }
 
+function boundedInfo(value, max = OUTPUT_BYTES) {
+  const text = bounded(value, max);
+  return {
+    text,
+    bytes: Buffer.byteLength(text),
+    truncated: text !== value,
+  };
+}
+
+function time(value) {
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function identifier(value) {
+  if (value == null) return null;
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(value) ||
+    value.includes("tcb_")
+  )
+    throw new Error("INVALID_TASK_RESULT");
+  return value;
+}
+
+function resultChoice(value, choices) {
+  if (value == null) return null;
+  if (!choices.includes(value)) throw new Error("INVALID_TASK_RESULT");
+  return value;
+}
+
+function resultCallback(record) {
+  try {
+    return validateCallback(record.callback);
+  } catch {
+    throw new Error("INVALID_TASK_RESULT");
+  }
+}
+
+function timing(record) {
+  return {
+    time_basis: "unix_epoch_ms_wall_clock",
+    accepted_at: time(record.createdAt),
+    started_at: time(record.startedAt),
+    terminal_at: time(record.terminalAt),
+    callback_attempted_at: time(record.callbackAttemptedAt),
+    callback_delivered_at: time(record.callbackDeliveredAt),
+  };
+}
+
+function sealedResult(record, callback) {
+  if (record.body === undefined) return null;
+  if (
+    typeof record.body !== "string" ||
+    !["outbox", "delivered", "rejected"].includes(record.state)
+  )
+    throw new Error("INVALID_TASK_RESULT");
+  let value;
+  try {
+    value = JSON.parse(record.body);
+  } catch {
+    throw new Error("INVALID_TASK_RESULT");
+  }
+  if (
+    !value ||
+    value.version !== 1 ||
+    value.callback_id !== callback.callback_id ||
+    !["success", "error", "cancelled"].includes(value.status) ||
+    typeof value.output !== "string"
+  )
+    throw new Error("INVALID_TASK_RESULT");
+  return value;
+}
+
+function privateResultText(value, callback) {
+  return value.includes("tcb_") || value.includes(callback.callback_url);
+}
+
+function resultOutput(record, payload, callback) {
+  const limit = callback.max_output_bytes;
+  if (!payload)
+    return {
+      output: null,
+      output_bytes: null,
+      output_limit_bytes: limit,
+      output_truncated: null,
+      output_available: false,
+    };
+  const boundedOutput = boundedInfo(payload.output, limit);
+  const truncated = typeof record.outputTruncated === "boolean"
+    ? record.outputTruncated : null;
+  // Inspect the sealed text before clipping, so a clipped bearer is not printable.
+  const privateOutput = privateResultText(payload.output, callback);
+  return {
+    output: privateOutput ? null : boundedOutput.text,
+    output_bytes: privateOutput ? null : boundedOutput.bytes,
+    output_limit_bytes: limit,
+    output_truncated: boundedOutput.truncated ? true : truncated,
+    output_available: !privateOutput,
+    ...(privateOutput ? { output_error: "PRIVATE_CALLBACK_CONTENT" } : {}),
+  };
+}
+
+function resultReceipt(value, callback) {
+  if (value == null) return null;
+  if (
+    value.version !== 1 ||
+    typeof value.receipt_id !== "string" ||
+    !value.receipt_id || Buffer.byteLength(value.receipt_id) > 256 ||
+    typeof value.accepted_at !== "string" ||
+    Buffer.byteLength(value.accepted_at) > 256 ||
+    !Number.isFinite(Date.parse(value.accepted_at))
+  )
+    throw new Error("INVALID_TASK_RESULT");
+  if (privateResultText(value.receipt_id + value.accepted_at, callback))
+    throw new Error("INVALID_TASK_RESULT");
+  return { receipt_id: value.receipt_id, accepted_at: value.accepted_at };
+}
+
+function evidence(record, payload, callback) {
+  return {
+    lifecycle: "program_observed",
+    terminal_source: payload ? resultChoice(record.terminalSource, [
+      "turn.result", "watchSession.turn_result", "queued_cancellation", "operator_resolution",
+    ]) : null,
+    output_source: payload ? resultChoice(record.outputSource, [
+      "assistant_output", "program_generated", "operator_verified",
+    ]) : null,
+    callback_receipt: resultReceipt(record.receipt, callback),
+  };
+}
+
 /** Keep the last assistant message, including bounded chunks; thoughts/tools are omitted. */
 export function appendOutput(record, text, messageId) {
   if (messageId && messageId !== record.outputMessageId) {
     record.outputMessageId = messageId;
     record.output = "";
+    record.outputTruncated = false;
   }
-  record.output = bounded((record.output ?? "") + text);
+  const collected = boundedInfo((record.output ?? "") + text);
+  if (collected.truncated) record.outputTruncated = true;
+  record.output = collected.text;
 }
 
 function terminalStatus(result) {
@@ -401,12 +535,43 @@ export class TaskRunner {
       ...(record.resultStatus ? { result_status: record.resultStatus } : {}),
       ...(record.deliveryError ? { delivery_error: record.deliveryError } : {}),
       ...(record.executionError ? { execution_error: record.executionError } : {}),
+      timing: timing(record),
       ...(record.state === "ambiguous"
         ? {
             guidance:
               "Original request outcome is unknown. Recover watches that request; resolve only with independently verified output. Never automatically resubmit the prompt.",
           }
         : {}),
+    };
+  }
+  result(id) {
+    let record;
+    try {
+      record = this.load(id);
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error("INVALID_TASK_RESULT");
+      throw error;
+    }
+    if (!record || record.version !== 1 || record.id !== id)
+      throw new Error("INVALID_TASK_RESULT");
+    const callback = resultCallback(record);
+    const payload = sealedResult(record, callback);
+    const session = record.handle ?? {};
+    return {
+      version: 1,
+      task_id: id,
+      request_id: identifier(record.requestId),
+      session_name: identifier(record.sessionName),
+      session_key: identifier(record.sessionKey),
+      session_id: identifier(session.backendSessionId),
+      acpx_record_id: identifier(session.acpxRecordId),
+      state: resultChoice(record.state, [
+        "queued", "dispatching", "running", "ambiguous", "outbox", "delivered", "rejected",
+      ]),
+      result_status: payload?.status ?? null,
+      timing: timing(record),
+      ...resultOutput(record, payload, callback),
+      evidence: evidence(record, payload, callback),
     };
   }
   pending() {
@@ -419,10 +584,23 @@ export class TaskRunner {
           !["delivered", "rejected"].includes(this.load(id).state),
       );
   }
-  seal(record, status, output) {
+  seal(
+    record,
+    status,
+    output,
+    terminalSource = "turn.result",
+    outputSource = "assistant_output",
+  ) {
     if (record.body) return;
+    const body = callbackBody(record.callback, status, output);
     record.resultStatus = status;
-    record.body = JSON.stringify(callbackBody(record.callback, status, output));
+    record.terminalAt = this.now();
+    record.terminalSource = terminalSource;
+    record.outputSource = outputSource;
+    const collectedTruncation = outputSource === "assistant_output"
+      ? record.outputTruncated ?? null : false;
+    record.outputTruncated = body.output !== output ? true : collectedTruncation;
+    record.body = JSON.stringify(body);
     record.state = "outbox";
     record.attempts = 0;
     record.nextAttemptAt = this.now();
@@ -433,6 +611,8 @@ export class TaskRunner {
   async deliver(record) {
     if (record.state !== "outbox" || record.nextAttemptAt > this.now()) return;
     let retryAfter;
+    record.callbackAttemptedAt = this.now();
+    this.write(record);
     try {
       const response = await this.fetcher(record.callback.callback_url, {
         method: "POST",
@@ -443,6 +623,7 @@ export class TaskRunner {
       });
       if (response.status === 202) {
         record.receipt = await receipt(response);
+        record.callbackDeliveredAt = this.now();
         record.state = "delivered";
         delete record.deliveryError;
       } else {
@@ -482,6 +663,7 @@ export class TaskRunner {
     );
     if (!record.cursor) {
       record.output = "";
+      record.outputTruncated = false;
       delete record.outputMessageId;
     }
     try {
@@ -508,6 +690,7 @@ export class TaskRunner {
               record,
               terminalStatus(event.result),
               record.output ?? "",
+              "watchSession.turn_result",
             );
             return;
           }
@@ -538,7 +721,13 @@ export class TaskRunner {
     const record = this.load(id);
     if (record.state === "queued") {
       if (fs.existsSync(this.filename(id, "cancel.json"))) {
-        this.seal(record, "cancelled", "Task cancelled before execution.");
+        this.seal(
+          record,
+          "cancelled",
+          "Task cancelled before execution.",
+          "queued_cancellation",
+          "program_generated",
+        );
         return;
       }
       // ensureSession does not dispatch the prompt. A queued crash is safe to resume.
@@ -560,6 +749,7 @@ export class TaskRunner {
         throw error; // No dispatch has been attempted; retain queued for explicit recovery.
       }
       record.state = "dispatching";
+      record.outputTruncated = false;
       this.write(record);
       let monitor;
       try {
@@ -573,6 +763,7 @@ export class TaskRunner {
         const started = turn.promptStarted
           .then(() => {
             record.state = "running";
+            if (record.startedAt === undefined) record.startedAt = this.now();
             this.write(record);
           })
           .catch(() => {});
@@ -625,6 +816,12 @@ export class TaskRunner {
     const record = this.load(id);
     if (record.state !== "ambiguous" || record.body)
       throw new Error("TASK_NOT_AMBIGUOUS");
-    this.seal(record, status, output);
+    this.seal(
+      record,
+      status,
+      output,
+      "operator_resolution",
+      "operator_verified",
+    );
   }
 }

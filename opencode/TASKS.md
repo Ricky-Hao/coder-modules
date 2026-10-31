@@ -39,6 +39,7 @@ opencode-task submit --key copilot-123 --model copilot/gpt-6.1-sol --variant max
 opencode-task submit --key astra-123 --model copilot/gpt-6-astra --variant high --prompt-file ./task-prompt.txt < /private/task-registration.json
 opencode-task submit --key ticket-123-fix --session ticket-123 --permission-mode approve-all --prompt-file ./fix.txt < /private/fix-registration.json
 opencode-task status task_<64-hex-digest-from-submit>
+opencode-task result task_<64-hex-digest-from-submit>
 opencode-task recover
 opencode-task cancel task_<64-hex-digest-from-submit>
 ```
@@ -48,9 +49,50 @@ private request and the detached launch attempt. This is local durable acceptanc
 not proof that ACP/the model already received the prompt. The worker survives the
 submitter. Use a stable caller-chosen `--key`: the same key/prompt/cwd/registration
 returns the same task/request; changed data fails closed. `status` exposes
-state/result status, permission mode, optional session name, cancellation request
-and safe codes, never callback, prompt, output or raw errors.
+state/result status, permission mode, optional session name, safe lifecycle timing,
+cancellation request and safe codes, never callback, prompt, output or raw errors.
 A stopped worker is recovered by startup or `recover`.
+
+### 有界结果读取与时间
+
+`result TASK_ID` 只读已有 durable state，不启动模型、恢复任务或投递 callback。
+它返回 `task_id`、`request_id`、`session_name`、`session_key`、`session_id` 和
+`acpx_record_id`。`session_id` 只使用已保存的 backend session ID，不用 acpx record ID
+代替；未取得的标识为 `null`。`state` 是执行器状态，`result_status` 是已封存的
+`success|error|cancelled`，与 callback 是否投递成功无关。
+
+终态 `output` 只取已封存 body 的输出字段。非终态返回 `output: null`，不返回正在收集
+的文本。`output_bytes` 是返回文本的 UTF-8 字节数；`output_limit_bytes` 为 callback
+注册的较小限额，缺省 32768，上限 32768。这是文本限额，不含 JSON 转义和其他字段。
+`output_truncated` 覆盖流收集、封存和读取时的实际裁剪；旧记录未保存裁剪信息且本次
+未裁剪时，返回 `null`，不能推定完整。`output_available` 区分未取得或被扣留的输出。
+
+该接口不返回内部 prompt、callback 注册、完整 body、凭据、cwd 或 raw errors。
+它只允许已知元数据字段及类型。malformed 记录失败时不打印原文。输出含 `tcb_` 或
+已保存 callback URL 时，扣留整个输出并返回 `PRIVATE_CALLBACK_CONTENT`；不改写
+封存 body。assistant 文本仍可能含业务敏感内容，负责人应在任务授权范围内读取。
+
+`timing.time_basis` 为 `unix_epoch_ms_wall_clock`。各时间使用本地 wall clock 毫秒：
+
+- `accepted_at` 复用已有 `createdAt`，记录首次提交的持久接受；同 key 重试不更新。
+- `started_at` 只在 `promptStarted` 时保存。恢复若未找到已保存时间，则保持 `null`，
+  不把首次观察时间当作原请求开始时间。
+- `terminal_at` 记录封存终态的本地观测时间，在首次 POST 前保存。被动恢复或人工
+  resolve 的时间可能晚于原业务完成时间，不声称是原事件的精确时间。
+- `callback_attempted_at` 记录最近一次 POST 前的时间。它不证明服务已收到。
+- `callback_delivered_at` 只在收到有效 `202` receipt 后保存，表示本地确认时间。
+
+旧记录缺失时间时返回 `null`，读取不补写旧记录。wall clock 差值不是 CPU time，
+可能受系统时钟调整影响。callback receipt 的服务时间单独保留于
+`evidence.callback_receipt`，只证明 callback 存储/队列接受，不证明后续模型已完成。
+
+`evidence.terminal_source` 区分 `turn.result`、`watchSession.turn_result`、
+`queued_cancellation` 和 `operator_resolution`。`output_source` 区分
+`assistant_output`、`program_generated` 和 `operator_verified`，旧来源为 `null`。
+assistant 的改动、测试和 SHA 是声明，执行器不解析这些声明，也不推断测试通过或
+Git push。task/request/session 标识和 receipt 是后续核对入口。
+所有事实沿用任务记录或封存 body；不生成或要求模型维护
+`result.md`、`result.json`、`recovery.md`。
 
 内置 env profile 的新任务默认 **codex/gpt-6.1-sol / max**，title 为 codex/Sol/low。
 `--model provider/model` 和独立的 `--variant variant` 正式选择单任务模型；

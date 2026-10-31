@@ -206,6 +206,47 @@ test(
       assert.equal(state, "delivered");
       assert.equal(seen.length, 2);
       assert.equal(seen[0], seen[1]);
+      const taskFile = path.join(root, "runtime/tasks", taskId, "task.json");
+      const beforeRead = fs.readFileSync(taskFile);
+      const readerCli = (args) => spawnSync(path.join(root, "bin/opencode-task"), args, {
+        cwd: base,
+        env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: base },
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      const result = readerCli(["result", taskId]);
+      assert.equal(result.status, 0, result.stderr);
+      const summary = JSON.parse(result.stdout);
+      assert.equal(summary.task_id, taskId);
+      assert.equal(summary.request_id, accepted.request_id);
+      assert.equal(summary.state, "delivered");
+      assert.equal(summary.result_status, "success");
+      assert.equal(summary.output, "Pinned ACP result");
+      assert.equal(summary.output_truncated, false);
+      assert.equal(summary.evidence.terminal_source, "turn.result");
+      assert.equal(summary.evidence.output_source, "assistant_output");
+      assert.ok(Number.isSafeInteger(summary.timing.accepted_at));
+      assert.ok(summary.timing.started_at >= summary.timing.accepted_at);
+      assert.ok(summary.timing.terminal_at >= summary.timing.started_at);
+      assert.ok(summary.timing.callback_attempted_at >= summary.timing.terminal_at);
+      assert.ok(summary.timing.callback_delivered_at >= summary.timing.callback_attempted_at);
+      assert.equal(result.stdout.includes(callbackId), false);
+      assert.equal(result.stdout.includes("Produce one final response."), false);
+      assert.equal(result.stdout.includes(JSON.parse(registration).callback_url), false);
+      assert.deepEqual(fs.readFileSync(taskFile), beforeRead);
+      const safeStatus = JSON.parse(readerCli(["status", taskId]).stdout);
+      assert.equal(JSON.stringify(safeStatus).includes(callbackId), false);
+      assert.equal(JSON.stringify(safeStatus).includes("Produce one final response."), false);
+      assert.equal(JSON.stringify(safeStatus).includes(summary.output), false);
+      assert.equal(readerCli(["result", taskId, "--unexpected"]).status, 1);
+      fs.writeFileSync(taskFile, JSON.stringify({ ...JSON.parse(beforeRead),
+        body: callbackId }), { mode: 0o600 });
+      const malformed = readerCli(["result", taskId]);
+      assert.equal(malformed.status, 1);
+      assert.equal(malformed.stdout, "");
+      assert.equal(malformed.stderr.includes(callbackId), false);
+      assert.equal(malformed.stderr.includes("Produce one final response."), false);
+      fs.writeFileSync(taskFile, beforeRead);
       const replay = cli(submitArgs, registration);
       assert.equal(replay.status, 0, replay.stderr);
       assert.deepEqual(JSON.parse(replay.stdout), accepted);
@@ -219,6 +260,8 @@ test(
       assert.equal(stored.resultStatus, 'success');
       assert.equal(JSON.parse(stored.body).output, 'Pinned ACP result');
       assert.equal(stored.requestId, accepted.request_id);
+      assert.equal(summary.session_id, stored.handle.backendSessionId ?? null);
+      assert.equal(summary.acpx_record_id, stored.handle.acpxRecordId);
       const load = (id) =>
         JSON.parse(
           fs.readFileSync(

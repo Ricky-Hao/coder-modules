@@ -10,8 +10,9 @@ tags: [helper, ide, ai]
 # OpenCode and acpx
 
 The module also installs **`opencode-task`** for detached tasks, durable callback
-delivery and recovery using the pinned acpx runtime. See [TASKS.md](TASKS.md) for
-the CLI, private-input contract, protocol and focused verification.
+delivery, recovery and bounded terminal-result reads using the pinned acpx runtime.
+See [TASKS.md](TASKS.md) for the CLI, private-input contract, protocol and focused
+verification.
 
 Install pinned OpenCode and acpx as the existing workspace user. Only `agent_id` is
 required. For persistent use, a dedicated writable PVC is recommended:
