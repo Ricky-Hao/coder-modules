@@ -388,7 +388,7 @@ python3 -B -m unittest discover -s opencode/tests -v
 node --test opencode/tests/task.test.mjs
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/runtime.test.mjs
-env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/cli.test.mjs
+env -i PATH=/usr/local/bin:/usr/bin:/bin node --test opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs
 # Optional: a reviewed published binary copied into an isolated scratch directory:
 env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode node --test opencode/tests/published.test.mjs
 # From the LibreChat companion's packages/api:
@@ -419,20 +419,29 @@ callback fixture，核对 HTTP 200 `response.failed` 和同 session 后续成功
 CLI 还专门验收“owner/agent 仍存活、原 request 已开始、永久静默且没有终态”：生产 wrapper、
 detached monitor/worker 和固定 acpx 自动完成怀疑、连续确认、封存及 HTTP error 投递。
 测试只控制合成 ACP peer、观察原 request journal 与出生身份，不代调 `fail/seal/deliver`，
-不通过取消或杀 owner/agent 促成检测。缩小策略为 poll 100、probe 1000、progress 600、
+不通过取消或杀 owner/agent 促成检测。原请求先发送合成进展，待同 session 后续请求排队且
+确认 peer 实际消费原请求后，再注入永久静默；`running/turn_started` 本身不代表 peer 已消费。
+缩小策略为 poll 100、probe 1000、progress 600、
 confirm 800 毫秒；首次 POST 须在最后进展后的 1400～4600 毫秒内，首 receipt 丢失后由
 原 outbox 按正常 5 秒退避原字节重投。有效 `202` receipt 后，`callback_state: delivered`、
 `callback_kind: supervision_failure`、`callback_status: error`，业务仍为 `ambiguous`，
 `result_status/terminal_at: null`。只执行一次业务；同 session 后续请求仍排队，未误取消或放行。
 
-健康对照先跨 progress 进入怀疑，再恢复只有 thought 的进展，清除怀疑并持续超过
-progress + confirm，最后只有一次 success callback，全程没有 assistant 文字；已有长工具
+健康对照由独立采样线程记录怀疑/恢复快照并只放行 peer 的 thought，避免同步 submit 阻塞父测试
+时错过短暂状态。父测试刻意阻塞 1.8 秒，peer 仍持续 thought，待父测试核对恢复且健康跨度超过
+progress + confirm 后才放行成功终态。最后只有一次 success callback，全程没有 assistant 文字；已有长工具
 对照继续跨普通静默边界成功。CLI 的 `healthy-tool`、`thought-after-suspicion`、
 `alive-original-stall` 诊断只输出合成标识、策略、观测时间与次数，可由上述命令复核。
 这些是本地故障注入证据，不证明真实 Provider 卡死或生产误报率；正常长思考与永久卡住仍可能
-暂时不可区分。业务无需自动恢复，监护接续原请求也不等于重做业务。本次 CLI 两轮均通过，
-未再现前轮一次 fixture 等待超时，根因仍未确定；保留原分阶段等待上限，失败时输出阶段、
-任务和安全观测，不隐藏失败。
+暂时不可区分。业务无需自动恢复，监护接续原请求也不等于重做业务。
+
+夹具清理先保留原失败及阶段，再按出生身份停止自有 monitor、worker、owner/agent，等待它们
+退出或进入不可写的僵尸状态后才删临时目录。覆盖尚未完成 Node 初始化的自有子进程和暂停的
+worker；无法确认停止则保留临时目录并报错。清理异常会另行诊断，不覆盖首错；只有清理失败
+也必须使测试失败。回归用真实子进程验证 TERM 后延迟重建目录、SIGSTOP、PID 出生身份不符和
+首错保留，未改生产监督逻辑或原等待上限。旧夹具只发 TERM 就立即删目录，存在可证的并发写入
+竞态；sing-box 固定 `7f7b749` 的 ENOTEMPTY 会掩盖首错，原日志未提供被覆盖的异常，因此不能
+据此认定生产检测失败或确定首错。前轮单次 fixture timeout 的根因同样仍未确定。
 
 双 Provider 回归覆盖完整元数据一致性、独立变量对与名字级错误、两跳转发、model/variant
 去重与 session 冲突、ACP 拒绝选模型时不发 prompt、旧记录兼容。真实 loopback 还分别用

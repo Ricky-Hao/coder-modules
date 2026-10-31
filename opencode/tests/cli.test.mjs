@@ -6,7 +6,9 @@ import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import { TaskRunner } from "../scripts/task.mjs";
+import { startHealthWitness, stopFixtureProcesses, finishFixture } from "./cli-fixture.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts/", import.meta.url));
 const quote = (value) => `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -38,7 +40,11 @@ test(
     const copiedCli = path.join(version, 'task-cli.mjs');
     fs.writeFileSync(copiedCli, fs.readFileSync(copiedCli, 'utf8').replace(
       '} catch (error) {\n  // No raw', `} catch (error) {\n  fs.appendFileSync(${JSON.stringify(path.join(base, 'worker-errors'))}, error.stack + '\\n');\n  // No raw`).replace(
-      'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise'].includes(command)) fs.writeFileSync(${JSON.stringify(base)} + '/' + (command === '_supervise' ? 'monitor' : 'worker') + '-' + id + '.pid', String(process.pid));`));
+      'const stored = runner.load(id);', `const stored = runner.load(id);\n      if (['_worker', '_observe', '_supervise', '_fail_launch'].includes(command)) {
+        fs.appendFileSync(${JSON.stringify(path.join(base, 'drivers.ndjson'))}, JSON.stringify({ pid: process.pid,
+          ticks: fs.readFileSync('/proc/self/stat', 'utf8').split(') ').at(-1).trim().split(/\\s+/)[19], role: command }) + '\\n');
+        fs.writeFileSync(${JSON.stringify(base)} + '/' + (command === '_supervise' ? 'monitor' : 'worker') + '-' + id + '.pid', String(process.pid));
+      }`));
     fs.mkdirSync(path.join(version, "node/bin"), {
       recursive: true,
       mode: 0o700,
@@ -80,10 +86,17 @@ test(
       const pid =
         tool === "opencode-task"
            ? `if [[ "\${1-}" == _worker ]]; then printf '%s' "$$" > ${quote(base)}/worker-\${2}.pid; exec 2>>${quote(path.join(base, 'worker-errors'))}; fi\n`
-          : "";
+           : "";
+      const birth = tool === "opencode-task" ? `case "\${1-}" in _worker|_observe|_supervise|_fail_launch)
+read -r fixture_stat < /proc/$$/stat
+fixture_stat=\${fixture_stat##*) }
+read -ra fixture_fields <<< "$fixture_stat"
+printf '{"pid":%s,"ticks":"%s","role":"%s"}\\n' "$$" "\${fixture_fields[19]}" "$1" >> ${quote(path.join(base, 'drivers.ndjson'))}
+esac
+` : "";
       fs.writeFileSync(
         path.join(root, "bin", tool),
-        `#!/usr/bin/env bash\nset -euo pipefail\n${pid}exec python3 -B ${quote(path.join(root, "active/runtime.py"))} ${tool} "$@"\n`,
+        `#!/usr/bin/env bash\nset -euo pipefail\n${birth}${pid}exec python3 -B ${quote(path.join(root, "active/runtime.py"))} ${tool} "$@"\n`,
         { mode: 0o700 },
       );
     }
@@ -174,6 +187,9 @@ test(
     });
     await new Promise((resolve) => webhook.listen(0, "127.0.0.1", resolve));
     let taskId;
+    let primaryError;
+    let phase = "initial-submit";
+    const witnesses = [];
     try {
       const callbackId = `tcb_${"z".repeat(43)}`;
       const registration = JSON.stringify({
@@ -286,6 +302,7 @@ test(
           ),
         );
       const until = async (condition, label = "condition") => {
+        phase = label;
         const end = Date.now() + 10000;
         while (!condition()) {
           if (Date.now() > end) {
@@ -322,15 +339,16 @@ test(
       };
       const delivered = async (id) => {
         try { await until(() => load(id).state === "delivered", `delivered:${id}`); }
-        catch {
+        catch (error) {
           const { state, executionError, health, workerExit } = load(id);
           const observations = Object.fromEntries(['worker.json', 'monitor.json'].map((name) => {
             const file = path.join(root, 'runtime/tasks', id, name);
             return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null];
           }));
-          throw new Error(JSON.stringify({ id, state, executionError, health, workerExit,
+          console.error(JSON.stringify({ phase: `delivered:${id}`, state, executionError, health, workerExit,
             now: Date.now(), observations,
             fixtureErrors: fs.existsSync(path.join(base, 'worker-errors')) ? fs.readFileSync(path.join(base, 'worker-errors'), 'utf8') : '' }));
+          throw error;
         }
         return load(id);
       };
@@ -528,23 +546,44 @@ test(
         `${encodeURIComponent(record.handle.acpxRecordId)}.stream.ndjson`)); // pinned acpx，只读合成 journal。
       const executionCount = () => fs.readFileSync(executions, 'utf8').trim().split('\n').length;
       const callbacks = (record) => seen.filter((body) => JSON.parse(body).callback_id === record.callback.callback_id);
+      const witnessFor = async (key, resumeDirectory) => {
+        const id = `task_${createHash('sha256').update(key).digest('hex')}`;
+        const witness = await startHealthWitness(path.join(root, 'runtime/tasks', id, 'task.json'), resumeDirectory);
+        witnesses.push(witness);
+        return witness;
+      };
+      phase = "thought-health-control";
+      console.error(JSON.stringify({ fixture_phase: phase, at: Date.now() }));
+      const thoughtWitness = await witnessFor('healthy-thought', progressControl);
       const beforeHealthControls = executionCount();
       const thoughtId = faultSubmit('healthy-thought', 'recover thought progress');
-      await until(() => load(thoughtId).health?.assessment === 'suspected', 'thought enters suspicion');
-      const quietThought = load(thoughtId);
+      // 故意让父测试超过整个短确认窗不获调度；独立 witness 仍须记录怀疑并恢复 peer。
+      const blocked = spawnSync('python3', ['-B', '-c', 'import time; time.sleep(1.8)'], { env: { PATH: env.PATH }, timeout: 3000 });
+      assert.equal(blocked.status, 0);
+      await until(() => thoughtWitness.events.suspected || thoughtWitness.events.error || thoughtWitness.events.sealed, 'thought enters suspicion');
+      assert.equal(thoughtWitness.events.error, undefined);
+      const quietThought = thoughtWitness.events.suspected;
+      assert.ok(quietThought, JSON.stringify(thoughtWitness.events));
       assert.equal(quietThought.health.suspectedReason, 'PROGRESS_UNCONFIRMED');
       assert.equal(quietThought.health.ownerProcess, 'alive');
-      assert.equal(quietThought.body, undefined);
-      assert.equal(callbacks(quietThought).length, 0);
-      fs.writeFileSync(path.join(progressControl, quietThought.handle.backendSessionId), 'resume synthetic thought');
-      await until(() => load(thoughtId).health?.assessment === 'observing' &&
-        peerEvents(quietThought).some((event) => event.type === 'thought_resumed'), 'thought retracts suspicion');
-      const resumedThought = load(thoughtId);
+      assert.equal(quietThought.bodyPresent, false);
+      assert.equal(quietThought.assistantOutput, false);
+      await until(() => thoughtWitness.events.resumed || thoughtWitness.events.error || thoughtWitness.events.sealed, 'thought retracts suspicion');
+      const resumedThought = thoughtWitness.events.resumed;
+      assert.ok(resumedThought, JSON.stringify(thoughtWitness.events));
       assert.equal(resumedThought.health.suspectedAt, undefined);
       assert.equal(resumedThought.health.suspectedReason, undefined);
-      assert.equal(resumedThought.body, undefined);
-      assert.equal(resumedThought.output ?? '', '');
+      assert.equal(resumedThought.bodyPresent, false);
+      assert.equal(resumedThought.assistantOutput, false);
+      assert.equal(callbacks(load(thoughtId)).length, 0);
+      // peer 持续 thought，直到父测试确认健康跨度后显式放行终态，避免错过 observing 窗口。
+      await until(() => {
+        const event = peerEvents(load(thoughtId)).find((item) => item.type === 'thought_resumed');
+        return event && Date.now() - event.at >= 1600;
+      }, 'thought stays healthy beyond progress and confirmation');
+      fs.writeFileSync(path.join(progressControl, `${quietThought.sessionId}.finish`), 'finish synthetic thought');
       const thought = await delivered(thoughtId);
+      await thoughtWitness.close();
       assert.equal(thought.resultStatus, 'success');
       assert.equal(JSON.parse(thought.body).output, '');
       assert.equal(callbacks(thought).length, 1);
@@ -563,7 +602,7 @@ test(
       t.diagnostic(JSON.stringify({ scenario: 'thought-after-suspicion', task_id: thoughtId, request_id: thought.requestId,
         suspected_at: quietThought.health.suspectedAt, resumed_at: resumedAt, completed_at: completedAt,
         cleared_at: resumedThought.health.observedAt, thought_events: thoughtUpdates.length,
-        assistant_events: 0, business_executions: 1, http_posts: 1, result_status: 'success' }));
+        assistant_events: 0, parent_blocked_ms: 1800, business_executions: 1, http_posts: 1, result_status: 'success' }));
 
       const stalledCallback = `tcb_${'alive-stall'.padEnd(43, 'v')}`;
       let lostStallReceipt = false;
@@ -573,11 +612,19 @@ test(
         return true;
       };
       const beforeStall = executionCount();
+      phase = 'alive-original-stall';
+      console.error(JSON.stringify({ fixture_phase: phase, at: Date.now() }));
+      const stallWitness = await witnessFor('alive-stall');
       const stalledId = faultSubmit('alive-stall', 'silent forever', ['--session', 'alive-stall-session']);
-      await until(() => load(stalledId).state === 'running' && load(stalledId).originalObserved, 'silent original started');
+      await until(() => {
+        const record = load(stalledId);
+        // running 可先于 peer 消费请求；同时等到合成 peer 的接收证据。
+        return record.state === 'running' && record.originalObserved &&
+          peerEvents(record).some((event) => event.type === 'prompt_received');
+      }, 'original received by peer before injecting silence');
       const startedStall = load(stalledId);
       assert.ok(journalEntries(startedStall).some((event) => event.type === 'turn_started' && event.request_id === startedStall.requestId));
-      const originalPeer = peerEvents(startedStall).find((event) => event.type === 'silent_started');
+      const originalPeer = peerEvents(startedStall).find((event) => event.type === 'prompt_received');
       assert.ok(originalPeer);
       const incarnation = lines(path.join(base, 'processes')).find((proof) => proof.agent === originalPeer.agent);
       assert.equal(incarnation.owner, originalPeer.owner);
@@ -597,15 +644,18 @@ test(
       const behindStall = faultSubmit('behind-stall', 'continuity', ['--session', 'alive-stall-session']);
       env.OPENCODE_TASK_PROGRESS_MS = '600';
       await until(() => load(behindStall).state === 'dispatching', 'unrelated same-session request queued');
-      await until(() => load(stalledId).health?.assessment === 'suspected', 'silent original suspected');
-      const suspectedStall = load(stalledId);
+      fs.writeFileSync(path.join(progressControl, `${startedStall.handle.backendSessionId}.stall`), 'inject permanent silence');
+      await until(() => peerEvents(startedStall).some((event) => event.type === 'silent_started'), 'permanent silence injected');
+      await until(() => stallWitness.events.suspected || stallWitness.events.error || stallWitness.events.sealed, 'silent original suspected');
+      const suspectedStall = stallWitness.events.suspected;
+      assert.ok(suspectedStall, JSON.stringify(stallWitness.events));
       assert.equal(suspectedStall.health.suspectedReason, 'PROGRESS_UNCONFIRMED');
       assert.equal(suspectedStall.health.owner, 'lease_current');
-      assert.equal(suspectedStall.body, undefined);
-      assert.equal(callbacks(suspectedStall).length, 0);
+      assert.equal(suspectedStall.bodyPresent, false);
       assertOriginalAlive();
       await until(() => load(stalledId).notificationState === 'delivered', 'silent original automatic error receipt');
       const stalled = load(stalledId);
+      await stallWitness.close();
       assertOriginalAlive();
       assert.equal(stalled.executionError, 'PROGRESS_UNCONFIRMED');
       assert.equal(stalled.state, 'ambiguous');
@@ -699,8 +749,10 @@ test(
       assert.equal(fs.readFileSync(executions, 'utf8').trim().split('\n').length, beforeStopped + 1);
       env.OPENCODE_TASK_WORKER_MS = '5000';
       const lostId = faultSubmit('owner-exit', 'wait for cancellation');
-      await until(() => load(lostId).state === 'running');
-      const owned = JSON.parse(fs.readFileSync(path.join(base, 'processes'), 'utf8').trim().split('\n').at(-1));
+      await until(() => load(lostId).state === 'running' &&
+        peerEvents(load(lostId)).some((event) => event.type === 'prompt_received'), 'owner-exit original received by peer');
+      const lostPeer = peerEvents(load(lostId)).find((event) => event.type === 'prompt_received');
+      const owned = lines(path.join(base, 'processes')).find((proof) => proof.agent === lostPeer.agent && proof.owner === lostPeer.owner);
       assert.ok(fs.readFileSync(`/proc/${owned.owner}/cmdline`, 'utf8').includes(path.join(version, 'node_modules/acpx')));
       process.kill(owned.owner, 'SIGKILL');
       await until(() => load(lostId).notificationState === 'delivered');
@@ -778,59 +830,26 @@ test(
         if (lockName === 'monitor.lock') assert.equal(concurrentRecovery.status, 0, concurrentRecovery.stderr);
         assert.equal(fs.readFileSync(executions, 'utf8'), beforeResolve);
       }
-      // Graceful fixture shutdown only; never wait for an idle ACP owner to report completion.
+      // 全部断言完成后才清理 fixture；finally 会等待自有进程退出，再删除临时目录。
       assert.deepEqual(callbacks(load(stalledId)), [stalled.body, stalled.body]);
       assert.equal(peerEvents(stalled).some((event) => event.type === 'cancel'), false);
-      const { createSharedAcpRuntime, createAgentRegistry } =
-        await import("../scripts/node_modules/acpx/dist/runtime.js");
-      const priorHome = process.env.HOME;
-      process.env.HOME = path.join(root, "runtime/home");
-      const runtime = createSharedAcpRuntime({
-        cwd: base,
-        permissionMode: "deny-all",
-        agentRegistry: createAgentRegistry({
-          overrides: { opencode: [path.join(root, "bin/opencode"), "acp"] },
-        }),
-      });
-      try {
-        for (const handle of [stored.handle, afterCancel.handle, chosenRecord.handle, failed.handle, exited.handle, slow.handle,
-          thought.handle, stalled.handle, pausedRecord.handle, stoppedRecord.handle])
-          await runtime.close({ handle, reason: "CLI fixture cleanup" });
-      } finally {
-        await runtime.shutdown();
-        if (priorHome === undefined) delete process.env.HOME;
-        else process.env.HOME = priorHome;
-      }
+    } catch (error) {
+      primaryError = error;
+      // 先保留首错与阶段；即使随后清理失败，原 stack 仍作为测试失败返回。
+      console.error(JSON.stringify({ phase, temporary_root: base, first_failure: error.message, stack: error.stack }));
     } finally {
-      webhook.close();
-      for (const name of fs
-        .readdirSync(base)
-        .filter((name) => /^(worker|monitor)-task_.*\.pid$/.test(name))) {
+      await finishFixture(primaryError, async () => {
+        console.error(JSON.stringify({ fixture_phase: 'cleanup', after_failure: Boolean(primaryError), at: Date.now() }));
         try {
-          const pid = Number(fs.readFileSync(path.join(base, name), "utf8"));
-          // Only the fixture's own detached worker may be stopped; a stale PID
-          // must not identify an unrelated process. Never inspect environments.
-          if (
-            fs
-              .readFileSync(`/proc/${pid}/cmdline`, "utf8")
-              .includes(path.join(version, "task-cli.mjs"))
-          )
-            process.kill(pid, "SIGTERM");
-        } catch {}
-      }
-      // 仅清理本夹具的出生身份；失败诊断也不能遗留永久静默的合成 peer。
-      const processes = path.join(base, 'processes');
-      if (fs.existsSync(processes)) for (const proof of fs.readFileSync(processes, 'utf8').trim().split('\n').map(JSON.parse)) {
-        for (const [pid, ticks] of [[proof.owner, proof.ownerStartTicks], [proof.agent, proof.startTicks]]) {
-          try {
-            const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').at(-1).trim().split(/\s+/);
-            if (stat[19] === ticks && stat[0] !== 'Z' &&
-              fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(path.join(version, 'node/bin/node')))
-              process.kill(pid, 'SIGTERM');
-          } catch {}
+          for (const witness of witnesses) await witness.close();
+          await stopFixtureProcesses(base, version);
+        } finally {
+          // 清理被拒绝时也释放本地 receiver，不能让首错变成测试进程悬挂。
+          await new Promise((resolve) => { webhook.close(resolve); webhook.closeAllConnections(); });
         }
-      }
-      fs.rmSync(base, { recursive: true, force: true });
+        fs.rmSync(base, { recursive: true, force: true });
+        t.diagnostic(JSON.stringify({ phase: 'cleanup', writers_stopped: true, temporary_root_removed: true }));
+      }, (value) => t.diagnostic(JSON.stringify(value)));
     }
   },
 );

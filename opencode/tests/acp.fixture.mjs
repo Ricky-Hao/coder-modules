@@ -91,6 +91,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }
     if (process.env.TASK_FIXTURE_LOG)
       fs.appendFileSync(process.env.TASK_FIXTURE_LOG, "prompt\n");
+    fixtureEvent("prompt_received", request.params.sessionId);
     const finish = (text = "Pinned ACP result") => {
       send({
         method: "session/update",
@@ -111,9 +112,14 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         data: { service: "session", errorName: "provider.internal" } } });
     } else if (text === "agent exit") process.exit(23);
     else if (text === "silent forever") {
-      // 保持 ACP 连接/进程存活，已开始的请求不再发送事件，也永不完成。
-      fixtureEvent("silent_started", request.params.sessionId);
-      active = { request };
+      // 先保持进展，待同 session 跟随请求排队后再注入永久静默，终态永不返回。
+      active = { request, timer: setInterval(() => {
+        if (fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.stall`))) {
+          clearInterval(active.timer);
+          fixtureEvent("silent_started", request.params.sessionId);
+        } else send({ method: "session/update", params: { sessionId: request.params.sessionId,
+          update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Synthetic pre-fault progress." } } } });
+      }, 100) };
     } else if (text === "recover thought progress") {
       fixtureEvent("quiet_started", request.params.sessionId);
       let resumed;
@@ -124,7 +130,8 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
           resumed = performance.now();
           fixtureEvent("thought_resumed", request.params.sessionId);
         }
-        if (performance.now() - resumed >= 1600) {
+        if (performance.now() - resumed >= 1600 &&
+            fs.existsSync(path.join(process.env.TASK_FIXTURE_PROGRESS_CONTROL, `${request.params.sessionId}.finish`))) {
           clearInterval(active.timer);
           fixtureEvent("thought_completed", request.params.sessionId);
           reply({ stopReason: "end_turn" }); // 全程没有 assistant 文字。
