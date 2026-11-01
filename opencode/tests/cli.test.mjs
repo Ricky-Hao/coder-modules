@@ -69,6 +69,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     git(repo, "config", "user.name", "Fixture"); git(repo, "config", "user.email", "fixture@example.invalid");
     fs.writeFileSync(path.join(repo, "tracked"), "base\n"); git(repo, "add", "tracked"); git(repo, "commit", "-m", "base");
     git(repo, "remote", "add", "origin", origin); git(repo, "push", "origin", "main");
+    git(repo, "push", "origin", "HEAD:refs/heads/rickyhao/stable");
     const baseSha = git(repo, "rev-parse", "HEAD");
     const callback = (letter) => ({ callback_id: `tcb_${letter.repeat(43)}`, callback_url: `http://127.0.0.1:${webhook.address().port}/api/agents/task-callbacks` });
     const input = (key, prompt, letter, extra = {}) => ({ schema_version: 1, key, prompt, callback: callback(letter),
@@ -84,8 +85,9 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     };
     let primaryError;
     try {
-      const firstInput = input("first", "model selection", "a"), first = launch(firstInput);
+      const firstInput = input("first", "model selection", "a", { base: "rickyhao/stable" }), first = launch(firstInput);
       assert.equal(first.base_sha, baseSha); assert.equal(first.accepted, true);
+      assert.equal(first.base, "rickyhao/stable");
       await until(() => load(first.task_id).attempts === 1, "lost receipt persisted");
       const exact = load(first.task_id).body; await killControl(first.task_id);
       const attempts = seen.length; await pause(300); assert.equal(seen.length, attempts);
@@ -97,6 +99,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       assert.equal(selected.title.variant, "low");
       assert.equal(launch(firstInput).request_id, first.request_id);
       const follow = launch({ schema_version: 1, key: "follow", prompt: "continuity", callback: callback("b") }, first.task_id);
+      assert.equal(follow.base, first.base); assert.equal(follow.base_sha, first.base_sha);
       await until(() => load(follow.task_id).callbackState === "delivered", "trusted followup");
       assert.equal(checked(["result", follow.task_id]).output, "Session turn 2");
       assert.equal(load(follow.task_id).handle.backendSessionId, load(first.task_id).handle.backendSessionId);
@@ -174,7 +177,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => load(survivor).result?.status === "success", "other queued survived");
 
       // 两个公开 launch 竞争同一 key；整个准备/提交链只有一个提交者。
-      const concurrent = input("concurrent", "continuity", "j"), file = inputFile(concurrent);
+      const concurrent = input("concurrent", "continuity", "j", { base: "rickyhao/stable" }), file = inputFile(concurrent);
       const call = () => new Promise((resolve, reject) => {
         const child = spawn(path.join(root, "bin/opencode-task"), ["launch", "--input-file", file], { cwd: base, env });
         let out = "", err = ""; child.stdout.on("data", (data) => { out += data; }); child.stderr.on("data", (data) => { err += data; });

@@ -30,11 +30,15 @@ function safePath(filename, privateParent = false) {
   return filename;
 }
 
+const branchName = (name) => typeof name === "string" && name !== "HEAD" && name.length <= 240 &&
+  !name.includes("..") && !name.includes("tcb_") && name.split("/").every((part) =>
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part) && !part.endsWith(".") && !part.endsWith(".lock"));
+
 function inputFile(filename, continuing) {
   safePath(filename, true);
   const input = readJson(filename, 1048576 + 16384);
   const required = ["schema_version", "key", "prompt", "callback", ...continuing ? [] : ["repo_path", "branch", "worktree"]];
-  const fields = [...required, "permissions", "provider", "model", "variant", "no_progress_timeout_seconds"];
+  const fields = [...required, ...(continuing ? [] : ["base"]), "permissions", "provider", "model", "variant", "no_progress_timeout_seconds"];
   if (!input || Array.isArray(input) || required.some((key) => input[key] === undefined) ||
       Object.keys(input).some((key) => !fields.includes(key)) || input.schema_version !== 1 ||
       typeof input.key !== "string" || !input.key || input.key.length > 256 || /[\x00-\x1f\x7f]|tcb_/.test(input.key) ||
@@ -42,10 +46,11 @@ function inputFile(filename, continuing) {
       /tcb_[A-Za-z0-9_-]{43}/.test(input.prompt) ||
       !input.callback || Array.isArray(input.callback) || Buffer.byteLength(JSON.stringify(input.callback)) > 4096)
     fail("INVALID_LAUNCH_INPUT");
+  if (!continuing && input.base !== undefined && !branchName(input.base)) fail("INVALID_LAUNCH_INPUT");
   let callback;
   try { callback = validateCallback(input.callback); } catch { fail("INVALID_LAUNCH_INPUT"); }
   try { noProgressTimeout(input.no_progress_timeout_seconds); } catch { fail("INVALID_LAUNCH_INPUT"); }
-  for (const text of [input.prompt, input.key, input.repo_path ?? "", input.branch ?? "", input.worktree ?? ""])
+  for (const text of [input.prompt, input.key, input.repo_path ?? "", input.branch ?? "", input.worktree ?? "", input.base ?? ""])
     if (text.includes(callback.callback_id) || text.includes(callback.callback_url) || text.includes(input.callback.callback_url)) fail("INVALID_LAUNCH_INPUT");
   if (input.permissions !== undefined) {
     const p = input.permissions;
@@ -59,8 +64,7 @@ function inputFile(filename, continuing) {
         !selectionPatterns[name].test(input[name]) || input[name].includes("tcb_"))) fail("INVALID_LAUNCH_INPUT");
   if (!continuing) {
     safePath(input.repo_path);
-    if (typeof input.branch !== "string" || input.branch === "HEAD" || input.branch.length > 240 || input.branch.includes("..") || input.branch.includes("tcb_") ||
-        !input.branch.split("/").every((part) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part) && !part.endsWith(".") && !part.endsWith(".lock")) ||
+    if (!branchName(input.branch) ||
         typeof input.worktree !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(input.worktree) || input.worktree.includes("tcb_")) fail("INVALID_LAUNCH_INPUT");
   }
   return input;
@@ -150,7 +154,7 @@ async function prepare(record, persist) {
   record.stage = "fetch"; persist();
   // 隔离其他终端的 FETCH_HEAD；此 ref 仅保存本次 fetch 结果，不用于中断恢复。
   const fetched = `refs/opencode-launch/${record.token}`;
-  await git(repo, ["fetch", "--no-tags", "--no-write-fetch-head", "origin", `refs/heads/main:${fetched}`], "GIT_FETCH_FAILED");
+  await git(repo, ["fetch", "--no-tags", "--no-write-fetch-head", "origin", `refs/heads/${record.base}:${fetched}`], "GIT_FETCH_FAILED");
   record.base_sha = await git(repo, ["rev-parse", "--verify", `${fetched}^{commit}`]);
   if (!/^[a-f0-9]{40}$/.test(record.base_sha)) fail("GIT_PREPARE_FAILED");
   record.stage = "branch"; persist();
@@ -178,7 +182,8 @@ function response(record, task, reused) {
   return { version: 1, key: record?.key ?? null, task_id: record?.id ?? null, request_id: task?.requestId ?? null,
     accepted: Boolean(task && record?.controlAck), stage: record?.stage ?? "validate", reused,
     repo_path: record?.repo_path ?? null, branch: record?.branch ?? null, worktree: record?.worktree ?? null,
-    base_sha: record?.base_sha ?? null, session: record?.session ?? null, session_id: task?.handle?.backendSessionId ?? null,
+    base: record?.base ?? (record?.version === 2 ? "main" : null), base_sha: record?.base_sha ?? null,
+    session: record?.session ?? null, session_id: task?.handle?.backendSessionId ?? null,
     selection: model ? { provider: model.id.split("/")[0], model: model.id.split("/").slice(1).join("/"), variant: model.variant ?? null,
       status: "resolved" } : null,
     permissions: record?.permissions ? { mode: record.permissions.mode, policy_rules: Object.values(record.permissions.policy).filter(Array.isArray).reduce((n, rules) => n + rules.length, 0),
@@ -230,6 +235,7 @@ export async function launchTask(runner, flags, { version, spawnControl, checkpo
       if (prior && !equal(prior.repository, repoIdentity)) fail("LAUNCH_OBJECT_CONFLICT");
       record = { version: 2, id, key: input.key, inputHash, token: randomUUID(), stage: "claimed",
         repo_path: repo, repository: repoIdentity, branch: prior?.branch ?? input.branch, worktree,
+        base: prior?.base ?? input.base ?? "main",
         session: prior?.session ?? `launch-${hash(input.key)}`, origin: prior?.origin ?? id, tail: id,
         permissions: input.permissions ? taskPermissions(input.permissions.mode, input.permissions.policy) : prior?.permissions ?? taskPermissions(),
         ...(prior ? { base_sha: prior.base_sha, worktreeIdentity: prior.worktreeIdentity, prior: prior.id,
