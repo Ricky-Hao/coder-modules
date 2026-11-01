@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { TaskRunner } from "../scripts/task.mjs";
-import { launchTask } from "../scripts/task-launch.mjs";
+import { launchTask, git as launchGit } from "../scripts/task-launch.mjs";
 import { TaskError } from "../scripts/task-errors.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts", import.meta.url));
@@ -23,7 +23,7 @@ function fixture(t) {
   for (const dir of [root, version, path.join(root, "runtime"), tasks]) fs.mkdirSync(dir, { mode: 0o700 });
   for (const name of ["home", "config", "data", "cache", "state", "tmp"])
     fs.mkdirSync(path.join(root, "runtime", name), { mode: 0o700 });
-  for (const name of ["runtime.py", "profiles.py", "profile-env.json", "safety.py"])
+  for (const name of ["runtime.py", "git_ssh.py", "profiles.py", "profile-env.json", "safety.py"])
     fs.copyFileSync(path.join(scripts, name), path.join(version, name));
   write(path.join(root, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "launch-fixture" });
   write(path.join(version, "settings.json"), { install_root: root, workspace_id: "launch-fixture", runtime_profile: "env" });
@@ -74,7 +74,7 @@ test("new: fetched main, dirty checkout preserved, private intent and same-key r
   assert.equal(fs.readFileSync(path.join(f.repo, "dirty"), "utf8"), "keep unrelated work");
   assert.equal(result.worktree, path.join(f.base, "new-work"));
   assert.deepEqual(result.selection, { provider: "codex", model: "gpt-6.1-sol", variant: "max", status: "resolved" });
-  assert.equal(result.permissions.mode, "deny-all");
+  assert.equal(result.permissions.mode, "approve-all");
   assert.equal(JSON.stringify(result).includes("tcb_"), false);
   assert.equal(JSON.stringify(f.saved(result)).includes(f.input.prompt), false);
   assert.equal(fs.statSync(path.join(f.tasks, ".launches", `${result.task_id}.json`)).mode & 0o777, 0o600);
@@ -92,7 +92,7 @@ test("自选含斜线的远端 base：新 key fresh fetch，同 key 保留原 SH
   assert.equal(first.error, undefined, JSON.stringify(first));
   assert.equal(first.base, base); assert.equal(first.base_sha, f.old);
   assert.equal(git(first.worktree, "rev-parse", "HEAD"), f.old);
-  const saved = f.saved(first), fetched = `refs/opencode-launch/${saved.token}`;
+  const saved = f.saved(first), fetched = `refs/opencode-launch/${saved.id}`;
   assert.equal(saved.base, base); assert.equal(saved.base_sha, f.old);
   assert.equal(git(f.repo, "rev-parse", fetched), f.old);
   git(f.origin, "update-ref", remote, f.latest);
@@ -167,16 +167,15 @@ test("自选 base 的续接保留原 SHA、worktree 和 session，不接受 base
   assert.equal(fs.readFileSync(path.join(next.worktree, "dirty"), "utf8"), "keep task work");
 });
 
-test("未存 base 的现有 v2 记录按 main 返回，同输入重试保留原 task/launch 字节", async (t) => {
+test("v3 缺失 base 是损坏记录，不提供旧格式 fallback", async (t) => {
   const f = fixture(t), original = await f.launch();
   const launchFile = path.join(f.tasks, ".launches", `${original.task_id}.json`);
   const taskFile = path.join(f.tasks, original.task_id, "task.json"), record = f.saved(original);
   delete record.base; write(launchFile, record);
   const launchBytes = fs.readFileSync(launchFile), taskBytes = fs.readFileSync(taskFile);
   const retry = await f.launch();
-  assert.equal(retry.error, undefined, JSON.stringify(retry));
-  assert.equal(retry.base, "main"); assert.equal(retry.base_sha, f.latest);
-  assert.equal(retry.request_id, original.request_id);
+  assert.equal(retry.error.code, "INVALID_TASK_RESULT");
+  assert.equal(retry.base, null); assert.equal(retry.request_id, null);
   assert.deepEqual(fs.readFileSync(launchFile), launchBytes); assert.deepEqual(fs.readFileSync(taskFile), taskBytes);
 });
 
@@ -260,6 +259,12 @@ test("fetch failure does not use cached main and never returns raw stderr", asyn
   const result = await f.launch();
   assert.equal(result.error.code, "GIT_FETCH_FAILED"); assert.equal(result.base_sha, null);
   assert.equal(result.accepted, false); assert.equal(JSON.stringify(result).includes("RAW-REMOTE"), false);
+  assert.equal(result.task_recorded, false); assert.equal(result.claim_recorded, true);
+  assert.equal(result.dispatch_state, "not_reached"); assert.deepEqual(result.unknown_scope, ["preparation"]);
+  assert.equal(result.error.git_exit_code, 128); assert.equal(result.error.reason, "unknown");
+  const status = f.runner.status(result.task_id);
+  assert.equal(status.task_recorded, false); assert.equal(status.claim_recorded, true);
+  assert.equal(status.dispatch_state, "not_reached"); assert.equal(status.preparation.policy, "fail_closed_on_partial_git_preparation");
   assert.equal(git(f.repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"), f.old);
 });
 
@@ -427,14 +432,101 @@ test("fsync failure after task rename keeps the original request but does not cl
   assert.equal(retry.request_id, failed.request_id); assert.equal(f.runner.status(failed.task_id).execution_error, "RECOVERED_BEFORE_DISPATCH");
 });
 
+test("first claim parent fsync failure is storage uncertainty before any Git or submit", async (t) => {
+  const f = fixture(t), sync = fs.fsyncSync, before = git(f.repo, "show-ref");
+  t.mock.method(fs, "fsyncSync", (fd) => {
+    if (fs.readlinkSync(`/proc/self/fd/${fd}`) === f.tasks) throw Object.assign(new Error("PRIVATE-FSYNC"), { code: "EIO" });
+    return sync(fd);
+  });
+  const failed = await f.launch(); t.mock.restoreAll();
+  assert.equal(failed.error.code, "TASK_WRITE_FAILED"); assert.equal(failed.claim_recorded, null);
+  assert.equal(failed.task_recorded, false); assert.equal(failed.dispatch_state, "not_reached");
+  assert.deepEqual(failed.unknown_scope, ["preparation", "storage"]); assert.equal(f.launches(), 0);
+  assert.equal(git(f.repo, "show-ref"), before);
+  assert.equal((await f.launch()).error.code, "GIT_PREPARATION_INTERRUPTED");
+});
+
 test("lost control ACK is unknown with a durable request, not invalid input or permission to resend", async (t) => {
   const f = fixture(t);
   const failed = await f.launch(f.input, {}, { spawnControl: async () => { throw new TaskError("CONTROL_ACK_UNKNOWN", { reason: "timeout" }); } });
   assert.equal(failed.error.code, "CONTROL_ACK_UNKNOWN"); assert.equal(failed.error.stage, "control"); assert.equal(failed.error.field, "control_ack");
   assert.equal(failed.error.reason, "timeout"); assert.equal(failed.task_recorded, true); assert.equal(failed.outcome_unknown, true);
+  assert.equal(failed.claim_recorded, true); assert.equal(failed.dispatch_state, "unknown"); assert.deepEqual(failed.unknown_scope, ["request"]);
   assert.equal(failed.error.request_id, failed.request_id); assert.equal(failed.error.action, "observe_original");
   f.runner.submit = () => assert.fail("must not resubmit");
   assert.equal((await f.launch()).request_id, failed.request_id);
+});
+
+test("last claim fsync fails after ACK: accepted remains true; task/request must never be resubmitted", async (t) => {
+  const f = fixture(t);
+  const failed = await f.launch(f.input, {}, { spawnControl: async () => {
+    t.mock.method(fs, "fsyncSync", () => { throw Object.assign(new Error("PRIVATE-FSYNC"), { code: "EIO" }); });
+  } });
+  t.mock.restoreAll();
+  assert.equal(failed.error.code, "TASK_WRITE_FAILED"); assert.equal(failed.error.field, "launch_record");
+  assert.equal(failed.accepted, true); assert.equal(failed.task_recorded, true); assert.equal(failed.claim_recorded, null);
+  assert.ok(failed.unknown_scope.includes("storage")); assert.ok(failed.request_id); assert.equal(failed.dispatch_state, "unknown");
+  f.runner.submit = () => assert.fail("must not resubmit");
+  const again = await f.launch(); assert.equal(again.request_id, failed.request_id);
+  assert.equal(again.no_progress_timeout_seconds, 900); assert.equal(again.continue_from, null);
+  assert.equal(again.query.status, `'${f.root}/bin/opencode-task' status ${again.task_id}`); assert.equal(again.session_id, null); assert.equal(again.started_at, null);
+});
+
+test("exclusive same-key claim permits one submit while concurrent preparation fails closed", async (t) => {
+  const f = fixture(t), submit = f.runner.submit.bind(f.runner); let submissions = 0;
+  f.runner.submit = (input) => { submissions++; return submit(input); };
+  const results = await Promise.all([f.launch(), f.launch()]);
+  assert.equal(submissions, 1); assert.equal(results.filter((value) => value.accepted).length, 1);
+  const rejected = results.find((value) => value.error);
+  assert.equal(rejected.error.code, "GIT_PREPARATION_INTERRUPTED");
+  assert.equal(rejected.dispatch_state, "not_reached");
+  const retry = await f.launch(); assert.equal(retry.reused, true); assert.equal(submissions, 1);
+});
+
+test("continue inherits smaller saved permissions, rules expose only fixed safe names", async (t) => {
+  const f = fixture(t), original = await f.launch({ ...f.input, permissions: { mode: "deny-all", policy: { autoDeny: ["edit", "PRIVATE-RULE"] } } });
+  const task = f.runner.load(original.task_id);
+  task.handle = { backend: "acpx-shared", cwd: task.cwd, sessionKey: task.sessionKey, acpxRecordId: "fixture-record", backendSessionId: "fixture-session" };
+  f.runner.seal(task, "success", "done", "turn.result");
+  const next = await f.launch({ schema_version: 1, key: "inherit", prompt: "next", callback: f.input.callback }, { "--continue-from": original.task_id });
+  assert.equal(next.permissions.mode, "deny-all"); assert.deepEqual(next.permissions.auto_deny, ["edit"]); assert.equal(next.permissions.rules_withheld, 1);
+  assert.equal(next.continue_from, original.task_id); assert.equal(JSON.stringify(next).includes("PRIVATE-RULE"), false);
+  assert.equal(f.runner.load(original.task_id).permissions.mode, "deny-all");
+});
+
+test("claim-only status is read only, rejects corrupt association and JSON without leaking private fields", async (t) => {
+  const f = fixture(t), failed = await f.launch(f.input, {}, { checkpoint: (stage) => { if (stage === "fetch") throw new Error("stop"); } });
+  const file = path.join(f.tasks, ".launches", `${failed.task_id}.json`), before = fs.readFileSync(file);
+  const status = f.runner.status(failed.task_id);
+  assert.equal(status.state, "preparation"); assert.equal(status.task_recorded, false); assert.equal(status.dispatch_state, "not_reached");
+  assert.equal(status.preparation.objects.branch, false); assert.equal(status.preparation.objects.worktree_directory, false);
+  assert.deepEqual(fs.readFileSync(file), before); assert.equal(fs.existsSync(path.join(f.tasks, failed.task_id)), false);
+  const record = JSON.parse(before); record.id = `task_${"e".repeat(64)}`; write(file, record);
+  assert.throws(() => f.runner.status(failed.task_id), /INVALID_TASK_RESULT/);
+  fs.writeFileSync(file, '{"PRIVATE-JSON":');
+  assert.throws(() => f.runner.status(failed.task_id), /INVALID_TASK_RESULT/);
+});
+
+test("Git diagnostics retain errno, exit and signal, discard bounded stderr and never infer auth from 128", async (t) => {
+  const f = fixture(t), dir = path.join(f.base, "fake-bin"), previous = process.env.PATH;
+  fs.mkdirSync(dir); const script = path.join(dir, "git");
+  try {
+    process.env.PATH = dir;
+    await assert.rejects(launchGit(f.repo, []), (error) => error.git_errno === "ENOENT" && !JSON.stringify(error).includes(f.repo));
+    for (const [body, reason, status, signal] of [
+      ["echo PRIVATE-URL-USER-SECRET >&2; exit 128", "unknown", 128],
+      ["echo 'Host key verification failed.' >&2; echo PRIVATE-KEY >&2; exit 128", "SSH_HOST_KEY_VERIFICATION_FAILED", 128],
+      ["echo 'Permission denied (publickey) PRIVATE-USER' >&2; exit 128", "unknown", 128],
+      ["kill -TERM $$", "unknown", undefined, "SIGTERM"],
+      ["i=0; while [ $i -lt 20000 ]; do printf x >&2; i=$((i+1)); done; echo; echo 'Host key verification failed.' >&2; exit 128", "unknown", 128],
+    ]) {
+      fs.writeFileSync(script, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+      await assert.rejects(launchGit(f.repo, []), (error) => {
+        assert.equal(error.reason, reason); assert.equal(error.git_exit_code, status); assert.equal(error.git_signal, signal);
+        assert.equal(JSON.stringify(error).includes("PRIVATE-"), false); assert.equal(error.cause, undefined); return true;
+      });
+    }
+  } finally { process.env.PATH = previous; }
 });
 
 test("reused error response does not expand untrusted launch metadata strings", async (t) => {
@@ -443,8 +535,8 @@ test("reused error response does not expand untrusted launch metadata strings", 
   write(path.join(f.tasks, ".launches", `${original.task_id}.json`), record);
   const bytes = fs.readFileSync(path.join(f.tasks, ".launches", `${original.task_id}.json`));
   const result = await f.launch(f.input, {}, { spawnControl: async () => { throw new Error("PTC_TOOL_FAILED 502 EAGAIN PRIVATE-STDERR"); } });
-  assert.equal(result.error.code, "CONTROL_ACK_UNKNOWN"); assert.equal(result.error.reason, "unknown");
-  assert.equal(result.outcome_unknown, true); assert.equal(result.task_recorded, true);
+  assert.equal(result.error.code, "INVALID_TASK_RESULT"); assert.equal(result.error.reason, "unknown");
+  assert.equal(result.outcome_unknown, true); assert.equal(result.task_recorded, null);
   for (const secret of ["PRIVATE-", f.input.callback.callback_url]) assert.equal(JSON.stringify(result).includes(secret), false);
   assert.deepEqual(fs.readFileSync(path.join(f.tasks, ".launches", `${original.task_id}.json`)), bytes);
 });

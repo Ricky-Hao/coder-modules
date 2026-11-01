@@ -17,6 +17,7 @@ class NonrootTests(unittest.TestCase):
             base.chmod(0o755)
             source = base / 'source'
             shutil.copytree(module, source, ignore=shutil.ignore_patterns('node_modules', '__pycache__', '.terraform'))
+            source.chmod(0o755)
             for file in source.rglob('*'):
                 file.chmod(0o755 if file.is_dir() else 0o644)
             node = base / 'node'

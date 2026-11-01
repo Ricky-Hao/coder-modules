@@ -131,7 +131,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(result.stdout)
         child = actual['env']
-        self.assertEqual(actual['argv'], ['run', 'argument with spaces', '', '$HOME', "a'b"])
+        self.assertEqual(actual['argv'], ['run', '--auto', 'argument with spaces', '', '$HOME', "a'b"])
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(child['PATH'], self.env['PATH'])
         self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
@@ -356,7 +356,7 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertFalse(list(store.glob('.profile-*')))
 
-    def test_acpx_to_opencode_readiness_env_and_deny_defaults(self):
+    def test_acpx_to_opencode_readiness_env_and_approve_defaults(self):
         node_program = '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -370,7 +370,7 @@ elif sys.argv[-1] == '--version':
 elif sys.argv[1].endswith('task-cli.mjs'):
     assert sys.argv[2:] == ['recover']
 else:
-    assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
+    assert sys.argv[2:5] == ['--approve-all','--non-interactive-permissions','deny']
     assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.1-sol'
     assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
     for name in ('CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY', 'UNLISTED_SERVICE_AUTH', 'HTTPS_PROXY'):

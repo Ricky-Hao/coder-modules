@@ -1,39 +1,32 @@
 # OpenCode 任务与持久回调
 
-任务入口为 `opencode-task launch`。OpenCode **v2.2.0-ricky.1** 管模型、工具和上下文；
-acpx **0.21.1** 管 ACP、持久 session、队列、执行和 journal，私有 Node 为 **22.23.4**。
-模块只准备任务、适配原 request/session、保存结果并投递回调。每任务只有一个自建后台控制进程，
-同时执行或观察原请求和处理 outbox。没有独立监护、替换 worker、内部心跳或 owner 健康推断。
-安装和 Workspace 启动不扫描或恢复任务。控制程序被杀或重启后，须显式 `recover`。
+`opencode-task` 是可信本地、单人使用的薄任务层。固定 OpenCode **v2.2.0-ricky.1**、acpx **0.21.1**、
+Node **22.23.4**。每 task 只有一个后台 control，执行或观察原 request，并处理 outbox。
+安装、Workspace 启动和查询均不自动恢复。没有 monitor、租约、健康探针或自动接管。
 
 ## CLI
 
 ```sh
 opencode-task launch --input-file /private/task-inputs/new.json
 opencode-task launch --continue-from task_<64位摘要> --input-file /private/task-inputs/follow.json
+opencode-task launch --help
 opencode-task status task_<64位摘要>
 opencode-task result task_<64位摘要>
 opencode-task list --state ambiguous --limit 10
-opencode-task doctor
 opencode-task doctor --quick
-opencode-task recover
-opencode-task recover task_<64位摘要>
-opencode-task cancel task_<64位摘要>
+opencode-task recover [TASK_ID]
+opencode-task cancel TASK_ID
 ```
 
-公开 submit、resolve、inspect 和手工 session 选择已删除。`_run`、`_selection` 为内部入口。
-内部 TaskRunner.submit 是持久提交原语，不能作为公开绕过 launch 的方法。
-查询不恢复、取消、执行或投递；`recover` 是有副作用的显式操作。
+launch 是唯一公开派发入口。submit/resolve/inspect 不公开。`_run`、`_selection` 为内部入口。
+help/version、list/status/result/doctor 只读；不创建存储、锁或配置，不要求 Provider key。
+recover 有副作用，须显式调用。cancel 只针对原 request。
 
 ## 高层 launch 入口
 
-Agent 沿现有工具完成三次调用：
-
-1. 调用 `create_task_callback`，取得完整原生注册对象，遵守工具 schema 和已授权范围。
-2. 用文件写入工具将 JSON 写到仓库外的私有文件，原样放入 `callback`。父目录由当前 UID
-   拥有、mode 0700；文件是当前 UID 的普通文件、单链接、mode 0600，整条路径无 symlink。
-3. Workspace Bash 执行 launch，只传文件路径。callback 不进入 shell 文本、argv、环境、业务 prompt
-   或日志。无新增 MCP tool，也不复制 bearer 到另一个文件。
+Agent 调用原生 `create_task_callback`，将完整返回对象原样写入私有 JSON，再用 Workspace Bash 调用 launch。
+输入在仓库外；父目录 0700、当前 UID 拥有，文件为 0600 普通单链接文件，整条输入路径无 symlink。
+callback 不进入 shell 文本、argv、环境或业务 prompt；不要另存一份 bearer。
 
 ```json
 {
@@ -42,14 +35,13 @@ Agent 沿现有工具完成三次调用：
   "repo_path": "/workspaces/project",
   "branch": "feat/review-1",
   "worktree": "project-review-1",
-  "base": "rickyhao/stable",
+  "base": "main",
   "prompt": "完成已授权修改并报告实际测试。",
   "callback": {
-    "callback_id": "<原生工具返回的私密值>",
+    "callback_id": "<原生私密值>",
     "callback_url": "https://chat.example.invalid/api/agents/task-callbacks",
     "max_output_bytes": 32768
   },
-  "permissions": { "mode": "approve-reads", "policy": { "autoDeny": ["edit"] } },
   "provider": "codex",
   "model": "gpt-6.1-sol",
   "variant": "max",
@@ -57,224 +49,144 @@ Agent 沿现有工具完成三次调用：
 }
 ```
 
-新任务要求 schema_version/key/repo_path/branch/worktree/prompt/callback，其余可选。
-`base` 是 origin 的远端分支名称，省略为 `main`。key 为 1～256 字符，无控制字符或 `tcb_`；
-prompt 非空，UTF-8 最多 1 MiB。完整 callback 最多 4096 字节，原生 expiry/guidance 等附加字段
-保留在输入指纹。整个文件最多 1 MiB+16 KiB。prompt、名称、权限策略不能含 callback bearer/URL。
-输入与选择在 Git 修改前校验。未知字段、`start`、`base_sha` 和无效组合明确拒绝。
+新任务必填 schema_version/key/repo_path/branch/worktree/prompt/callback。未知字段拒绝。
+key 为 1～256 字符；prompt 非空、最多 1 MiB；callback 最多 4096 字节；整个输入最多 1 MiB+16 KiB。
+名称和权限策略不得含 callback bearer/URL。输入和选择在 Git 写入前校验。
 
-`no_progress_timeout_seconds` 是整数秒，范围 **1～86400**，默认 **900**。长构建或长工具由调用者
-显式调长。不依据工具种类、retry 时间、owner lease 或查询自动延长。续接省略时使用默认 900 秒，
-该轮显式值参与同 key 指纹；不改变 session 的模型和权限。
+repo_path 是绝对 Git 顶层且有 origin。worktree 为 1～64 位名称，首位字母/数字，其余为字母、数字、`_`、`-`，
+目录固定在 repo 的父目录。branch/base 最长 240 字符，按 `/` 分段；段首位字母/数字，其余允许字母、数字、`.`、`_`、`-`。
+拒绝 HEAD、`..`、尾点、`.lock`、`tcb_`、选项和 revision 表达式。
 
-repo_path 须为无 symlink 的绝对 Git checkout 顶层并有 origin。worktree 为 1～64 位名称，首位
-字母/数字，其余允许字母、数字、下划线或连字符；目录固定为 repo 的父目录加名称。
-branch 和 base 最长 240 字符，按 `/` 分段，每段首位字母/数字，其余允许字母、数字、`.`、`_`、`-`；
-禁止 HEAD、`..`、尾点、`.lock` 和 `tcb_`。base 可写 `main` 或 `rickyhao/stable`，不接受参数或 revision 表达式。
+base 为 origin 的分支名称，省略 main。新任务 fresh fetch 到本次独立 ref，保存完整 40 位 base_sha。
+不使用缓存或同名 tag，不更新原 checkout 分支。已有分支/目录报冲突，不覆盖、stash/reset 或自动清理。
+Git 身份、参数、PATH 和主机信任见 [README](README.md#git-ssh)。
 
-Git 沿调用者 HOME、SSH 身份、hostkey、PATH 和网络环境运行，只清除仓库/index/对象路由变量。
-新任务 fresh fetch `origin refs/heads/<base>`，保存所选 base 名称和完整 40 位 base_sha，再从该提交创建 branch/worktree。
-fetch 使用本次独立 ref，避免其他 fetch 改写 FETCH_HEAD；该 ref 不授权中断恢复。
-远端分支不存在则报 GIT_FETCH_FAILED，不采用缓存或同名 tag。新任务不使用缓存 origin 分支，
-不更新原 checkout 的分支，不要求无关 checkout 干净。已有 branch/目录
-保留并报冲突；不 stash/reset、覆盖、删除、换名称或强推。Git stderr、remote 值不进入输出或记录。
+### 权限与续接
 
-### 续接与同 key 去重
+新 launch 缺省 **approve-all**。可显式设置 `permissions: {"mode":"deny-all"}` 或 approve-reads。
+policy 的 autoApprove/autoDeny/escalate 各最多 32 条，每条 1～256 字符；defaultAction 为 approve/deny/escalate。
+回执仅显示固定安全规则名及扣留数量，完整规则不公开。原生 policy 拒绝、非交互 escalation 拒绝继续生效。
+这些默认值只影响模块工具能力，不增加业务授权或平台 Agent/MCP ACL。
 
-续接只要求 schema_version/key/prompt/callback，可带权限、模型选择及时限；不接受 repo_path/branch/worktree/base，
-即使 base 与原值相同也拒绝。须从最新一轮可信 launch 续接，保留 repo、branch、worktree、base 名称、
-完整 base_sha、session、模型/profile；不重新 fetch，不改向当前远端提交。
-省略权限沿保存值，显式覆盖只作用该轮。权限模式为 deny-all、approve-reads、approve-all，新任务
-默认 deny-all；approve-all 须已有该轮授权。policy 的 autoApprove/autoDeny/escalate 各最多 32 个
-非空规则，每条最多 256 字符；defaultAction 为 approve/deny/escalate。未知字段拒绝。
-匹配沿原生 acpx 规则，非交互 escalation 仍拒绝。策略与选择持久保存，不读旧输入来恢复。
+continue 只接受 schema_version/key/prompt/callback，以及可选权限、选择、时限。不接受 repo/branch/worktree/base。
+省略权限沿原保存值，不追溯放权；显式权限只作用本轮。模型/profile/variant 固定，显式相同值可用，改变则报 SESSION_MODEL_CONFLICT。
+保留原 repo、branch、worktree、base、SHA 和 session，不重新 fetch。每轮时限省略为 900 秒。
+完整四变量与模型契约见 [PROVIDERS](PROVIDERS.md)。
 
-原轮须有 canonical 结果、可信派发前失败或取消，并有可信 backend session 身份。通知已投递、
-控制程序退出、queueDepth 或 owner 缺失均不能证明原请求结束。未知仍拒绝第二个写入者。
-晚到 canonical 结果独立落盘后可作为续接依据。派发前失败/取消的续接轮可保留上轮可信身份。
-执行前再核 backend session 身份，缺失或变化则拒绝，不建新 session 替代上下文。
+续接须从最新一轮可信 task 开始，有 canonical 结果或明确派发前失败/取消，并有可信 backend session 身份。
+通知已投递、control 退出或 owner 缺失不能证明业务结束。未知时不启动第二个写入者。
+派发前取消的续接轮保留上轮已确认的 session 身份；执行前再次核对，不建立替代 session。
 
-省略选择沿保存值，显式相同选择可用；切换报 SESSION_MODEL_CONFLICT。acpx 公共接口不能将
-完整请求/profile/effort 与排队 prompt 原子绑定，因此不自动切换或接管手工 session。
-默认 codex/Sol/max、同 Provider title/low，完整四变量和模型契约见 [PROVIDERS.md](PROVIDERS.md)。
+### 去重与 Git 中断
 
-私有 `.launches/task_<key摘要>.json` 保存输入指纹、选择、Git 身份和 task 关联，不另存 prompt
-或完整 callback。submit.lock 串行整个准备/提交链，Git 继承锁；同 key 并发只有一个提交者。
-同 key/完整同输入复用已提交的 task/request，异输入报 LAUNCH_CONFLICT。新任务显式 base 参与输入指纹，
-省略与显式 `main` 也是不同输入；重试须保留原输入，不重新 fetch 或更改已保存的 SHA。
+固定 key 对应 task_id。`.launches` 的排他 claim 在 profile/Git 写入前领取；同 key 竞争只允许一方准备/submit。
+claim 用完整输入指纹去重，不保存 prompt 或 callback。完整相同输入复用原 task/request；不同输入报 LAUNCH_CONFLICT。
+显式 base 与省略 base 是不同输入。重试保留原输入，不重新 fetch 或更改已存 SHA。
 
-Git 准备中断采取 **fail closed**：没有完整 task 关联的旧 claim 报 GIT_PREPARATION_INTERRUPTED。
-保留分支、目录和现场，人工核对后处理。没有分阶段自动续完、staging/rename/reflog 恢复协议。
-task 已持久提交但响应丢失时，核对原关联，禁止再次 submit/startTurn；重复 launch 只尝试观察原
-request 或补投原 body。原 queued 也不重新派发，而是如实封存未派发失败。
+**fail_closed_on_partial_git_preparation**：有 claim、无完整 task 时拒绝自动续完，报 GIT_PREPARATION_INTERRUPTED。
+用回执的 `query.status` 直接查同一 TASK_ID；status 返回计划路径、对象当前存在性及人工核对动作。
+计划 worktree 不证明已建立 Git worktree，session 名不证明 backend session 已创建。
+此时 recover 不适用。不得换 key 自动重派，不自动 resume/replay/cleanup。
+同 key 并发时，后到者也可能看到准备中断；首个完成后可用原输入复用原关联。
 
-成功响应包含 key/task_id/request_id/accepted/stage/reused、Git/session、selection 和权限摘要。
-`base` 返回 origin 分支名称，`base_sha` 返回本轮最初 fetch 的完整提交 SHA；续接返回原值。
-accepted=true 只证明持久意图和控制进程接管确认，或原任务已有结果且无待投递；不证明模型收到。
-ACK 等待最多 10 秒；丢失不能证明没有派发，不自动杀控制进程、换 key 或重发。
-失败退出 1，安全 JSON 包含分类、定位和处理建议，见下节；保留原 key/输入/注册和现场。
+## 回执、错误与查询
 
-## 错误分类与定位
+成功和失败都返回已知的 repo/branch/worktree/base/base_sha、task/request/session、selection、权限、时限、reused、continue_from。
+`query` 给出使用模块 wrapper 绝对路径的 status/result 命令和新 namespace 的 task_directory。它不是已生成报告或日志。
+backend session_id/started_at 未取得时为 null，不阻塞 accepted 等待它们。
 
-`error` 只输出安全字段：
-
-- `code`：稳定错误码。已有准确码保留，不将所有失败归为输入或读取错误。
-- `stage`：本次失败发生的阶段。它与 launch 顶层 `stage` 的准备进度分开。
-- `field`：允许列表内的字段或对象类别。未知 JSON 字段只报 `fields`，不回显其名称。
-- `category`、`reason`：可证明的类别和固定原因。不能安全分辨时为 `unknown`。
-- `action`、`hint`：下一步建议，不增加权限，也不触发自动控制、换模型、放权或重派。
-- 可选 `task_id`、`request_id`、`environment_names`、`http_status`：只保留安全句柄、模块变量名和标准 HTTP 状态。
-
-不输出 prompt、注册/bearer、callback URL、编码串、完整环境、原私密 stderr 或任意底层异常消息。
-任务层诊断不保存原 `cause` 或 `stack`；安全异常的 stack 也只含固定错误码。
-
-| 错误码 | 定位与动作 |
+| 字段 | 含义 |
 | --- | --- |
-| `INVALID_LAUNCH_JSON` | `input/input_file`：修正输入文件 JSON，不当作坏 task 记录。 |
-| `LAUNCH_INPUT_UNREADABLE` | `input/input_file`：核对私有文件和路径；不当作 task 不存在。安全属性和体积错误仍保留原码。 |
-| `INVALID_LAUNCH_INPUT` | `validate`：核对 `schema_version`、必填字段、名称或字段组合。 |
-| `INVALID_CALLBACK`、`CALLBACK_IN_PROMPT` | 指出 callback 子字段或 prompt；修正原私有输入，不输出或重新复制注册。 |
-| `INVALID_PERMISSIONS` | 指出模式或 policy 子字段；格式修正不等于授权放权。 |
-| `INVALID_NO_PROGRESS_TIMEOUT` | `no_progress_timeout_seconds`：1～86400 的整数，默认 900；不按工具或 retry 延长。 |
-| `LAUNCH_ENVIRONMENT_INVALID` | `selection/environment`：`missing`/`invalid` 加变量名；通过已有 env 机制处理，不输出值或回退 Provider。 |
-| `INVALID_MODEL`、`INVALID_VARIANT`、`TASK_MODEL_CONFIG_REQUIRED`、`TASK_TITLE_LOW_UNAVAILABLE` | 保留选择/配置的准确码，指出 model、variant 或 model_config。 |
-| `LAUNCH_SELECTION_INVALID` | 选择、配置读取或快照失败；字段和固定原因可定位，但根因不能证明时仍为 unknown。 |
-| `GIT_FETCH_FAILED`、`GIT_PREPARE_FAILED`、`GIT_PREPARATION_INTERRUPTED` | 指出 fetch/base、branch 或 worktree 阶段。保留 claim 和 Git 现场，人工核对，不自动续完或用缓存替代。 |
-| `TASK_WRITE_FAILED` | 写入、替换或 fsync 失败。记录和副作用可能未知；可读文件不能证明失败 fsync 已完成。先查原 task，不启动另一个请求。 |
-| `CONTROL_START_FAILED` | 本层明确未能启动控制进程；task 意图仍可能已经保存，先查原关联。 |
-| `CONTROL_ACK_UNKNOWN` | ACK 超时、进程退出或 ACK 无效。不能证明未派发；查原 task，必要时仅显式 recover。 |
-| `MODEL_OR_SESSION_SETUP_FAILED` | prompt 尚未派发，初始化根因未知。准确的 session 身份、model/effort 和 acpx pin 错误保留原码。 |
-| `REQUEST_FAILED` | 原 journal 的 canonical 失败；根因未知，副作用可能已发生。核对原结果，不因泛化失败换模型、放权或重发。 |
-| `REQUEST_AUTH_REQUIRED`、`REQUEST_PERMISSION_DENIED` | ACP 有明确结构化认证或权限证据；尊重拒绝，由负责人处理授权，不自动换模型、放权或重发。 |
-| `REQUEST_OUTCOME_UNKNOWN`、`TURN_TRANSPORT_INTERRUPTED` | 非 canonical 观察失败或明确通信中断。只观察原 request，不将其封存为业务失败或重放授权。 |
-| `NO_PROGRESS` | 原请求静默达到本轮期限。已尝试派发时封存结果未知通知，再继续被动观察；没有额外期限。 |
-| `CANCEL_UNCONFIRMED`、`UNSAFE_OWNER_SOCKET` | 原 request 取消或 socket 身份未确认。取消意图/RPC 不等于 canonical cancelled；不扩大为 session-wide cancel。 |
-| `INVALID_RECEIPT`、`CALLBACK_RETRYABLE_STATUS`、`DELIVERY_UNCONFIRMED` | 分别表示无有效 receipt、可重试 HTTP 状态、handoff 未知。沿原 exact body 和期限重试，不重派业务。 |
-| `CALLBACK_REJECTED`、`REDIRECT_REFUSED` | 明确拒绝或重定向拒绝；保留原 outbox，由负责人处理，不向新地址发送 bearer。 |
-| 原读取/安全/不支持记录码、`UNKNOWN_RECORDED_CODE` | 核对所列记录，保留原字节；缺记录、坏记录或未知旧码不授权重放。 |
-| `TASK_OPERATION_FAILED` | 本层只能确认操作失败，不能安全分辨根因；沿 stage/field 核对原任务。 |
+| accepted | 保留原 ACK 语义：control 已确认接管，或原结果无需补投；不证明模型收到或 started。 |
+| task_recorded | true：task 已保存且关联确认；false：本次尚未到 submit；null：写入/fsync 或原关联不能确认。 |
+| claim_recorded | true：claim 已保存/读到；false：本次未领取；null：claim 写入持久性不能确认。 |
+| dispatch_state | not_reached：当前证据尚未到 startTurn；attempted：已落盘派发尝试，不等于模型收到；unknown：可能已尝试。 |
+| unknown_scope | preparation、storage、request 的数组；指出准备现场、持久性或原请求不确定性。 |
+| outcome_unknown | unknown_scope 是否非空；不是“业务目标未完成”的自动标记。 |
 
-launch 错误的 `task_recorded` 为三态：`true` 表示已核对原 task 关联；`false` 表示本次在 submit 前失败；
-`null` 表示原记录或持久性不能确认。`false` 不判断更早的同 key 调用。`outcome_unknown=true` 要求保留并核对
-原请求或准备现场；`accepted=false`、ACK 丢失或文件缺失均不证明未派发。submit 的写入失败不启动控制进程；
-若原 task 已可读，返回原 request_id，后续只能按既有显式恢复规则观察。普通 submit 响应丢失仍复用原请求。
-已领取 claim 时，即使修正环境或选择，也不自动续完准备。若先前调用结果未知，先观察原请求，再处理新输入。
+首次 fetch 失败：accepted=false、task_recorded=false、claim_recorded=true、dispatch_state=not_reached，未知范围仅 preparation。
+submit fsync 失败可能已有可读 request；task_recorded=null，但本次不启动 control。
+ACK 丢失时 dispatch_state 可为 unknown。最后 claim 写入失败可同时 **accepted=true + TASK_WRITE_FAILED**；仍观察原对象，不再次 submit。
+task_id 存在不证明 task 已存在；可读文件也不证明失败 fsync 已完成。status 是当前只读采样，不补写或倒推历史 fsync。
 
-status/result/list items 同时显示 `execution_error`/`execution_diagnostic`、
-`observation_error`/`observation_diagnostic` 和 `delivery_error`/`delivery_diagnostic`。
-执行终态、非 canonical 观察失败、回调 handoff 分开。晚到 canonical 结果清除观察错误，但不改已封存 callback body。
-list 的逐项 `errors` 使用相同定位字段，coverage 和有界游标规则不变。批量 recover 失败时，
-`recovery_confirmed` 只数已收到 ACK 的控制请求；更早的控制可能已接管，不能将批量失败理解为全部未启动。
-后续项读取失败只定位当前 task；未确认 request_id 时不返回该字段，`task_recorded=null`。
+失败退出 1。error 只保留固定 code/stage/field/category/reason/action/hint、安全句柄、允许的变量名/HTTP 状态。
+Git 另返回数值 git_exit_code、启动 git_errno、允许的 git_signal；必要时有固定 SSH_HOST_KEY_VERIFICATION_FAILED 或 SSH_OPTIONS_UNSUPPORTED。
+exit 128 不代表认证失败。stderr 只在内存有界匹配后丢弃；不返回 remote、用户名、公钥、凭据、原 cause/stack。
+不解析自然语言、assistant 拒绝或 retryable 来猜 Provider policy/auth。明确 ACP 认证/权限拒绝分别为 REQUEST_AUTH_REQUIRED/REQUEST_PERMISSION_DENIED。
 
-pinned acpx 的 journal 会丢失部分原 ACP/Provider 细节。任务层只识别固定认证/权限字段，
-不解析异常文字、assistant 自然语言拒绝或 `retryable` 来猜 Provider policy/auth。
-canonical completed 也不证明业务目标完成，仍须按授权读取结果。callback 的 401/403 不是 Provider 认证证据。
-CodeAPI runner 的 fork/thread EAGAIN、执行 502 或 LibreChat 的 `PTC_TOOL_FAILED` 位于本层之外。
-没有本层结构化错误和原 task/request 证据时，不映射成同一错误；由宿主负责人保留原 Workspace 执行证据。
-本改造不修 PTC 宿主、替换 installed runtime 或承诺宿主恢复。
+status/result 区分 execution、observation、delivery 错误。REQUEST_FAILED 是 canonical 失败；REQUEST_OUTCOME_UNKNOWN/TURN_TRANSPORT_INTERRUPTED 是观察未知。
+NO_PROGRESS 通知不证明原请求结束；CALLBACK_REJECTED/REDIRECT_REFUSED 不更换地址或重派业务。
+TASK_WRITE_FAILED/CONTROL_ACK_UNKNOWN 先查原 task；需要时只显式 recover 原 request/原 body。
+坏 JSON、缺失、超限或不支持格式均报错，保留原字节，不授权重放。
 
-## 当前持久格式边界
+result 直接返回 canonical output、callback_output 和已有 delivery/receipt 字段。无 canonical 时 result_status/output/terminal_at 为 null。
+晚到 canonical 结果和已封存 callback 分开；receipt 只证明 handoff。输出按注册限额裁剪（默认/最大 32768），
+含 `tcb_` 或保存 callback URL 的文本扣留。业务敏感输出仍须按授权读取。
 
-仅支持当前 task.json 与 launch 记录 **version: 2**。task 必须有完整模型/config/profile、权限、
-createdAt、noProgressMs 和进展起点；结果单独存入 result，callback body/state 单独保存。
-已有 v2 launch 未存 base 时，沿其原约定按 main 返回及续接，保留已存 base_sha，不回填字段或迁移数据。
-旧 version=1、旧 callback/ACK/unknown 和所有 runtime/session/cache/private 数据不迁移、不改字节。
-当前任务在既有状态写入时可保存允许列表内的可选诊断；旧 v2 无诊断仍受支持，查询只作安全投影，不回填。
-task/launch 仍为 version 2，公开响应与 callback wire version 均不变。
-不支持记录报 UNSUPPORTED_TASK_RECORD（launch 元数据为 UNSUPPORTED_LAUNCH_RECORD）。
-定向操作退出 1；list 列 errors/不完整 coverage；无参数 recover 明列 unsupported 并继续支持项。
-坏记录、unsafe 属性和读错误失败关闭，不静默当作缺失，也不授权重放。
+list 用普通目录列表、排序和 state/session 筛选。默认 limit=20，最大 50；最多读 200 个 task，每记录最多 8 MiB。
+返回 records_checked、truncated 和逐项 errors；无 cursor、目录指纹、coverage 或全库索引。空 items 不保证无其他任务。
+claim-only 用已知 TASK_ID 的 status 查询。doctor 默认 full 校验安装 inventory；--quick 跳过二进制内容/哈希。
+doctor 不扫描任务，不执行版本或访问 Provider/MCP。离线自检不证明服务健康。
 
-runtime/tasks 的 owner 标记绑定 UID/Workspace。目录 0700、记录 0600，原子替换和文件/目录 fsync
-保证合作进程的持久接受。control.lock 只允许一个控制进程。锁不证明进程健康；不保存 PID 作接管
-或发信号依据。继承 [安装信任边界](README.md#存储与启动)，不防 root/同 UID/可信 PVC group。
+## 当前持久格式
+
+源码新版本只读写 **runtime/tasks-v3/** 中的 **version: 3** task/claim，无旧 v1/v2 兼容或迁移。
+旧 runtime/tasks、session、cache、private 和 installed 均不扫描、不删除、不自动 adopt；清理由负责人另阶段处理。
+任务查询信任本地用户，不逐祖先/UID/inode/hardlink 检查，不加读锁或跨文件快照。
+私密输入写前保护、发行包验证和安装回退仍保留，见 [README](README.md#存储与启动)。
+
+task 写入使用小型 atomic replace，文件及目录 fsync；claim 排他发布，防意外双提交。
+无全局 submit/目录锁，不把 flock 描述符传给 Git。每 task 只有 nonblocking control.lock，防重复执行/投递。
+不防 root、同 UID 或恶意本地用户，不保证并发跨文件事务快照。
 
 ## 执行、统一时限和显式恢复
 
-无事件计时起点是 task 持久接受的 createdAt。初始化、排队及执行使用同一条规则；进入阶段、
-findSession、重连、空轮询和其他请求均不续期。原 promptStarted、thought、文本、工具状态等
-执行事件续期。输出仅收集 assistant 文本，thought/工具不进入业务结果。新 message ID 替换
-中间回答，按 UTF-8 限额裁剪。原 request 的 canonical turn.result 或 journal turn_result 才完成。
-通信 failed/WATCH_OUTCOME_UNKNOWN 不伪装 canonical 失败；明确 setup/canonical 失败及时报告。
+默认连续 **900 秒**无原 request 执行事件，整数 override 范围 1～86400 秒。起点是持久接受时间。
+初始化、排队、执行共用期限；阶段变化、findSession、重连、空轮询、其他请求和读查询不续期。
+原 promptStarted、文本、thought、工具等执行事件续期；只收集 assistant 文本，thought/工具不进入业务结果。
+不同 message ID 替换中间回答。只有原 canonical turn.result/journal turn_result 才结束请求。
 
-派发前先落盘 dispatching；从这一刻开始即可能已发送，响应丢失仍未知，禁止重发。
-queued/preparing 尚未尝试 startTurn，显式 recover 可如实报告未派发失败或排队取消。
-dispatching/running/ambiguous 只观察保存的原 session/request/cursor，output 与 cursor 一起保存。
-不从缺日志、缺 owner、缺结果、时间流逝或控制程序退出推断重放授权。
+派发前先落盘 dispatching；从这里起可能已发送，响应丢失仍未知，不重发。
+queued/preparing 显式 recover 只封存未派发失败或排队取消；其余阶段只观察保存的 session/request/cursor。
+无日志、owner、结果或时间流逝均不授权重放。通信失败不伪装 canonical 失败。
 
-连续无原请求事件达到时限时，控制进程先持久保存一次 error 通知：原结果和副作用未知、可能
-仍执行，不自动重发或取消。回调封存后同一控制进程继续被动观察，晚到 canonical 成功/失败/取消
-另存 result，查询可见；不覆盖 body、不投递第二次回调。若初始化尚未派发，可报告未派发错误，
-其晚到初始化完成也不发送 prompt。
-
-进程内及同 boot/time namespace 显式恢复沿保存的单调起点；跨重启沿原墙钟时间差，不重赠完整
-期限。journal 无生成时间，新进展仅表示 cursor 后新观察到事件，不证明远端实时活跃。
-控制程序存活且可调度时，超时检查间隔最多约 200 ms；callback 每次网络上限 30 秒且异步。
-磁盘不可写、控制程序卡住/退出或整个 Workspace 停止时没有及时通知保证，也没有另一个 monitor。
-只有显式 recover 恢复观察/补投，安装和启动不自动恢复，不重新派发业务。
-
-cancel 只保存取消请求并对原 request ID 发 cancel_prompt，不调用 session-wide cancel。
-RPC accepted/cancelled 回复只是取消请求确认，canonical cancelled 才表示原业务终态。
-未派发的 queued 取消不执行业务；不影响同 session 其他 queued。acpx 私有 adapter 仅保留固定
-0.21.1 的 socket 路径/UID/权限及 generation/响应身份校验，3 秒取消等待；这些校验不用于健康探测。
+到期后先持久封存一次 unknown error 通知；不自动取消或重发。原 control 继续 passive observe，晚到 canonical 独立保存，不覆盖 body 或二次 callback。
+断线和显式恢复沿剩余期限；同 boot 用单调起点，跨重启用原墙钟差，不重赠完整期限。
+control 可调度时约 200 ms 检查；网络投递异步、每次最多 30 秒。磁盘不可写、进程停止或 Workspace 停止时无及时通知保证。
+只有显式 recover 恢复观察/补投。cancel 只保存意图并向原 request ID 发 cancel_prompt，canonical cancelled 才是业务终态。
+不影响同 session 其他 queued 请求，不调用 session-wide cancel。
 
 ## 持久 outbox
 
-每次注册只封存一个 exact body，先 fsync 再 POST，重试不重新生成：
+每注册只封存一个 exact body，先 fsync 再 POST：
 
 ```json
 {"version":1,"callback_id":"<私密 bearer>","status":"success","output":"有界结果"}
 ```
 
-仅 success/error/cancelled，不附输入/metadata/认证头。URL 仅 HTTPS（loopback fixture 可 HTTP），
-路径固定 `/api/agents/task-callbacks`，拒绝用户信息/query/fragment/重定向。最多读 4096 字节
-202 receipt `{version:1,receipt_id,accepted_at}`，有效 receipt 后停止重投；只证明 handoff。
-网络失败、无效 receipt、408/425/429/5xx 沿同一 body 自动重试。退避 5 秒～5 分钟，Retry-After
-可延至 24 小时，期限持久保存。其他状态成为 rejected，保留安全原因。不按 expiry 丢弃 outbox。
-投递等待不阻塞事件消费、超时或晚到结果。进程退出后自动重试停止，须显式 recover 补投。
+仅 success/error/cancelled，无输入/metadata/认证头。URL 仅 HTTPS（loopback fixture 可 HTTP），固定 `/api/agents/task-callbacks`，拒绝用户信息/query/fragment/重定向。
+最多读取 4096 字节 202 receipt `{version:1,receipt_id,accepted_at}`；有效 receipt 后停止补投，只证明 handoff。
+网络失败、无效 receipt、408/425/429/5xx 重试原 body；退避 5 秒～5 分钟，Retry-After 最多 24 小时，期限保存。
+其余状态 rejected。不因 expiry 丢弃 outbox；进程退出后须显式 recover。
 
-## 只读查询与离线安装自检
+## 下游交接
 
-list/status/result/doctor 不建存储/锁/config，不要求 Provider key；存储不存在报 TASK_STORE_MISSING。
-仅 result 返回 canonical output 和已封存 callback_output，二者分开。status 的 result_status/
-terminal_at 表示真实业务结果；callback_kind/status/state 和 notification_at 表示通知及投递。
-无 canonical 时 result_status/output/terminal_at 为 null。receipt 不能证明业务结束或后续推理完成。
-output_limit_bytes 取注册限额，默认/最大 32768；output_bytes/truncated/available 明确裁剪和扣留。
-文本含 `tcb_` 或保存的 callback URL 则扣留，不改原 body；业务敏感文本仍须按授权读取。
-
-list 支持 state=queued|preparing|dispatching|running|ambiguous|completed 和 session 精确筛选。
-默认 limit=20、scan-limit=100，上限 50/200；单记录最多 8 MiB、每页最多 32 MiB。不读 journal
-或旧健康文件，不算全库总数。coverage 列读取/推进/成功/失败/字节，须连同 items/errors 解释。
-stop_reason=limit|scan_limit|read_budget|end；remaining_records 始终 null。next_cursor=null 才采样到
-目录末尾，complete 只指本页到末尾且无错；空 items 不表示空库。
-游标用 Linux x86-64 glibc 目录 cookie，续页保留筛选；目录身份变化报 CURSOR_STALE，重查按
-task_id 去重。逐记录与跨页非事务快照。安全错误不附 prompt、路径、callback 或原 Provider 错误。
-
-doctor 只核必要安装项：active/wrapper、私有布局、源码 inventory、固定工具 metadata/pin、profile
-和安装 capability。默认 full 核二进制内容/摘要，--quick 明确跳过二进制内容/摘要，仅核同 fd 元数据。
-不扫描任务/依赖历史，不执行 agent/工具版本、不联系服务。遇首错停止，其后标为 not_checked。
-离线通过不证明真实 Provider/MCP 健康。wrapper 缺失可用已审阅源码：
-
-```sh
-python3 -B opencode/scripts/diagnostics.py --root /mnt/opencode/toolset --quick
-```
+callback 后按已有结果继续，不重复读取已确认的 status/report/diff。下游 prompt 需带已核门槛：实际 repo、run_id、branch、完整 SHA、status、conclusion 和核对时间。
+continue 只补增量，并写明已完成步骤。不解析报告文字虚构自动业务成功标记，也不把 accepted 当成 started。
+平台 Task Running 人读文案、PTC 样例和 Skill 由平台负责人同步，本仓不改宿主或机器触发条件。
 
 <a id="verification-and-rollout-boundary"></a>
 ## 验证与交付边界
 
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
-python3 -B opencode/build_bundle.py --check
 node --test opencode/tests/task.test.mjs opencode/tests/task-launch.test.mjs opencode/tests/task-read.test.mjs
+python3 -B opencode/build_bundle.py --check
 (cd opencode/scripts && npm ci --ignore-scripts --no-audit --no-fund)
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test --test-concurrency=1 opencode/tests/runtime.test.mjs opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs
 env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode node --test opencode/tests/published.test.mjs
 ```
 
-使用已有 Node 时可用其绝对路径；Python 非 root fixture 支持 NODE_FIXTURE_BINARY。
-测试含单控制进程、默认/覆盖时限、原事件隔离、重连剩余期限、晚到结果、异步 outbox、显式恢复、
-取消队列隔离、同 key 并发/响应丢失、Git 中断保留、有界只读和私密输入安全。
-夹具先按出生身份停止自有写入者才清理；失败保留现场与首错。历史并行 heartbeat 超时、copilot
-首次 resume 停顿、SQLite/worker.lock 原因仍未证；删除旧保证不证明修复，见 [UPGRADE.md](UPGRADE.md)。
-无真实 Provider/MCP/QQ 或付费推理，不发布、激活模板或替换当前 toolset。平台 Skill 由负责人同步。
+原生 OpenSSH 新/变化 key、host/port/alias 回环 fixture 另需测试环境的 paramiko 3.5.1；通过 PYTHONPATH 指向隔离依赖即可，不进 payload。
+测试仅合成凭据、mock ACP、loopback。安装覆盖首次/缓存、普通 UID 和旧数据保留；Terraform render 固定 65536 预算，见 [README](README.md#validation-and-publication-boundary)。
+不调用真实 Provider/MCP/QQ，不部署、激活模板、替换 installed 或重启 Workspace；fixture 通过不证明生产部署。

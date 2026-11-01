@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { createSharedAcpRuntime, createAgentRegistry } from "../scripts/node_modules/acpx/dist/runtime.js";
 import { TaskRunner } from "../scripts/task.mjs";
 
-test("published OpenCode: HTTP 200 response.failed becomes request failure; same session can continue",
+for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider}: HTTP 200 response.failed becomes request failure; same session can continue`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "published-acp-"));
     fs.chmodSync(base, 0o700);
@@ -57,6 +57,7 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const endpoint = `http://127.0.0.1:${server.address().port}`;
     const config = JSON.parse(fs.readFileSync(new URL("../scripts/profile-env.json", import.meta.url), "utf8"));
+    config.model.providerID = provider; config.agents.title.model.providerID = provider;
     config.mcp = { servers: {} };
     for (const provider of Object.values(config.providers)) provider.settings = { baseURL: endpoint + "/v1", apiKey: "synthetic-key" };
     const configFile = path.join(base, "config.json");
@@ -64,8 +65,8 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     Object.assign(process.env, { HOME: base, TMPDIR: base, XDG_DATA_HOME: path.join(base, "data"),
       XDG_CONFIG_HOME: path.join(base, "config"), XDG_CACHE_HOME: path.join(base, "cache"), XDG_STATE_HOME: path.join(base, "state"),
       OPENCODE_CONFIG: configFile, OPENCODE_DISABLE_AUTOUPDATE: "true", OPENCODE_DISABLE_MODELS_FETCH: "true",
-      OPENCODE_ACP_REQUIRED_MODEL: "codex/gpt-6.1-sol", OPENCODE_ACP_REQUIRED_VARIANT: "max" });
-    const runtime = createSharedAcpRuntime({ cwd: base, permissionMode: "deny-all", nonInteractivePermissions: "deny", authPolicy: "skip",
+      OPENCODE_ACP_REQUIRED_MODEL: `${provider}/gpt-6.1-sol`, OPENCODE_ACP_REQUIRED_VARIANT: "max" });
+    const runtime = createSharedAcpRuntime({ cwd: base, permissionMode: "approve-all", nonInteractivePermissions: "deny", authPolicy: "skip",
       ttlMs: 1000, agentRegistry: createAgentRegistry({ overrides: { opencode: [process.env.OPENCODE_FIXTURE_BINARY, "acp"] } }) });
     const watchSession = runtime.watchSession.bind(runtime);
     runtime.watchSession = async function* (options) {
@@ -81,7 +82,7 @@ test("published OpenCode: HTTP 200 response.failed becomes request failure; same
     let handle;
     try {
       const submit = (key, letter) => runner.submit({ key, cwd: base, prompt: "Synthetic fixture: answer one short sentence.", session: "original",
-        model: { id: 'codex/gpt-6.1-sol', variant: 'max' }, modelConfig: configFile, modelProfile: 'external',
+        model: { id: `${provider}/gpt-6.1-sol`, variant: 'max' }, modelConfig: configFile, modelProfile: 'external',
         callback: { callback_id: `tcb_${letter.repeat(43)}`, callback_url: endpoint + "/api/agents/task-callbacks" } }).task_id;
       const failed = submit("failed-response", "f");
       await runner.execute(failed);

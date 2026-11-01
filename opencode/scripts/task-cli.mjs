@@ -9,7 +9,7 @@ let context = { stage: "runtime", field: "installation" }, taskRecorded, outcome
 const version = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2), command = args.shift();
 const help = "opencode-task launch --input-file PRIVATE_JSON [--continue-from TASK_ID]\n" +
-  "opencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20] [--scan-limit 100] [--cursor CURSOR]\nopencode-task doctor [--quick]\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\nlist/status/result/doctor 只读。recover 须显式调用，只观察原 request 或补投原 body。权限及未知结果边界见 TASKS.md。";
+  "opencode-task status TASK_ID\nopencode-task result TASK_ID\nopencode-task list [--state STATE] [--session NAME] [--limit 20]\nopencode-task doctor [--quick]\nopencode-task cancel TASK_ID\nopencode-task recover [TASK_ID]\n新 launch 默认 approve-all；continue 省略权限沿原保存值。list/status/result/doctor/help 只读。recover 只观察原 request 或补投原 body。受理不等于 started。未知时不换 key 重派。详见 TASKS.md。";
 
 async function spawnControl(id, recover = false) {
   let child;
@@ -41,14 +41,15 @@ function options(values, names) {
   return result;
 }
 async function main() {
-  if (["--help", "help", undefined].includes(command)) { console.log(help); return; }
-  if (command === "--version") { console.log("opencode-task 2"); return; }
+  if (["--help", "-h", "help", undefined].includes(command)) { console.log(help); return; }
+  if (["launch", "status", "result", "list", "cancel", "recover", "doctor"].includes(command) && args.length === 1 && ["--help", "-h"].includes(args[0])) { console.log(help); return; }
+  if (command === "--version") { console.log("opencode-task 3"); return; }
   if (!["launch", "status", "result", "list", "cancel", "recover", "_run"].includes(command)) throw new TaskError("INVALID_COMMAND", { stage: "validate", field: "command" });
   const root = readJson(path.join(version, "settings.json"), 65536, { stage: "runtime", field: "settings" }).install_root;
   context = { stage: "read", field: "task_store" };
-  const runner = new TaskRunner({ root: path.join(root, "runtime/tasks") });
+  const runner = new TaskRunner({ root: path.join(root, "runtime/tasks-v3") });
   if (command === "list") {
-    console.log(JSON.stringify(listTasks(runner, options(args, ["--state", "--session", "--limit", "--scan-limit", "--cursor"])))); return;
+    console.log(JSON.stringify(listTasks(runner, options(args, ["--state", "--session", "--limit"])))); return;
   }
   if (command === "launch") {
     const { launchTask } = await import("./task-launch.mjs");
@@ -57,7 +58,7 @@ async function main() {
   }
   if (command === "recover") {
     if (args.length > 1) throw new TaskError("INVALID_ARGUMENTS", { stage: "validate", field: "arguments" });
-    const unsupported = [], pending = args.length ? [args[0]] : runner.pending(unsupported);
+    const pending = args.length ? [args[0]] : runner.pending();
     for (const id of pending) {
       // 后续读取失败不能沿用上一项的 request 或确认状态。
       context = { stage: "read", field: "task_record", task_id: id }; taskRecorded = null; outcomeUnknown = true;
@@ -65,7 +66,7 @@ async function main() {
       context = { stage: "control", field: "control_ack", task_id: id, request_id: task.requestId };
       await spawnControl(id, true); recoveryConfirmed++;
     }
-    console.log(JSON.stringify({ version: 1, recovering: pending.length, unsupported })); return;
+    console.log(JSON.stringify({ version: 1, recovering: pending.length })); return;
   }
   const id = args.shift();
   if (["status", "result"].includes(command)) {
@@ -95,7 +96,7 @@ async function main() {
     if (command === "_run") {
       context.stage = "control"; context.field = "control_ack"; outcomeUnknown = !stored.result;
       if (args.includes("--ready")) fs.writeSync(3, "ready\n");
-      await runner.control(id, { observeOnly: args.includes("--recover") });
+      await runner.control(stored, { observeOnly: args.includes("--recover") });
     }
     else { context.stage = "cancel"; context.field = "request"; outcomeUnknown = !stored.result;
       await runner.cancel(id); console.log(JSON.stringify(runner.status(id))); }

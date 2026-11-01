@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { createSharedAcpRuntime, createAgentRegistry } from "acpx/runtime";
 import { l as readQueueOwnerRecord } from "acpx/dist/ipc-BbYFsKOj.js";
-import { taskPermissions, taskModel, privateFile } from "./task.mjs";
+import { privateFile } from "./task.mjs";
 import { TaskError, errorCode } from "./task-errors.mjs";
 
 const installed = createRequire(import.meta.url)("acpx/package.json").version;
@@ -58,11 +58,7 @@ async function cancelOriginal(recordId, targetRequestId) {
 }
 export function createTaskRuntime(root, record) {
   if (installed !== "0.21.1") throw new TaskError("UNSUPPORTED_ACPX_RUNTIME", { stage: "setup", field: "installation" });
-  const permissions = taskPermissions(
-    record.permissions.mode,
-    record.permissions.policy,
-  );
-  const model = taskModel(record.model);
+  const { permissions, model } = record; // TaskRunner.load 已校验当前格式。
   try { privateFile(record.modelConfig); }
   catch (error) { throw new TaskError(errorCode(error, error?.code === "ENOENT" ? "TASK_MODEL_CONFIG_REQUIRED" : "TASK_READ_FAILED"), { stage: "setup", field: "model_config", reason: error?.code }); }
   const argv = [path.join(root, "bin/opencode"), "--module-task", record.modelConfig,

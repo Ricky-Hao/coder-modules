@@ -10,8 +10,9 @@ import fcntl
 # 固定本次版本。
 VERSION = Path(__file__).resolve().parent
 sys.path.insert(0, str(VERSION))
-from safety import ancestors, directory, owner, regular
+from safety import ancestors, directory, owner, regular, sync_directory
 import profiles
+import git_ssh
 
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
@@ -21,7 +22,7 @@ RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_S
 def filtered_environment(environ, preserve=()):
     # 回调不进入模型环境。
     return {k: value for k, value in environ.items() if k not in RESERVED - set(preserve)
-            and (not k.startswith('OPENCODE_MODULE_') or k == 'OPENCODE_MODULE_CONFIG' or k in preserve)
+            and (not k.startswith('OPENCODE_MODULE_') or k in ('OPENCODE_MODULE_CONFIG', git_ssh.BASE) or k in preserve)
             and not k.startswith(('LC_TASK_CALLBACK', 'OPENCODE_TASK_CALLBACK'))
             and not re.search(r'tcb_[A-Za-z0-9_-]{43}', value)}
 
@@ -30,6 +31,7 @@ def environment(environ, root, profile='none', workspace_id=None, arguments=(), 
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
     child = filtered_environment(environ)
+    child = git_ssh.environment(child, root, VERSION)
     state = root / 'runtime'
     child.setdefault('PATH', '/usr/bin:/bin')
     child.update({'HOME': str(state / 'home'),
@@ -75,13 +77,22 @@ def environment(environ, root, profile='none', workspace_id=None, arguments=(), 
 
 
 def acpx_arguments(arguments):
-    # Project acpx config must not silently broaden the module's deny-all default.
+    # Explicit CLI permissions and native policy still take precedence.
     defaults = []
     if not any(flag in arguments for flag in ('--approve-all', '--approve-reads', '--deny-all')):
-        defaults.append('--deny-all')
+        defaults.append('--approve-all')
     if not any(arg == '--non-interactive-permissions' or arg.startswith('--non-interactive-permissions=') for arg in arguments):
         defaults.extend(['--non-interactive-permissions', 'deny'])
     return [*defaults, *arguments]
+
+
+def opencode_arguments(arguments):
+    # Native --auto approves asks but still respects explicit policy denials.
+    # ACP gets the saved acpx permissions; interactive/continued sessions stay native.
+    if arguments[:1] != ['run'] or any(arg in ('-c', '--continue', '-s', '--session') or arg.startswith(
+            ('--session=', '-s=', '--continue=', '-c=', '--auto', '--no-auto', '--yolo', '--dangerously-skip-permissions')) for arg in arguments):
+        return arguments
+    return ['run', '--auto', *arguments[1:]]
 
 
 class SelectionError(ValueError):
@@ -161,11 +172,11 @@ def main():
                 value = doctor(root, VERSION, quick=arguments == ['doctor', '--quick'])
                 print(json.dumps(value, ensure_ascii=False))
                 return 0 if value['ok'] else 1
-            if arguments[:1] == ['doctor']:
+            if arguments[:1] == ['doctor'] and not profiles.harmless(arguments):
                 raise ReadError('INVALID_ARGUMENTS')
-            if arguments[:1] in (['list'], ['status'], ['result']):
+            if arguments[:1] in (['list'], ['status'], ['result']) and not profiles.harmless(arguments):
                 field = 'task_store'
-                task_root(root, settings)
+                task_root(root)
             # 查询没有初始化、锁文件或 profile materialize；Node 只运行命令投影。
             binary = VERSION / 'node/bin/node'
             field = 'installation'
@@ -211,57 +222,39 @@ def main():
             return 1
     task_arguments = arguments
     if tool == 'opencode-task':
-        tasks = root / 'runtime/tasks'
-        # 锁覆盖 owner 创建与 submit 去重。
-        runtime_fd = os.open(root / 'runtime', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            fcntl.flock(runtime_fd, fcntl.LOCK_EX)
-            created = False
-            try:
-                tasks.mkdir(mode=0o700)
-                created = True
-            except FileExistsError:
-                pass
-            directory(tasks)
-            if created:
-                from safety import write_json
-                write_json(tasks / 'owner.json', {'schema': 1, 'uid': os.getuid(), 'workspace_id': settings['workspace_id']})
-            owner(tasks, settings['workspace_id'])
-        finally:
-            os.close(runtime_fd)
-        lockpath = tasks / 'submit.lock'
+        tasks = root / 'runtime/tasks-v3'
+        tasks.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(tasks.parent)
         if arguments[:1] == ['_run']:
             if len(arguments) < 2 or not re.fullmatch(r'task_[a-f0-9]{64}', arguments[1]):
                 raise ValueError('invalid task control')
-            task_dir = directory(tasks / arguments[1])
+            task_dir = tasks / arguments[1]
             lockpath = task_dir / 'control.lock'
             regular(task_dir / 'task.json')
         task_arguments = ['--help']  # 控制/恢复免凭据；实际 agent 启动才校验已存选择的环境。
-        if arguments[:1] in (['launch'], ['_run']):
+        if arguments[:1] == ['_run']:
             task_lock = os.open(lockpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             regular(lockpath)
             if os.fstat(task_lock).st_mode & 0o077:
                 raise ValueError('task lock must be private')
             try:
-                fcntl.flock(task_lock, fcntl.LOCK_EX | (0 if arguments[:1] == ['launch'] else fcntl.LOCK_NB))
+                fcntl.flock(task_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                if arguments[:1] == ['_run']:
-                    if '--ready' in arguments[2:]:
-                        os.write(3, b'ready\n')
-                    return
-                raise
+                if '--ready' in arguments[2:]:
+                    os.write(3, b'ready\n')
+                return
             os.set_inheritable(task_lock, True)
     if tool == 'opencode-task' and arguments[:1] == ['launch']:
         # Git 沿调用者的 HOME/SSH/PATH；选择和 agent 再走各自的模块环境。
         caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
         child = filtered_environment(os.environ, caller_paths)
-        child['OPENCODE_MODULE_LAUNCH_LOCK'] = str(task_lock)
+        child = git_ssh.environment(child, root, VERSION)
     else:
         child = environment(os.environ, root, profile, settings['workspace_id'], task_arguments, task)
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):
         raise ValueError('ACP requires an explicit provider/model from config or environment')
     if tool == 'opencode':
-        binary, argv = VERSION / 'opencode', arguments
+        binary, argv = VERSION / 'opencode', opencode_arguments(arguments)
     elif tool == 'acpx':
         # 私有 Node 不进 PATH。
         binary, argv = VERSION / 'node/bin/node', [str(VERSION / 'node_modules/acpx/dist/cli.js'), *acpx_arguments(arguments)]

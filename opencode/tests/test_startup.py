@@ -296,11 +296,8 @@ class StartupTests(unittest.TestCase):
         self.fixture.install()
         root = self.fixture.root
         task_id = 'task_' + 'b' * 64
-        task = root / 'runtime/tasks' / task_id
+        task = root / 'runtime/tasks-v3' / task_id
         task.mkdir(mode=0o700, parents=True)
-        (task.parent / 'owner.json').write_text(json.dumps({'schema': 1, 'uid': os.getuid(),
-                                                          'workspace_id': self.fixture.bundle['config']['workspace_id']}))
-        (task.parent / 'owner.json').chmod(0o600)
         for name, value in (('task.json', {'state': 'queued'}), ('cancel.json', {'requested': True})):
             (task / name).write_text(json.dumps(value))
             (task / name).chmod(0o600)

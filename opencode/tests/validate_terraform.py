@@ -118,7 +118,7 @@ run "executable_dedicated_startup" {
         assert size <= SCRIPT_BUDGET, f'actual rendered script is {size} bytes, exceeding startup budget'
         sizes.append({'script': number, 'bytes': size, 'budget': SCRIPT_BUDGET})
         configs.append(bundle['config'])
-        assert set(bundle['files']) == {'install.py', 'runtime.py', 'safety.py', 'profiles.py',
+        assert set(bundle['files']) == {'install.py', 'runtime.py', 'git_ssh.py', 'safety.py', 'profiles.py', 'task-receipt.mjs',
                                         'profile-env.json', 'shell_path.py', 'task.mjs', 'task-errors.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs',
                                         'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():

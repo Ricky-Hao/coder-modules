@@ -18,7 +18,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture");
     fs.mkdirSync(version, { recursive: true, mode: 0o700 });
-    for (const name of ["runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
+    for (const name of ["runtime.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-launch.mjs", "task-receipt.mjs", "task-cli.mjs", "task-acp.mjs"])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     const copiedCli = path.join(version, "task-cli.mjs");
     fs.writeFileSync(copiedCli, recordFixtureSpawns(fs.readFileSync(copiedCli, "utf8"), path.join(base, "drivers.ndjson")));
@@ -76,7 +76,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       repo_path: repo, branch: `fixture/${key}`, worktree: `work-${key}`, ...extra });
     const inputFile = (value) => { const file = path.join(base, value.key + ".json"); write(file, value); return file; };
     const launch = (value, from) => checked(["launch", "--input-file", inputFile(value), ...(from ? ["--continue-from", from] : [])]);
-    const load = (id) => JSON.parse(fs.readFileSync(path.join(root, "runtime/tasks", id, "task.json"), "utf8"));
+    const load = (id) => JSON.parse(fs.readFileSync(path.join(root, "runtime/tasks-v3", id, "task.json"), "utf8"));
     const controls = (id) => fixtureProcessSnapshot(base).filter((proof) => proof.role === "_run" && proof.taskId === id && proof.same_birth && !["Z", "X"].includes(proof.state));
     const killControl = async (id) => {
       const proofs = controls(id); assert.equal(proofs.length, 1); const proof = proofs[0];
@@ -106,7 +106,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
 
       let prior = follow.task_id;
       for (const [key, letter, permissions, allowed] of [
-        ["deny-write", "k", undefined, false],
+        ["deny-write", "k", { mode: "deny-all" }, false],
         ["policy-write", "l", { mode: "approve-all", policy: { autoDeny: ["edit"] } }, false],
         ["allow-write", "m", { mode: "approve-all", policy: {} }, true],
       ]) {
@@ -122,7 +122,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => load(waiting.task_id).startedAt, "waiting started");
       assert.equal(controls(waiting.task_id).length, 1);
       for (const name of ["monitor.lock", "worker.lock", "monitor.json", "worker.json"])
-        assert.equal(fs.existsSync(path.join(root, "runtime/tasks", waiting.task_id, name)), false);
+        assert.equal(fs.existsSync(path.join(root, "runtime/tasks-v3", waiting.task_id, name)), false);
       await killControl(waiting.task_id);
       const requestId = load(waiting.task_id).requestId;
       const executionCount = fs.readFileSync(env.TASK_FIXTURE_LOG, "utf8").trim().split("\n").length;
@@ -155,7 +155,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
 
       // 同一 session 的请求级 queued cancel；另一条 queued 请求继续执行。
       const source = load(late.task_id);
-      const runner = new TaskRunner({ root: path.join(root, "runtime/tasks") });
+      const runner = new TaskRunner({ root: path.join(root, "runtime/tasks-v3") });
       const internal = (key, prompt, letter) => runner.submit({ key, cwd: source.cwd, prompt, callback: callback(letter), session: source.sessionName,
         ...Object.fromEntries(["model", "modelConfig", "modelProfile"].map((name) => [name, source[name]])), continuationHandle: source.handle,
         noProgressMs: 15000 }).task_id;
@@ -181,17 +181,24 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const call = () => new Promise((resolve, reject) => {
         const child = spawn(path.join(root, "bin/opencode-task"), ["launch", "--input-file", file], { cwd: base, env });
         let out = "", err = ""; child.stdout.on("data", (data) => { out += data; }); child.stderr.on("data", (data) => { err += data; });
-        child.once("error", reject); child.once("close", (status) => { assert.equal(status, 0, err); resolve(JSON.parse(out)); });
+        child.once("error", reject); child.once("close", (status) => {
+          const value = JSON.parse(out);
+          if (status) assert.equal(value.error.code, "GIT_PREPARATION_INTERRUPTED", err);
+          resolve(value);
+        });
       });
-      const results = await Promise.all([call(), call()]); assert.equal(results[0].request_id, results[1].request_id);
-      await until(() => load(results[0].task_id).result, "concurrent completed");
+      const results = await Promise.all([call(), call()]);
+      assert.equal(results.filter((result) => !result.error).length >= 1, true);
+      const accepted = results.find((result) => !result.error);
+      assert.equal(launch(concurrent).request_id, accepted.request_id);
+      await until(() => load(accepted.task_id).result, "concurrent completed");
       assert.equal(lines(env.TASK_FIXTURE_EVENT_LOG).filter((event) => event.type === "prompt_received" &&
-        event.sessionId === load(results[0].task_id).handle.backendSessionId).length, 1);
+        event.sessionId === load(accepted.task_id).handle.backendSessionId).length, 1);
       for (const command of ["submit", "resolve", "inspect"]) assert.equal(cli([command]).status, 1);
-      const unknown = path.join(root, "runtime/tasks", "task_" + "f".repeat(64)); fs.mkdirSync(unknown, { mode: 0o700 });
+      const unknown = path.join(root, "runtime/tasks", "task_" + "f".repeat(64)); fs.mkdirSync(unknown, { recursive: true, mode: 0o700 });
       write(path.join(unknown, "task.json"), { version: 1, id: path.basename(unknown) });
       const old = fs.readFileSync(path.join(unknown, "task.json"));
-      assert.equal(checked(["recover"]).unsupported.length, 1);
+      checked(["recover"]); // 旧 namespace 不扫描，也不生成兼容报告。
       assert.deepEqual(fs.readFileSync(path.join(unknown, "task.json")), old);
       t.diagnostic(JSON.stringify({ launches: results.length, stable_custom_controls_per_task: 1, callbacks: receipts.size,
         late_callback_body_unchanged: true, recover_replayed_prompts: 0, cancel_queued_isolated: true }));
@@ -204,9 +211,9 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
 
 test("CLI reports partial recovery ACK and setup failure without generic read hints or secret stderr", { timeout: 15000 }, async (t) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-errors-")); fs.chmodSync(base, 0o700);
-  const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture"), tasks = path.join(root, "runtime/tasks");
+  const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture"), tasks = path.join(root, "runtime/tasks-v3");
   for (const directory of [version, tasks]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  for (const name of ["task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs"])
+  for (const name of ["task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-receipt.mjs"])
     fs.copyFileSync(path.join(scripts, name), path.join(version, name));
   const cliFile = path.join(version, "task-cli.mjs");
   fs.writeFileSync(cliFile, recordFixtureSpawns(fs.readFileSync(cliFile, "utf8"), path.join(base, "drivers.ndjson")));

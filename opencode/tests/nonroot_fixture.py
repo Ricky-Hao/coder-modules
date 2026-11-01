@@ -54,15 +54,13 @@ def main(work, node, pvc):
             assert value['ok'] and not value['runtime']['executed']
             assert snapshot(root) == before
 
-        tasks = root / 'runtime/tasks'
+        tasks = root / 'runtime/tasks-v3'
         assert not tasks.exists()
         before = snapshot(root)
         for args in (('list',), ('status', 'task_' + 'a' * 64)):
             assert query(*args, ok=False)['error']['code'] == 'TASK_STORE_MISSING'
         assert snapshot(root) == before and not tasks.exists()
         tasks.mkdir(mode=0o700)
-        (tasks / 'owner.json').write_text(json.dumps({'schema': 1, 'uid': os.getuid(), 'workspace_id': fixture.bundle['config']['workspace_id']}))
-        (tasks / 'owner.json').chmod(0o600)
 
         calls = []
 
@@ -83,7 +81,7 @@ def main(work, node, pvc):
             task = tasks / task_id
             task.mkdir(mode=0o700)
             record = task / 'task.json'
-            record.write_text(json.dumps({'version': 2, 'id': task_id, 'requestId': 'fixture-request',
+            record.write_text(json.dumps({'version': 3, 'id': task_id, 'requestId': 'fixture-request',
                 'cwd': str(work), 'prompt': 'synthetic prompt', 'sessionKey': 'fixture-session',
                 'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
                 'modelConfig': str(root / 'runtime/fixture-config.json'), 'modelProfile': 'env',
@@ -104,7 +102,7 @@ def main(work, node, pvc):
             assert inspected['callback_state'] == 'outbox'
             assert snapshot(root) == before and not calls
             record.chmod(0o640)
-            assert query('status', task_id, ok=False)['error']['code'] == 'UNSAFE_TASK_FILE'
+            assert query('status', task_id)['result_status'] == 'success'
             record.chmod(0o600)
             assert not (tasks / 'submit.lock').exists()
             assert not (root / 'runtime/module-profiles').exists()

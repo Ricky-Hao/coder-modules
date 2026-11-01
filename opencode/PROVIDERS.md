@@ -38,11 +38,11 @@ provider/model 分别填 ID，不拼成一个字段；variant 独立，不靠自
 cost/capabilities/settings；均支持 low/medium/high/xhigh/max。
 
 launch 在接受前生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider title/low。
-model/variant/config path 参与去重和 session 绑定；恢复不重新解释默认值。
+model/variant/config path 参与 task/claim 去重与续接校验；恢复不重新解释默认值。
 首次 ACP 初始化选择模型并在 prompt 前核对 model/effort 确认；明确失败或超过统一无进展时限
 沿原 outbox 报 MODEL_OR_SESSION_SETUP_FAILED，不发 prompt。
 status 显示 model/variant；续接只允许相同选择，省略时沿保存值。不迁移或自动替换 session。
-旧格式的安全拒绝边界见 [当前持久格式](TASKS.md#当前持久格式边界)。
+新任务只用 tasks-v3，旧目录不扫描或迁移，见 [当前持久格式](TASKS.md#当前持久格式)。
 
 ## 外部配置
 

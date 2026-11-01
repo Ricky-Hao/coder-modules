@@ -45,7 +45,7 @@ function fixture(t, options = {}) {
   const intent = { model: { id: "codex/gpt-6.1-sol", variant: "max" }, modelConfig: path.join(root, "config.json"), modelProfile: "env" };
   const input = { ...intent, key: "local-submit-key", cwd: root, prompt: "Perform the task.", callback: options.callback ?? callback };
   const accepted = runner.submit(input), id = accepted.task_id, stop = new AbortController(), pending = [];
-  const run = (extra = {}) => { const promise = runner.control(id, { signal: stop.signal, ...extra }); pending.push(promise); return promise; };
+  const run = (extra = {}) => { const promise = runner.control(runner.load(id), { signal: stop.signal, ...extra }); pending.push(promise); return promise; };
   t.after(async () => { stop.abort(); await Promise.allSettled(pending); fs.rmSync(root, { recursive: true }); });
   return { root, runner, runtime, intent, input, id, accepted, run, stop, executions: () => executions,
     load: () => runner.load(id), result: () => runner.result(id) };
@@ -87,34 +87,34 @@ test("default 15 minutes, explicit seconds bound and timeout dedupe identity", (
   assert.throws(() => f.runner.submit({ ...f.input, noProgressMs: 200 }), /SUBMIT_CONFLICT/);
 });
 
-test("model, policy and cwd/session stay immutable; safe input guards remain", (t) => {
+test("same-key model, policy and cwd/session stay immutable; safe input guards remain", (t) => {
   const f = fixture(t);
   assert.throws(() => f.runner.submit({ ...f.input, prompt: "changed" }), /SUBMIT_CONFLICT/);
   assert.throws(() => f.runner.submit({ ...f.input, prompt: callback.callback_id }), /CALLBACK_IN_PROMPT/);
   assert.throws(() => f.runner.submit({ ...f.input, permissionPolicy: { unknown: [] } }), /INVALID_PERMISSIONS/);
   const input = { ...f.input, key: "named", session: "fixed", permissionMode: "approve-all", permissionPolicy: { autoDeny: ["delete"] } };
   f.runner.submit(input);
-  assert.throws(() => f.runner.submit({ ...input, key: "other", model: { id: "copilot/gpt-6-astra", variant: "high" } }), /SESSION_MODEL_CONFLICT/);
+  assert.throws(() => f.runner.submit({ ...input, model: { id: "copilot/gpt-6-astra", variant: "high" } }), /SUBMIT_CONFLICT/);
   const other = path.join(f.root, "other"); fs.mkdirSync(other, { mode: 0o700 });
-  assert.throws(() => f.runner.submit({ ...input, key: "other", cwd: other }), /SESSION_CWD_CONFLICT/);
+  assert.throws(() => f.runner.submit({ ...input, cwd: other }), /SUBMIT_CONFLICT/);
   for (const url of ["http://example.test/api/agents/task-callbacks", "https://a.test/path?secret=x", "https://u:p@a.test/api/agents/task-callbacks"])
     assert.throws(() => validateCallback({ ...callback, callback_url: url }), /INVALID_CALLBACK/);
 });
 
 test("unknown formats are refused without changing bytes or hiding bad records", async (t) => {
   const f = fixture(t); const valid = f.load();
-  for (const field of ["version", "model", "modelConfig", "modelProfile", "permissions", "createdAt", "noProgressMs", "progress"]) {
+  for (const field of ["version", "model", "modelConfig", "modelProfile", "permissions", "createdAt", "noProgressMs", "progress", "state"]) {
     const old = { ...valid }; delete old[field]; f.runner.write(old);
     const before = fs.readFileSync(f.runner.filename(f.id));
-    assert.throws(() => f.result(), /UNSUPPORTED_TASK_RECORD/);
-    await assert.rejects(f.runner.execute(f.id), /UNSUPPORTED_TASK_RECORD/);
-    await assert.rejects(f.runner.cancel(f.id), /UNSUPPORTED_TASK_RECORD/);
-    const unsupported = []; assert.deepEqual(f.runner.pending(unsupported), []);
-    assert.deepEqual(unsupported, [{ task_id: f.id, code: "UNSUPPORTED_TASK_RECORD" }]);
+    const code = field === "version" ? /UNSUPPORTED_TASK_RECORD/ : /INVALID_TASK_RESULT/;
+    assert.throws(() => f.result(), code);
+    await assert.rejects(f.runner.execute(f.id), code);
+    await assert.rejects(f.runner.cancel(f.id), code);
+    assert.throws(() => f.runner.pending(), code);
     assert.deepEqual(fs.readFileSync(f.runner.filename(f.id)), before);
   }
   f.runner.write(valid); fs.chmodSync(f.runner.filename(f.id), 0o644);
-  assert.throws(() => f.runner.pending(), /UNSAFE_TASK_FILE/);
+  assert.deepEqual(f.runner.pending(), [f.id]);
 });
 
 test("result returns bounded canonical output and withholds private callback content", (t) => {
@@ -237,9 +237,10 @@ for (const status of ["completed", "failed", "cancelled"]) {
 
 test("blocked outbox retry does not block late canonical save; restart retries original bytes", async (t) => {
   const bodies = []; let respond;
-  const f = fixture(t, { noProgressMs: 35, fetcher: async (_url, init) => { bodies.push(init.body); return new Promise((resolve) => { respond = resolve; }); } });
+  const clock = dispatchClock();
+  const f = fixture(t, { tick: clock.tick, noProgressMs: 35, fetcher: async (_url, init) => { bodies.push(init.body); return new Promise((resolve) => { respond = resolve; }); } });
   let finish; const done = new Promise((resolve) => { finish = resolve; });
-  f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () {})(), result: never() });
+  f.runtime.startTurn = () => { clock.start(); return { promptStarted: Promise.resolve(), events: (async function* () {})(), result: never() }; };
   f.runtime.watchSession = async function* () { await done; yield { type: "turn_result", requestId: f.accepted.request_id, cursor: "done", result: { status: "completed" } }; };
   const running = f.run(); await until(() => bodies.length === 1);
   finish(); await until(() => f.result().result_status === "success");
@@ -249,7 +250,7 @@ test("blocked outbox retry does not block late canonical save; restart retries o
   const record = f.load(), body = record.body; record.nextAttemptAt = 0; f.runner.write(record);
   const restarted = new TaskRunner({ root: f.root, runtime: { startTurn() { assert.fail("replay"); } }, pollMs: 5,
     fetcher: async (_url, init) => { bodies.push(init.body); return ok(); } });
-  await restarted.control(f.id, { observeOnly: true });
+  await restarted.control(restarted.load(f.id), { observeOnly: true });
   assert.deepEqual(bodies, [body, body]); assert.equal(restarted.result(f.id).result_status, "success");
 });
 
@@ -265,7 +266,7 @@ test("disconnect/reconnect and explicit recover preserve remaining silence and c
   const before = f.load().progress;
   const stopped = new AbortController();
   const restarted = new TaskRunner({ root: f.root, runtime: f.runtime, pollMs: 5, fetcher: async () => ok() });
-  const began = performance.now(), recovered = restarted.control(f.id, { observeOnly: true, signal: stopped.signal });
+  const began = performance.now(), recovered = restarted.control(restarted.load(f.id), { observeOnly: true, signal: stopped.signal });
   await until(() => restarted.result(f.id).callback_state === "delivered");
   assert.ok(performance.now() - began < 100);
   assert.deepEqual(restarted.load(f.id).progress, before);
@@ -389,7 +390,7 @@ for (const [name, error, code, category] of [
     assert.equal(f.executions(), 0); assert.equal(value.execution_error, code);
     assert.equal(value.execution_diagnostic.stage, "setup"); assert.equal(value.execution_diagnostic.category, category);
     if (category !== "unknown") assert.equal(value.execution_diagnostic.action, "respect_denial");
-    assert.equal(record.model.id, f.intent.model.id); assert.equal(record.permissions.mode, "deny-all");
+    assert.equal(record.model.id, f.intent.model.id); assert.equal(record.permissions.mode, "approve-all");
     assert.equal(record.dispatchedAt, undefined);
     for (const output of [record.body, JSON.stringify(record.executionDetail), JSON.stringify(record)]) assert.equal(output.includes("PRIVATE-"), false);
   });
@@ -409,7 +410,7 @@ for (const [native, code, category] of [
     const result = f.result(); assert.equal(result.result_status, "error"); assert.equal(result.execution_error, code);
     assert.equal(result.execution_diagnostic.category, category); assert.equal(starts, 1);
     assert.equal(JSON.stringify(f.load()).includes("PRIVATE-"), false);
-    assert.equal(f.load().model.id, f.intent.model.id); assert.equal(f.load().permissions.mode, "deny-all");
+    assert.equal(f.load().model.id, f.intent.model.id); assert.equal(f.load().permissions.mode, "approve-all");
   });
 }
 

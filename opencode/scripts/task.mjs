@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { readJson, SNAPSHOT_BYTES } from "./task-read.mjs";
 import { TaskError, errorCode, errorInfo, runtimeError } from "./task-errors.mjs";
+import { loadLaunch, verifyLaunchTask, launchProjection, receiptFacts, preparationSummary } from "./task-receipt.mjs";
 
 export const OUTPUT_BYTES = 32768;
 export const DEFAULT_NO_PROGRESS_MS = 900000;
@@ -28,7 +29,7 @@ async function* connectionEvents(events, disconnected) {
   const iterator = events[Symbol.asyncIterator]();
   while (true) {
     let item;
-    try { item = await iterator.next(); } catch (error) { disconnected?.(error); return; }
+    try { item = await iterator.next(); } catch (error) { disconnected(error); return; }
     if (item.done) return;
     yield item.value;
   }
@@ -42,7 +43,6 @@ export async function within(promise, ms) {
     })]);
   } finally { clearTimeout(timer); }
 }
-export function deliveryState(record) { return record.callbackState; }
 export function privateFile(filename) {
   const info = fs.lstatSync(filename);
   if (!info.isFile() || info.uid !== process.getuid() || info.nlink !== 1 || info.mode & 0o077)
@@ -50,9 +50,7 @@ export function privateFile(filename) {
   return filename;
 }
 function directory(dirname) {
-  const info = fs.lstatSync(dirname);
-  if (!info.isDirectory() || info.uid !== process.getuid() || info.mode & 0o077)
-    throw new Error("UNSAFE_TASK_DIRECTORY");
+  if (!fs.statSync(dirname).isDirectory()) throw new Error("TASK_READ_FAILED");
   return dirname;
 }
 function syncDirectory(dirname) {
@@ -61,19 +59,23 @@ function syncDirectory(dirname) {
     try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   } catch (error) { throw new TaskError("TASK_WRITE_FAILED", { stage: "submit", field: "task_store", reason: error?.code }); }
 }
-export function save(filename, value, { stage = "submit", field = "task_record" } = {}) {
+export function save(filename, value, { stage = "submit", field = "task_record", exclusive = false } = {}) {
+  const temporary = path.join(path.dirname(filename), `.write-${randomUUID()}`);
   try {
-    if (fs.existsSync(filename)) privateFile(filename);
-    const temporary = path.join(directory(path.dirname(filename)), `.write-${randomUUID()}`);
-    const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    const fd = fs.openSync(temporary, "wx", 0o600);
     try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
-    fs.renameSync(temporary, filename);
+    if (exclusive) { fs.linkSync(temporary, filename); fs.unlinkSync(temporary); }
+    else fs.renameSync(temporary, filename);
     syncDirectory(path.dirname(filename));
-  } catch (error) { throw new TaskError(errorCode(error, "TASK_WRITE_FAILED"), { stage, field, reason: error instanceof TaskError ? error.reason : error?.code }); }
+    if (exclusive) syncDirectory(path.dirname(path.dirname(filename))); // 持久保存首次 .launches 目录项。
+  } catch (error) {
+    if (exclusive && error.code === "EEXIST") throw error;
+    throw new TaskError(errorCode(error, "TASK_WRITE_FAILED"), { stage, field, reason: error instanceof TaskError ? error.reason : error?.code });
+  } finally { fs.rmSync(temporary, { force: true }); }
 }
 
-export function taskPermissions(mode = "deny-all", policy = {}) {
+export function taskPermissions(mode = "approve-all", policy = {}) {
   if (!["deny-all", "approve-reads", "approve-all"].includes(mode))
     throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: "permissions.mode" });
   if (!policy || typeof policy !== "object" || Array.isArray(policy))
@@ -220,48 +222,37 @@ export class TaskRunner {
   }
   filename(id, name = "task.json") {
     if (!taskPattern.test(id)) throw new TaskError("INVALID_TASK_ID", { stage: "read", field: "task_id" });
-    return path.join(directory(path.join(this.root, id)), name);
+    return path.join(this.root, id, name);
   }
   load(id, options) {
     const record = readJson(this.filename(id), undefined, options);
     if (!record || record.id !== id) throw new Error("INVALID_TASK_RESULT");
-    if (record.version !== 2 || !record.model || !path.isAbsolute(record.modelConfig ?? "") ||
-        !["env", "external"].includes(record.modelProfile) || !record.permissions || !Number.isSafeInteger(record.createdAt) ||
+    if (record.version !== 3) throw new Error("UNSUPPORTED_TASK_RECORD");
+    if (!record.model || !path.isAbsolute(record.modelConfig ?? "") ||
+        !["env", "external"].includes(record.modelProfile) || !record.permissions?.mode || !record.permissions.policy || !Number.isSafeInteger(record.createdAt) ||
         !Number.isSafeInteger(record.noProgressMs) || record.noProgressMs < 1 || record.noProgressMs > 86400000 ||
         !Number.isSafeInteger(record.progress?.at) || !Number.isFinite(record.progress?.tick) ||
         record.result && (typeof record.result.truncated !== "boolean" || !Number.isSafeInteger(record.result.at) ||
           typeof record.result.output !== "string" || !record.result.status || !record.result.source || !record.result.outputSource))
-      throw new Error("UNSUPPORTED_TASK_RECORD");
+      throw new Error("INVALID_TASK_RESULT");
     if (!record.requestId || !record.sessionKey || typeof record.prompt !== "string" || !record.prompt ||
         !path.isAbsolute(record.cwd ?? "") || Boolean(record.result) !== (record.state === "completed") ||
         record.callbackState !== undefined && record.body === undefined) throw new Error("INVALID_TASK_RESULT");
     taskModel(record.model); taskPermissions(record.permissions.mode, record.permissions.policy);
+    if (!["queued", "preparing", "dispatching", "running", "ambiguous", "completed"].includes(record.state)) throw new Error("INVALID_TASK_RESULT");
+    if (record.result) {
+      choice(record.result.status, ["success", "error", "cancelled"]);
+      choice(record.result.source, ["turn.result", "watchSession.turn_result", "queued_cancellation", "execution_setup_failure"]);
+      choice(record.result.outputSource, ["assistant_output", "program_generated"]);
+    }
+    for (const value of [record.requestId, record.sessionKey, record.sessionName, record.handle?.backendSessionId, record.handle?.acpxRecordId]) identifier(value);
+    try { record.callback = validateCallback(record.callback); sealedBody(record, record.callback); }
+    catch { throw new Error("INVALID_TASK_RESULT"); }
     if (record.handle) validateHandle(record, record.handle);
-    this.resultRecord(record, { output: false });
     return record;
   }
   write(record, stage = record.result ? "result" : ({ queued: "submit", preparing: "setup", dispatching: "dispatch", running: "observe", ambiguous: "observe" })[record.state]) {
     save(this.filename(record.id), record, { stage, field: "task_record" });
-  }
-  bindSession({ cwd, session, model, modelConfig, modelProfile }) {
-    const sessions = path.join(this.root, ".sessions");
-    try {
-      fs.mkdirSync(sessions, { mode: 0o700 });
-      save(path.join(sessions, "owner.json"), { schema: 1, uid: process.getuid() }, { stage: "selection", field: "session_record" }); syncDirectory(this.root);
-    } catch (error) { if (error.code !== "EEXIST") throw new TaskError(errorCode(error, "TASK_WRITE_FAILED"), { stage: "selection", field: "session_record", reason: error instanceof TaskError ? error.reason : error?.code }); }
-    directory(sessions);
-    if (JSON.stringify(readJson(path.join(sessions, "owner.json"), undefined, { stage: "selection", field: "session_record" })) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
-      throw new TaskError("INVALID_SESSION_OWNER", { stage: "selection", field: "session_record" });
-    const binding = path.join(sessions, `${hash(session)}.json`);
-    const sessionKey = `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
-    if (fs.existsSync(binding)) {
-      const prior = readJson(binding, undefined, { stage: "selection", field: "session_record" });
-      if (prior.version !== 2) throw new TaskError("UNSUPPORTED_SESSION_RECORD", { stage: "selection", field: "session_record" });
-      if (prior.cwd !== cwd || prior.name !== session || prior.sessionKey !== sessionKey) throw new TaskError("SESSION_CWD_CONFLICT", { stage: "selection", field: "session" });
-      if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig || prior.modelProfile !== modelProfile)
-        throw new TaskError("SESSION_MODEL_CONFLICT", { stage: "selection", field: "selection" });
-    } else save(binding, { version: 2, name: session, cwd, sessionKey, model, modelConfig, modelProfile }, { stage: "selection", field: "session_record" });
-    return sessionKey;
   }
   submit({ key, prompt, cwd, callback, session, permissionMode, permissionPolicy, model, modelConfig, modelProfile,
     launch, continuationHandle, noProgressMs = this.noProgressMs }) {
@@ -280,7 +271,7 @@ export class TaskRunner {
     if (/tcb_[A-Za-z0-9_-]{43}/.test(prompt) || prompt.includes(selected.callback_id) ||
         prompt.includes(callback.callback_url) || prompt.includes(selected.callback_url)) throw new Error("CALLBACK_IN_PROMPT");
     const id = `task_${hash(key)}`;
-    const sessionKey = session === undefined ? id : this.bindSession({ cwd, session, model, modelConfig, modelProfile });
+    const sessionKey = session === undefined ? id : `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
     const fingerprint = hash(JSON.stringify({ prompt, cwd, callback: selected, sessionKey, permissions, launch, continuationHandle,
       model, modelConfig, modelProfile, noProgressMs }));
     const dirname = path.join(this.root, id);
@@ -292,7 +283,7 @@ export class TaskRunner {
       record = this.load(id);
       if (record.fingerprint !== fingerprint) throw new Error("SUBMIT_CONFLICT");
     } else {
-      record = { version: 2, id, fingerprint, requestId: randomUUID(), sessionKey, sessionName: session,
+      record = { version: 3, id, fingerprint, requestId: randomUUID(), sessionKey, sessionName: session,
         permissions, launch, continuationHandle, model, modelConfig, modelProfile, cwd, prompt, callback: selected,
         state: "queued", createdAt: this.now(), noProgressMs,
         progress: { at: this.now(), tick: this.tick(), clock: this.clock } };
@@ -301,24 +292,34 @@ export class TaskRunner {
     return { version: 1, task_id: id, request_id: record.requestId, accepted: true };
   }
   status(id) {
-    const record = this.load(id);
+    let record;
+    try { record = this.load(id); }
+    catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "TASK_NOT_FOUND") throw error;
+      const claim = loadLaunch(this.root, id);
+      const uncertain = ["submit", "accepted"].includes(claim.stage);
+      return { version: 1, ...launchProjection(claim, this.root), request_id: null, session_id: null, started_at: null, state: "preparation",
+        ...receiptFacts(null, { taskRecorded: uncertain ? null : false, claimRecorded: true, dispatchUncertain: uncertain, preparationUncertain: true }),
+        preparation: preparationSummary(claim) };
+    }
+    const claim = loadLaunch(this.root, id, true);
+    if (claim) verifyLaunchTask(claim, record);
+    else if (record.launch) throw new TaskError("LAUNCH_METADATA_REQUIRED", { stage: "read", field: "launch_record" });
     return { ...this.resultRecord(record, { output: false }),
-      permission_mode: choice(record.permissions.mode, ["deny-all", "approve-reads", "approve-all"]),
-      model: taskModel(record.model).id, variant: identifier(record.model.variant),
+      ...(claim ? launchProjection(claim, this.root) : {}), ...receiptFacts(record, { claimRecorded: Boolean(claim) }),
+      permission_mode: record.permissions.mode,
+      model: record.model.id, variant: record.model.variant ?? null,
       cancel_requested: readJson(this.filename(id, "cancel.json"), SNAPSHOT_BYTES, { optional: true }) !== undefined,
     };
   }
   result(id) { return this.resultRecord(this.load(id)); }
   resultRecord(record, { output = true } = {}) {
-    let callback;
-    try { callback = validateCallback(record.callback); } catch { throw new Error("INVALID_TASK_RESULT"); }
-    const payload = sealedBody(record, callback), result = record.result;
-    const source = result ? choice(result.source, ["turn.result", "watchSession.turn_result", "queued_cancellation", "execution_setup_failure"]) : null;
-    const outputSource = result ? choice(result.outputSource, ["assistant_output", "program_generated"]) : null;
-    return { version: 1, task_id: identifier(record.id), request_id: identifier(record.requestId), session_name: identifier(record.sessionName),
-      session_key: identifier(record.sessionKey), session_id: identifier(record.handle?.backendSessionId), acpx_record_id: identifier(record.handle?.acpxRecordId),
-      state: choice(record.state, ["queued", "preparing", "dispatching", "running", "ambiguous", "completed"]),
-      result_status: result ? choice(result.status, ["success", "error", "cancelled"]) : null,
+    const callback = record.callback, payload = record.body === undefined ? null : JSON.parse(record.body), result = record.result;
+    const source = result?.source ?? null, outputSource = result?.outputSource ?? null;
+    return { version: 1, task_id: record.id, request_id: record.requestId, session_name: record.sessionName ?? null,
+      session_key: record.sessionKey, session_id: record.handle?.backendSessionId ?? null, acpx_record_id: record.handle?.acpxRecordId ?? null,
+      state: record.state,
+      result_status: result?.status ?? null,
       callback_status: payload?.status ?? null, callback_state: payload ? record.callbackState : null,
       callback_kind: payload ? choice(record.notificationKind, ["no_progress", "request_result"]) : null,
       execution_error: safeCode(record.executionError),
@@ -336,15 +337,10 @@ export class TaskRunner {
       evidence: { lifecycle: "program_observed", terminal_source: source, output_source: outputSource,
         callback_receipt: resultReceipt(record.receipt, callback) } };
   }
-  pending(unsupported = []) {
-    return fs.readdirSync(this.root).filter((id) => taskPattern.test(id)).filter((id) => {
-      try {
-        const record = this.load(id);
-        return !record.result || record.callbackState === "outbox";
-      } catch (error) {
-        if (error.message !== "UNSUPPORTED_TASK_RECORD") throw error;
-        unsupported.push({ task_id: id, code: error.message }); return false;
-      }
+  pending() {
+    return fs.readdirSync(this.root).filter((id) => taskPattern.test(id)).sort().filter((id) => {
+      const record = this.load(id);
+      return !record.result || record.callbackState === "outbox";
     });
   }
   sealCallback(record, status, output, kind) {
@@ -389,8 +385,6 @@ export class TaskRunner {
     return record.noProgressMs - elapsed;
   }
   finish(record, result, source = "turn.result") {
-    // 共享连接 failed 不等于 canonical 失败；只用原 journal 的失败结果。
-    if (result.status === "failed" && (source === "turn.result" || result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN")) return false;
     const status = result.status === "completed" ? "success" : result.status === "cancelled" ? "cancelled" : "error";
     delete record.observationError; delete record.observationDetail;
     if (status === "error") {
@@ -401,7 +395,6 @@ export class TaskRunner {
       delete record.executionError; delete record.executionDetail;
       this.seal(record, status, record.output ?? "", source);
     }
-    return true;
   }
   async deliver(record) {
     if (record.callbackState !== "outbox" || record.nextAttemptAt > this.now()) return;
@@ -498,7 +491,7 @@ export class TaskRunner {
       if (turn) {
         const stream = {};
         const active = () => !signal.aborted && !record.result;
-        Promise.resolve(turn.promptStarted).then(() => {
+        turn.promptStarted.then(() => {
           if (!active()) return;
           if (!record.body) record.state = "running";
           record.startedAt ??= this.now(); this.progress(record); this.write(record);
@@ -514,7 +507,7 @@ export class TaskRunner {
         })();
         consume.catch(onError);
         const journal = this.journal(record, signal);
-        Promise.resolve(turn.result).then(async (result) => {
+        turn.result.then(async (result) => {
           if (!active()) return;
           if (result.status === "failed") { this.observationFailure(record, result.error); return; }
           if (!record.body && this.remaining(record) <= 0) this.notify(record);
@@ -531,8 +524,8 @@ export class TaskRunner {
     if (record.handle) validateHandle(record, record.handle);
     await this.journal(record, signal);
   }
-  async control(id, { observeOnly = false, signal, deliver = true } = {}) {
-    const record = this.load(id), controller = new AbortController();
+  async control(record, { observeOnly = false, signal, deliver = true } = {}) {
+    const id = record.id, controller = new AbortController();
     const stop = () => controller.abort();
     signal?.addEventListener("abort", stop, { once: true });
     if (signal?.aborted) stop();
@@ -547,7 +540,7 @@ export class TaskRunner {
           delivery = this.deliver(record).catch((error) => { failure = error; }).finally(() => { delivery = undefined; });
         }
         if (!record.result && record.dispatchedAt && !cancellation && fs.existsSync(this.filename(id, "cancel.json"))) {
-          cancellation = within(Promise.resolve(this.runtime.cancelRequest?.({ handle: record.handle, requestId: record.requestId })), this.ioMs)
+          cancellation = within(this.runtime.cancelRequest({ handle: record.handle, requestId: record.requestId }), this.ioMs)
             .catch(() => {}).finally(() => { cancellation = undefined; });
         }
         if (record.result && (!deliver || record.callbackState !== "outbox") && !delivery) return;
@@ -560,14 +553,14 @@ export class TaskRunner {
     }
   }
   // 内部测试/适配原语；公开 CLI 只由 launch 或显式 recover 启动 control。
-  async execute(id, options = {}) { return this.control(id, { ...options, deliver: false }); }
+  async execute(id, options = {}) { return this.control(this.load(id), { ...options, deliver: false }); }
   async cancel(id) {
     const record = this.load(id);
     if (record.result) throw new Error("TASK_TERMINAL");
     save(this.filename(id, "cancel.json"), { requested: true }, { stage: "cancel", field: "cancel_record" });
     if (record.handle && record.dispatchedAt) {
       validateHandle(record, record.handle);
-      try { await within(Promise.resolve(this.runtime.cancelRequest?.({ handle: record.handle, requestId: record.requestId })), this.ioMs); }
+      try { await within(this.runtime.cancelRequest({ handle: record.handle, requestId: record.requestId }), this.ioMs); }
       catch (error) { throw new TaskError(error instanceof TaskError && error.code !== "OBSERVATION_TIMEOUT" ? error.code : "CANCEL_UNCONFIRMED",
         { ...(error instanceof TaskError ? error : {}), stage: "cancel", field: error instanceof TaskError ? error.field : "request",
           reason: error instanceof TaskError && error.code === "OBSERVATION_TIMEOUT" ? "timeout" : error instanceof TaskError ? error.reason : error?.code, task_id: id, request_id: record.requestId }); }

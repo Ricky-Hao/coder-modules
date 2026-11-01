@@ -28,12 +28,14 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
   [Provider 说明](opencode/PROVIDERS.md)。
   launcher 默认继承启动进程环境；模块目录覆盖和回调保护见
   [Launch environment](opencode/README.md#launch-environment)。
-  有界任务列表、状态/结果和离线安装自检见 [只读入口](opencode/TASKS.md#只读查询与离线安装自检)。
+  有界任务列表、状态/结果和离线安装自检见 [只读入口](opencode/TASKS.md#回执错误与查询)。
   `doctor` 默认完整校验；`doctor --quick` 只做静态日常核对，明确跳过二进制内容/哈希。
   Agent 可通过现有 Workspace Bash 调用 [`launch`](opencode/TASKS.md#高层-launch-入口)，
    用私密 JSON 一次准备 Git worktree 并尝试派发；可选 origin 分支 `base`，默认 main。
    续接保留原 SHA、session 和选择。
-   任务只公开 launch 准备流程；旧 submit/resolve 已删除，旧格式记录安全拒绝且保留原数据。
+   新 launch 默认 approve-all；continue 沿保存权限。受理不等于 started。
+   task 仅用 `runtime/tasks-v3`；旧目录保留且不扫描。旧 submit/resolve 已删除。
+   launch/status 直接提供安全回执、查询命令和 claim-only 准备摘要。
 
 e.g.
 
