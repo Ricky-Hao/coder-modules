@@ -119,7 +119,7 @@ def launch_selection(settings, request):
     source = filtered_environment(os.environ)
     saved = request.get('saved')
     if saved:
-        regular(Path(saved['modelConfig']))
+        profiles.private_file(Path(saved['modelConfig']), Path(settings['install_root']))
         source['OPENCODE_MODULE_CONFIG'] = saved['modelConfig']
     config_path = source.get('OPENCODE_MODULE_CONFIG')
     failed = False
@@ -204,7 +204,7 @@ def main():
             raise ValueError('invalid task launch')
         task = {'modelConfig': arguments[1], 'model': profiles.selection(arguments[2], arguments[3] or None),
                 'modelProfile': arguments[4]}
-        regular(Path(arguments[1]))
+        profiles.private_file(Path(arguments[1]), root)
         arguments = ['acp']
     if tool not in ('opencode', 'acpx', 'opencode-task'):
         raise ValueError('unknown command')

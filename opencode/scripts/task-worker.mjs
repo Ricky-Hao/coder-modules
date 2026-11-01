@@ -177,7 +177,8 @@ export class TaskWorker {
         if (task.dispatchedAt && this.runtime && !journal && (!task.result || !task.result.outputComplete)) {
           journal = this.journal(controller.signal).catch((error) => { this.failure = error; });
         }
-        if (task.result && !this.box && (task.result.outputComplete || !journal || this.store.now() >= this.terminalDeadline)) {
+        const drained = task.result && (task.result.outputComplete || !journal || this.store.now() >= this.terminalDeadline);
+        if (drained && !this.box) {
           let text = task.output?.text ?? "";
           if (task.error) text = `Original request failed: ${task.error.code}. Side effects may have occurred. ${text}`;
           if (!task.result.outputComplete) text = "Output incomplete: the journal did not provide the full output. Do not execute again.\n" + text;
@@ -190,7 +191,7 @@ export class TaskWorker {
             .catch(() => {}).finally(() => { cancellation = undefined; });
         }
         if (this.dirty) this.write();
-        if (task.result && this.box && (!deliver || this.box.state !== "pending") && !delivery) return;
+        if (drained && this.box && (!deliver || this.box.state !== "pending") && !delivery) return;
         await delay(this.pollMs);
       }
     } finally {

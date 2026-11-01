@@ -19,9 +19,9 @@ def directory(path, create=False):
     return path
 
 
-def regular(path):
+def regular(path, *, single_link=True):
     info = Path(path).lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or single_link and info.st_nlink != 1:
         raise ValueError('unsafe managed file')
 
 

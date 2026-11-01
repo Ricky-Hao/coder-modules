@@ -187,7 +187,9 @@ Context7 默认 `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`；其余默�
 拒绝控制/非 ASCII、JSON 插值字符、URL 用户信息/query/fragment/坏端口。
 Provider 须用 HTTPS，loopback 可 HTTP；MCP 支持 HTTP(S)，需要传输保密时使用 HTTPS。
 错误只列变量名。0600 内容寻址配置位于 `runtime/module-profiles`，在自动发现目录外；
-文件排他原子发布并核对原字节，无目录锁或重复 owner；已有不安全文件、链接和变化内容拒绝使用。
+文件排他原子发布并核对原字节，无目录锁或重复 owner；已有不安全文件、符号链接和变化内容拒绝使用。
+模块自有内容地址与原字节一致的 profile 允许发布临时名留下的多链接；类型、UID、0600 仍校验。
+运行与续接共用该校验，私密输入和其他安装文件仍须单链接。
 
 非空 `OPENCODE_MODULE_CONFIG` 优先于内置 profile。`none` 无外部配置时保留显式
 ACP readiness 模型/环境契约；任务 launch 仍须有完整模型配置。help/version 不要求凭据。

@@ -17,14 +17,17 @@ sys.path.insert(0, str(fixtures.SCRIPTS))
 import profiles
 
 
-def concurrent_profile_launch(root, config, creator, created, resume, results):
-    """Pause A before content-addressed publication; B must finish without A."""
+def concurrent_profile_launch(root, config, creator, created, resume, results, after_link=False):
+    """Pause A on either side of publication; B must finish without A."""
     link = os.link
     def paused_link(source, destination):
+        if after_link:
+            link(source, destination)
         created.set()
         if not resume.wait(10):
             raise TimeoutError('creator was not resumed')
-        return link(source, destination)
+        if not after_link:
+            link(source, destination)
     try:
         with patch.object(profiles.os, 'link', paused_link if creator else link):
             path = profiles.materialize(root, 'test-workspace', config)
@@ -330,7 +333,7 @@ class ProfileTests(unittest.TestCase):
                     elif kind == 'foreign': os.chown(path, 12345, 12345)
                     elif kind == 'mode': path.chmod(0o644)
                     else: path.write_text('unmanaged user config')
-                self.assertNotEqual(self.call().returncode, 0)
+                self.assertEqual(self.call().returncode, 0 if kind == 'hardlink' else 1)
                 if kind == 'changed': self.assertEqual(path.read_text(), 'unmanaged user config')
         path.unlink()
         cfg = profiles.configuration(self.env, fixtures.SCRIPTS)
@@ -338,6 +341,57 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaises(OSError): profiles.materialize(self.root, 'test-workspace', cfg)
         self.assertFalse(path.exists())
         self.assertFalse(list(store.glob('.profile-*')))
+
+    def test_linked_publication_survives_publisher_exit_in_runtime_and_continuation(self):
+        self.fixture.install()
+        config = profiles.configuration(self.env, fixtures.SCRIPTS)
+        context = multiprocessing.get_context('fork')
+        created, resume, results = context.Event(), context.Event(), context.Queue()
+        publisher = context.Process(target=concurrent_profile_launch, args=(
+            self.root, config, True, created, resume, results, True))
+        def select(request):
+            return subprocess.run([str(self.root / 'bin/opencode-task'), '_selection'], input=json.dumps(request),
+                                  env=self.env, cwd=self.base, capture_output=True, text=True)
+        def run_profile(path):
+            return self.call(args=['--module-task', str(path), 'codex/gpt-6.1-sol', 'max', 'env', 'acp'])
+        try:
+            publisher.start()
+            self.assertTrue(created.wait(10), 'publisher did not reach link/unlink window')
+            path = next((self.root / 'runtime/module-profiles').glob('*.json'))
+            self.assertEqual(path.stat().st_nlink, 2)
+            self.assertEqual(self.call().returncode, 0)
+            selected = select({})
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            saved = json.loads(selected.stdout)
+            self.assertEqual(saved['modelConfig'], str(path))
+            self.assertEqual(select({'saved': saved}).returncode, 0)
+            launched = run_profile(path)
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertEqual(json.loads(launched.stdout)['env']['OPENCODE_CONFIG'], str(path))
+            publisher.terminate(); publisher.join(10)
+            self.assertFalse(publisher.is_alive())
+            self.assertNotEqual(publisher.exitcode, 0)
+            self.assertEqual(path.stat().st_nlink, 2)
+            self.assertEqual(path.read_bytes(), profiles.encoded(config))
+            self.assertEqual(self.call().returncode, 0)
+            self.assertEqual(select({'saved': saved}).returncode, 0)
+            self.assertEqual(run_profile(path).returncode, 0)
+            # Other files retain nlink=1, even with identical valid profile bytes.
+            external = self.base / 'external-linked.json'
+            external.write_bytes(path.read_bytes()); external.chmod(0o600)
+            os.link(external, self.base / 'external-link')
+            self.assertNotEqual(select({'saved': {**saved, 'modelConfig': str(external)}}).returncode, 0)
+            self.assertNotEqual(run_profile(external).returncode, 0)
+            # A syntactically valid, same-model config still fails its content address.
+            path.write_bytes(profiles.encoded({**config, 'description': 'changed fixture'}))
+            self.assertNotEqual(self.call().returncode, 0)
+            self.assertNotEqual(select({'saved': saved}).returncode, 0)
+            self.assertNotEqual(run_profile(path).returncode, 0)
+        finally:
+            if publisher.pid is not None:
+                if publisher.is_alive(): publisher.terminate()
+                publisher.join(10)
+            results.close()
 
     def test_acpx_to_opencode_readiness_env_and_approve_defaults(self):
         node_program = '''#!/usr/bin/env python3

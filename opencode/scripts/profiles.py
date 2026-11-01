@@ -135,10 +135,14 @@ def task_configuration(config, model=None, variant=None):
     return selected
 
 
-def private_file(path):
-    regular(path)
+def private_file(path, root):
+    # Exclusive link publication may leave its temporary name, even after a crash.
+    managed = path.parent == root / 'runtime/module-profiles' and re.fullmatch(r'[a-f0-9]{64}\.json', path.name)
+    regular(path, single_link=not managed)
     if stat.S_IMODE(path.lstat().st_mode) != 0o600:
         raise ValueError('managed profile file must be mode 0600')
+    if managed and hashlib.sha256(path.read_bytes()).hexdigest() != path.stem:
+        raise ValueError('changed profile content address')
 
 
 def create_json(path, data):
@@ -170,7 +174,7 @@ def materialize(root, workspace_id, config):
             create_json(path, data)
         except FileExistsError:
             pass  # 同内容地址的另一发布者胜出；下面核对原字节。
-    private_file(path)
+    private_file(path, root)
     if path.read_bytes() != data:
         raise ValueError('unmanaged or changed profile file')
     sync_directory(store)

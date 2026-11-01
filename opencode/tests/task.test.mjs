@@ -143,6 +143,41 @@ test("held HTTP delivery does not block late terminal or journal output", async 
   await until(() => f.store.load(f.task.id).result); assert.equal(f.result().output, "late");
   post.resolve(accepted()); await running; assert.equal(f.result().callback_kind, "no_progress");
 });
+for (const state of ["delivered", "rejected"]) for (const readable of [true, false])
+test(`late Promise drains journal after unknown ${state}, journal ${readable ? "readable" : "unavailable"}`, async (t) => {
+  let posts = 0, ended = false;
+  const gate = deferred(), f = fixture(t, { fetcher: async () => {
+    posts++; return state === "delivered" ? accepted() : new Response("", { status: 403 });
+  } });
+  f.runtime.watchSession = async function* () {
+    yield { ...text("early"), requestId: f.task.requestId, cursor: "first" };
+    await gate.promise;
+    if (!readable) throw Object.assign(new Error("PRIVATE"), { code: "WATCH_CURSOR_EXPIRED" });
+    yield { ...text(" tail"), requestId: f.task.requestId, cursor: "tail" };
+    yield { type: "turn_result", result: { status: "completed" }, requestId: f.task.requestId, cursor: "last" };
+  };
+  const running = f.run().finally(() => { ended = true; });
+  t.after(async () => { gate.resolve(); f.stop.abort(); await running; });
+  await until(() => f.store.load(f.task.id).output?.text === "early");
+  f.advance(900000);
+  await until(() => f.store.outbox(f.task)?.state === state);
+  const original = fs.readFileSync(f.store.filename(f.task.id, "outbox.json"));
+  f.runtime.result.resolve({ status: "completed" });
+  await until(() => f.store.load(f.task.id).result?.source === "turn.result");
+  assert.equal(f.result().result_status, "success"); assert.equal(f.result().output_incomplete, true);
+  await delay(20); assert.equal(ended, false, "worker must keep the journal open during its existing drain deadline");
+  gate.resolve();
+  if (!readable) {
+    await until(() => f.task.observationError?.reason === "WATCH_CURSOR_EXPIRED");
+    f.advance(f.worker.ioMs - 1); await delay(10); assert.equal(ended, false);
+    f.advance(1);
+  }
+  await until(() => ended); await running;
+  assert.equal(f.result().output, readable ? "early tail" : "early");
+  assert.equal(f.result().output_incomplete, !readable);
+  assert.equal(f.task.noProgressMs, 900000); assert.equal(f.runtime.starts, 1); assert.equal(posts, 1);
+  assert.deepEqual(fs.readFileSync(f.store.filename(f.task.id, "outbox.json")), original);
+});
 for (const response of ["network", "bad-receipt", 408, 425, 429, 503, 302, 403]) test(`durable exact outbox handles ${response}`, async (t) => {
   const seen = [], f = fixture(t, { fetcher: async (_, options) => {
     seen.push(options.body); assert.equal(options.redirect, "manual");

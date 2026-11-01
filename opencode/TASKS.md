@@ -144,7 +144,8 @@ journal 按原 requestId/cursor 聚合唯一输出。startTurn 的 promptStarted
 立即 closeStream 清空关闭 acpx 本地旁路队列，不停止 IPC/result。通信 failed、
 WATCH_OUTCOME_UNKNOWN 不是 canonical；journal 的可信 turn_result 与 API 已知终态保留。
 cursor 过期/轮转报告观察错误，不清 cursor 猜测或重派。result Promise 先到时短暂排空 journal；
-取不全明确 output_incomplete。没有保留全量旁路 permission_escalation 的要求。
+即使 unknown 通知已投递或被拒绝，也等输出完整或原有 3 秒排空期限再退出，不改原通知。
+取不全明确 output_incomplete，排空不延长执行期限。没有保留全量旁路 permission_escalation 的要求。
 
 worker 不监护自身。进程/Workspace 停止或磁盘不可写时无及时通知保证；无自动 recover、
 daemon、租约、接管或健康探针。已 finished 且有 outbox 的 recover 只补投，不初始化 Provider。
