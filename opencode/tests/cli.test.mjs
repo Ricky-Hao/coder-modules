@@ -18,7 +18,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture");
     fs.mkdirSync(version, { recursive: true, mode: 0o700 });
-    for (const name of ["runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-read.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
+    for (const name of ["runtime.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     const copiedCli = path.join(version, "task-cli.mjs");
     fs.writeFileSync(copiedCli, recordFixtureSpawns(fs.readFileSync(copiedCli, "utf8"), path.join(base, "drivers.ndjson")));
@@ -201,3 +201,53 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       if (!primaryError) fs.rmSync(base, { recursive: true });
     }, (value) => t.diagnostic(JSON.stringify(value)));
   });
+
+test("CLI reports partial recovery ACK and setup failure without generic read hints or secret stderr", { timeout: 15000 }, async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-errors-")); fs.chmodSync(base, 0o700);
+  const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture"), tasks = path.join(root, "runtime/tasks");
+  for (const directory of [version, tasks]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const name of ["task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs"])
+    fs.copyFileSync(path.join(scripts, name), path.join(version, name));
+  const cliFile = path.join(version, "task-cli.mjs");
+  fs.writeFileSync(cliFile, recordFixtureSpawns(fs.readFileSync(cliFile, "utf8"), path.join(base, "drivers.ndjson")));
+  fs.writeFileSync(path.join(version, "settings.json"), JSON.stringify({ install_root: root }), { mode: 0o600 });
+  const runner = new TaskRunner({ root: tasks });
+  const ids = ["first", "second"].map((key) => runner.submit({ key, cwd: base, prompt: "PRIVATE-PROMPT", callback: {
+    callback_id: `tcb_${"x".repeat(43)}`, callback_url: "http://127.0.0.1:1/api/agents/task-callbacks" },
+    model: { id: "fixture/test" }, modelConfig: "/fixture/config", modelProfile: "external" }).task_id).sort();
+  fs.writeFileSync(path.join(version, "runtime.py"), `import os, sys
+if sys.argv[3] == ${JSON.stringify(ids[1])}:
+    print('PTC_TOOL_FAILED 502 EAGAIN PRIVATE-STDERR', file=sys.stderr)
+    sys.exit(1)
+os.write(3, b'ready\\n')
+`);
+  const call = (...args) => spawnSync(process.execPath, [cliFile, ...args], { cwd: base, env: { PATH: process.env.PATH }, encoding: "utf8", timeout: 10000 });
+  let primaryError;
+  try {
+    const recovering = call("recover"), value = JSON.parse(recovering.stderr);
+    assert.equal(recovering.status, 1); assert.equal(value.error.code, "CONTROL_ACK_UNKNOWN");
+    assert.equal(value.error.reason, "process_exit"); assert.equal(value.error.stage, "control"); assert.equal(value.error.field, "control_ack");
+    assert.equal(value.recovery_confirmed, 1); assert.equal(value.task_recorded, true); assert.equal(value.outcome_unknown, true);
+    assert.equal(value.error.task_id, ids[1]); assert.equal(recovering.stderr.includes("PRIVATE-"), false);
+    const record = runner.load(ids[1]); record.state = "running"; record.dispatchedAt = 1; runner.write(record);
+    fs.writeFileSync(path.join(version, "task-acp.mjs"), 'export function createTaskRuntime() { throw new Error("PRIVATE-SETUP provider auth policy denied"); }\n');
+    const cancelled = call("cancel", ids[1]), error = JSON.parse(cancelled.stderr);
+    assert.equal(cancelled.status, 1); assert.equal(error.error.code, "TASK_OPERATION_FAILED");
+    assert.equal(error.error.stage, "setup"); assert.equal(error.error.category, "unknown");
+    assert.equal(error.task_recorded, true); assert.equal(error.outcome_unknown, true);
+    assert.equal(cancelled.stderr.includes("PRIVATE-"), false); assert.equal(runner.result(ids[1]).result_status, null);
+    fs.writeFileSync(path.join(version, "runtime.py"), `import os
+with open(${JSON.stringify(runner.filename(ids[1]))}, 'w') as record:
+    record.write('{"PRIVATE-RECORD":')
+os.write(3, b'ready\\n')
+`);
+    const changed = call("recover"), read = JSON.parse(changed.stderr);
+    assert.equal(changed.status, 1); assert.equal(read.error.code, "INVALID_TASK_RESULT");
+    assert.equal(read.error.stage, "read"); assert.equal(read.error.field, "task_record");
+    assert.equal(read.error.task_id, ids[1]); assert.equal(read.error.request_id, undefined);
+    assert.equal(read.task_recorded, null); assert.equal(read.outcome_unknown, true); assert.equal(read.recovery_confirmed, 1);
+    assert.equal(changed.stderr.includes("PRIVATE-"), false);
+  } catch (error) { primaryError = error; t.diagnostic(`retained fixture: ${base}`); }
+  await finishFixture(primaryError, async () => { await stopFixtureProcesses(base, version); if (!primaryError) fs.rmSync(base, { recursive: true }); },
+    (value) => t.diagnostic(JSON.stringify(value)));
+});

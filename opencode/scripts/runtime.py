@@ -84,6 +84,25 @@ def acpx_arguments(arguments):
     return [*defaults, *arguments]
 
 
+class SelectionError(ValueError):
+    """固定的选择阶段定位，不保存原异常。"""
+    def __init__(self, field, reason):
+        assert field in ('model_config', 'provider') and reason in ('read_failed', 'snapshot_failed', 'invalid')
+        super().__init__('LAUNCH_SELECTION_INVALID')
+        self.field, self.reason = field, reason
+
+
+def selection_diagnostic(error):
+    if isinstance(error, profiles.ProfileError):
+        return {'code': 'LAUNCH_ENVIRONMENT_INVALID', 'stage': 'selection', 'field': 'environment',
+                'reason': error.reason, 'environment_names': error.names}
+    fields = {'INVALID_MODEL': 'model', 'INVALID_VARIANT': 'variant',
+              'TASK_MODEL_CONFIG_REQUIRED': 'model_config', 'TASK_TITLE_LOW_UNAVAILABLE': 'model_config'}
+    code = str(error) if isinstance(error, ValueError) and str(error) in fields else 'LAUNCH_SELECTION_INVALID'
+    return {'code': code, 'stage': 'selection', 'field': fields.get(code, 'selection') if not isinstance(error, SelectionError) else error.field,
+            'reason': error.reason if isinstance(error, SelectionError) else 'unknown'}
+
+
 def launch_selection(settings, request):
     """解析非秘密选择，复用 profile 校验与快照。"""
     source = filtered_environment(os.environ)
@@ -92,12 +111,18 @@ def launch_selection(settings, request):
         regular(Path(saved['modelConfig']))
         source['OPENCODE_MODULE_CONFIG'] = saved['modelConfig']
     config_path = source.get('OPENCODE_MODULE_CONFIG')
-    if config_path:
-        config = json.loads(Path(config_path).read_text())
-    elif settings.get('runtime_profile') == 'env':
-        config = json.loads((VERSION / 'profile-env.json').read_text())
-    else:
-        raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    failed = False
+    try:
+        if config_path:
+            config = json.loads(Path(config_path).read_text())
+        elif settings.get('runtime_profile') == 'env':
+            config = json.loads((VERSION / 'profile-env.json').read_text())
+        else:
+            raise ValueError('TASK_MODEL_CONFIG_REQUIRED')
+    except (OSError, json.JSONDecodeError):
+        failed = True
+    if failed:
+        raise SelectionError('model_config', 'read_failed')
     profile = saved['modelProfile'] if saved else 'external' if config_path else 'env'
     default = saved['model'] if saved else profiles.selection(config.get('model'))
     provider, model = default['id'].split('/', 1)
@@ -105,11 +130,19 @@ def launch_selection(settings, request):
     changed = target != default['id'] if saved else 'provider' in request or 'model' in request
     variant = request.get('variant', default.get('variant') if saved and not changed else None)
     if profile == 'env':
+        if target.split('/', 1)[0] not in profiles.PROVIDERS:
+            raise SelectionError('provider', 'invalid')
         current = profiles.configuration(source, VERSION, target.split('/', 1)[0])
         if not saved:
             config = current
     model = profiles.task_configuration(config, target if changed or saved else None, variant)
-    snapshot = profiles.materialize(Path(settings['install_root']), settings['workspace_id'], config)
+    failed = False
+    try:
+        snapshot = profiles.materialize(Path(settings['install_root']), settings['workspace_id'], config)
+    except (OSError, ValueError, KeyError, TypeError):
+        failed = True
+    if failed:
+        raise SelectionError('model_config', 'snapshot_failed')
     return {'model': model, 'modelConfig': str(snapshot), 'modelProfile': profile}
 
 
@@ -121,6 +154,7 @@ def main():
     if readonly:
         from diagnostics import ReadError, doctor, error_code, read_json, task_root
         try:
+            field = 'settings'
             settings = read_json(VERSION / 'settings.json')
             root = Path(settings['install_root'])
             if arguments in (['doctor'], ['doctor', '--quick']):
@@ -130,16 +164,20 @@ def main():
             if arguments[:1] == ['doctor']:
                 raise ReadError('INVALID_ARGUMENTS')
             if arguments[:1] in (['list'], ['status'], ['result']):
+                field = 'task_store'
                 task_root(root, settings)
             # 查询没有初始化、锁文件或 profile materialize；Node 只运行命令投影。
             binary = VERSION / 'node/bin/node'
+            field = 'installation'
             regular(binary)
             child = environment(os.environ, root, arguments=['--help'])
             os.execve(binary, [str(binary), str(VERSION / 'task-cli.mjs'), *arguments], child)
         except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
             code = error_code(error)
-            print(json.dumps({'error': {'code': code,
-                                       'hint': '核对安装及任务存储；查询不会创建目录、恢复或改写旧记录。'}}, ensure_ascii=False), file=sys.stderr)
+            print(json.dumps({'error': {'code': code, 'stage': 'read' if field == 'task_store' else 'runtime', 'field': field,
+                                       'category': 'storage', 'reason': 'unknown',
+                                       'action': 'inspect_record' if field == 'task_store' else 'check_installation',
+                                       'hint': '核对所列安装或存储项；查询不会创建目录、恢复或改写旧记录。缺失记录不授权重放。'}}, ensure_ascii=False), file=sys.stderr)
             return 1
     settings = json.loads((VERSION / 'settings.json').read_text())
     root = Path(settings['install_root'])
@@ -168,8 +206,8 @@ def main():
         try:
             print(json.dumps(launch_selection(settings, json.loads(sys.stdin.buffer.read(65537)))))
             return 0
-        except (OSError, ValueError, KeyError, TypeError):
-            print(json.dumps({'error': {'code': 'LAUNCH_SELECTION_INVALID'}}))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(json.dumps({'error': selection_diagnostic(error)}))
             return 1
     task_arguments = arguments
     if tool == 'opencode-task':
@@ -237,8 +275,17 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except profiles.ProfileError as error:
-        print(str(error) + '; supply valid values at launch (values hidden).', file=sys.stderr)
+        if sys.argv[1:2] == ['opencode-task']:
+            print(json.dumps({'error': selection_diagnostic(error)}), file=sys.stderr)
+        else:
+            print(str(error) + '; supply valid values at launch (values hidden).', file=sys.stderr)
         sys.exit(1)
     except (OSError, ValueError, KeyError, IndexError, TypeError):
-        print('OpenCode launcher refused: check private state and explicit runtime configuration (values hidden).', file=sys.stderr)
+        if sys.argv[1:2] == ['opencode-task']:
+            print(json.dumps({'error': {'code': 'TASK_OPERATION_FAILED', 'stage': 'runtime', 'field': 'installation',
+                                       'category': 'unknown', 'reason': 'unknown', 'action': 'check_installation',
+                                       'hint': '任务 launcher 拒绝运行，底层类别未知；核对私有安装和配置，保留原 task，不自动重发。'}}, ensure_ascii=False),
+                  file=sys.stdout if sys.argv[2:3] == ['_selection'] else sys.stderr)
+        else:
+            print('OpenCode launcher refused: check private state and explicit runtime configuration (values hidden).', file=sys.stderr)
         sys.exit(1)

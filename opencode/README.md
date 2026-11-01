@@ -13,6 +13,8 @@ tags: [helper, ide, ai]
 `opencode-task`。任务通过 `launch` 从 origin 的 `base` 分支（默认 main）准备 Git worktree，
 自动建立 session 并尝试派发，支持可信续接、持久回调和原请求恢复。
 API、权限和未知结果边界见 [TASKS.md](TASKS.md)。
+错误的阶段、字段、unknown 和原请求处理建议见 [错误分类与定位](TASKS.md#错误分类与定位)。
+错误诊断不证明未派发，也不触发换模型、放权或自动重派。
 无需新增 MCP tool；Agent 沿已有 callback 注册、私有文件写入和 Workspace Bash 调用。
 
 ```hcl
@@ -112,9 +114,9 @@ python3 -B opencode/build_bundle.py --check
 不能代替真实 `env bash -c` 参数边界检查。源码/settings 增长后须重新运行真实 Terraform render，
 同时验证首次/缓存启动和数据保留，确认不自动恢复任务。历史 E2BIG 及旧体积记录见 [UPGRADE.md](UPGRADE.md)。
 
-当前候选原文 payload 为 164946 字节，标准 XZ 为 40132、base64 为 53512 字节。
-实际 Terraform HOME/固定专用根/含引号路径分别为 54705/54733/54749 字节；
-本轮全部配置最大 **54817/65536，余量 10719 字节**。较长 settings 仍可被 plan 拒绝。
+当前候选原文 payload 为 199731 字节，标准 XZ 为 47368、base64 为 63160 字节。
+实际 Terraform HOME/固定专用根/含引号路径分别为 64353/64381/64397 字节；
+本轮全部配置最大 **64529/65536，余量 1007 字节**。较长 settings 仍可被 plan 拒绝。
 
 ## 固定工具与输入
 

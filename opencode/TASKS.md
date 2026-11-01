@@ -112,7 +112,67 @@ request 或补投原 body。原 queued 也不重新派发，而是如实封存�
 `base` 返回 origin 分支名称，`base_sha` 返回本轮最初 fetch 的完整提交 SHA；续接返回原值。
 accepted=true 只证明持久意图和控制进程接管确认，或原任务已有结果且无待投递；不证明模型收到。
 ACK 等待最多 10 秒；丢失不能证明没有派发，不自动杀控制进程、换 key 或重发。
-失败退出 1，安全 JSON 包含 error.code/hint 和 outcome_unknown；保留原 key/输入/注册和现场。
+失败退出 1，安全 JSON 包含分类、定位和处理建议，见下节；保留原 key/输入/注册和现场。
+
+## 错误分类与定位
+
+`error` 只输出安全字段：
+
+- `code`：稳定错误码。已有准确码保留，不将所有失败归为输入或读取错误。
+- `stage`：本次失败发生的阶段。它与 launch 顶层 `stage` 的准备进度分开。
+- `field`：允许列表内的字段或对象类别。未知 JSON 字段只报 `fields`，不回显其名称。
+- `category`、`reason`：可证明的类别和固定原因。不能安全分辨时为 `unknown`。
+- `action`、`hint`：下一步建议，不增加权限，也不触发自动控制、换模型、放权或重派。
+- 可选 `task_id`、`request_id`、`environment_names`、`http_status`：只保留安全句柄、模块变量名和标准 HTTP 状态。
+
+不输出 prompt、注册/bearer、callback URL、编码串、完整环境、原私密 stderr 或任意底层异常消息。
+任务层诊断不保存原 `cause` 或 `stack`；安全异常的 stack 也只含固定错误码。
+
+| 错误码 | 定位与动作 |
+| --- | --- |
+| `INVALID_LAUNCH_JSON` | `input/input_file`：修正输入文件 JSON，不当作坏 task 记录。 |
+| `LAUNCH_INPUT_UNREADABLE` | `input/input_file`：核对私有文件和路径；不当作 task 不存在。安全属性和体积错误仍保留原码。 |
+| `INVALID_LAUNCH_INPUT` | `validate`：核对 `schema_version`、必填字段、名称或字段组合。 |
+| `INVALID_CALLBACK`、`CALLBACK_IN_PROMPT` | 指出 callback 子字段或 prompt；修正原私有输入，不输出或重新复制注册。 |
+| `INVALID_PERMISSIONS` | 指出模式或 policy 子字段；格式修正不等于授权放权。 |
+| `INVALID_NO_PROGRESS_TIMEOUT` | `no_progress_timeout_seconds`：1～86400 的整数，默认 900；不按工具或 retry 延长。 |
+| `LAUNCH_ENVIRONMENT_INVALID` | `selection/environment`：`missing`/`invalid` 加变量名；通过已有 env 机制处理，不输出值或回退 Provider。 |
+| `INVALID_MODEL`、`INVALID_VARIANT`、`TASK_MODEL_CONFIG_REQUIRED`、`TASK_TITLE_LOW_UNAVAILABLE` | 保留选择/配置的准确码，指出 model、variant 或 model_config。 |
+| `LAUNCH_SELECTION_INVALID` | 选择、配置读取或快照失败；字段和固定原因可定位，但根因不能证明时仍为 unknown。 |
+| `GIT_FETCH_FAILED`、`GIT_PREPARE_FAILED`、`GIT_PREPARATION_INTERRUPTED` | 指出 fetch/base、branch 或 worktree 阶段。保留 claim 和 Git 现场，人工核对，不自动续完或用缓存替代。 |
+| `TASK_WRITE_FAILED` | 写入、替换或 fsync 失败。记录和副作用可能未知；可读文件不能证明失败 fsync 已完成。先查原 task，不启动另一个请求。 |
+| `CONTROL_START_FAILED` | 本层明确未能启动控制进程；task 意图仍可能已经保存，先查原关联。 |
+| `CONTROL_ACK_UNKNOWN` | ACK 超时、进程退出或 ACK 无效。不能证明未派发；查原 task，必要时仅显式 recover。 |
+| `MODEL_OR_SESSION_SETUP_FAILED` | prompt 尚未派发，初始化根因未知。准确的 session 身份、model/effort 和 acpx pin 错误保留原码。 |
+| `REQUEST_FAILED` | 原 journal 的 canonical 失败；根因未知，副作用可能已发生。核对原结果，不因泛化失败换模型、放权或重发。 |
+| `REQUEST_AUTH_REQUIRED`、`REQUEST_PERMISSION_DENIED` | ACP 有明确结构化认证或权限证据；尊重拒绝，由负责人处理授权，不自动换模型、放权或重发。 |
+| `REQUEST_OUTCOME_UNKNOWN`、`TURN_TRANSPORT_INTERRUPTED` | 非 canonical 观察失败或明确通信中断。只观察原 request，不将其封存为业务失败或重放授权。 |
+| `NO_PROGRESS` | 原请求静默达到本轮期限。已尝试派发时封存结果未知通知，再继续被动观察；没有额外期限。 |
+| `CANCEL_UNCONFIRMED`、`UNSAFE_OWNER_SOCKET` | 原 request 取消或 socket 身份未确认。取消意图/RPC 不等于 canonical cancelled；不扩大为 session-wide cancel。 |
+| `INVALID_RECEIPT`、`CALLBACK_RETRYABLE_STATUS`、`DELIVERY_UNCONFIRMED` | 分别表示无有效 receipt、可重试 HTTP 状态、handoff 未知。沿原 exact body 和期限重试，不重派业务。 |
+| `CALLBACK_REJECTED`、`REDIRECT_REFUSED` | 明确拒绝或重定向拒绝；保留原 outbox，由负责人处理，不向新地址发送 bearer。 |
+| 原读取/安全/不支持记录码、`UNKNOWN_RECORDED_CODE` | 核对所列记录，保留原字节；缺记录、坏记录或未知旧码不授权重放。 |
+| `TASK_OPERATION_FAILED` | 本层只能确认操作失败，不能安全分辨根因；沿 stage/field 核对原任务。 |
+
+launch 错误的 `task_recorded` 为三态：`true` 表示已核对原 task 关联；`false` 表示本次在 submit 前失败；
+`null` 表示原记录或持久性不能确认。`false` 不判断更早的同 key 调用。`outcome_unknown=true` 要求保留并核对
+原请求或准备现场；`accepted=false`、ACK 丢失或文件缺失均不证明未派发。submit 的写入失败不启动控制进程；
+若原 task 已可读，返回原 request_id，后续只能按既有显式恢复规则观察。普通 submit 响应丢失仍复用原请求。
+已领取 claim 时，即使修正环境或选择，也不自动续完准备。若先前调用结果未知，先观察原请求，再处理新输入。
+
+status/result/list items 同时显示 `execution_error`/`execution_diagnostic`、
+`observation_error`/`observation_diagnostic` 和 `delivery_error`/`delivery_diagnostic`。
+执行终态、非 canonical 观察失败、回调 handoff 分开。晚到 canonical 结果清除观察错误，但不改已封存 callback body。
+list 的逐项 `errors` 使用相同定位字段，coverage 和有界游标规则不变。批量 recover 失败时，
+`recovery_confirmed` 只数已收到 ACK 的控制请求；更早的控制可能已接管，不能将批量失败理解为全部未启动。
+后续项读取失败只定位当前 task；未确认 request_id 时不返回该字段，`task_recorded=null`。
+
+pinned acpx 的 journal 会丢失部分原 ACP/Provider 细节。任务层只识别固定认证/权限字段，
+不解析异常文字、assistant 自然语言拒绝或 `retryable` 来猜 Provider policy/auth。
+canonical completed 也不证明业务目标完成，仍须按授权读取结果。callback 的 401/403 不是 Provider 认证证据。
+CodeAPI runner 的 fork/thread EAGAIN、执行 502 或 LibreChat 的 `PTC_TOOL_FAILED` 位于本层之外。
+没有本层结构化错误和原 task/request 证据时，不映射成同一错误；由宿主负责人保留原 Workspace 执行证据。
+本改造不修 PTC 宿主、替换 installed runtime 或承诺宿主恢复。
 
 ## 当前持久格式边界
 
@@ -120,6 +180,8 @@ ACK 等待最多 10 秒；丢失不能证明没有派发，不自动杀控制进
 createdAt、noProgressMs 和进展起点；结果单独存入 result，callback body/state 单独保存。
 已有 v2 launch 未存 base 时，沿其原约定按 main 返回及续接，保留已存 base_sha，不回填字段或迁移数据。
 旧 version=1、旧 callback/ACK/unknown 和所有 runtime/session/cache/private 数据不迁移、不改字节。
+当前任务在既有状态写入时可保存允许列表内的可选诊断；旧 v2 无诊断仍受支持，查询只作安全投影，不回填。
+task/launch 仍为 version 2，公开响应与 callback wire version 均不变。
 不支持记录报 UNSUPPORTED_TASK_RECORD（launch 元数据为 UNSUPPORTED_LAUNCH_RECORD）。
 定向操作退出 1；list 列 errors/不完整 coverage；无参数 recover 明列 unsupported 并继续支持项。
 坏记录、unsafe 属性和读错误失败关闭，不静默当作缺失，也不授权重放。

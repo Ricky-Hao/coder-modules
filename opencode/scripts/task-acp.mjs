@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { createSharedAcpRuntime, createAgentRegistry } from "acpx/runtime";
 import { l as readQueueOwnerRecord } from "acpx/dist/ipc-BbYFsKOj.js";
 import { taskPermissions, taskModel, privateFile } from "./task.mjs";
+import { TaskError, errorCode } from "./task-errors.mjs";
 
 const installed = createRequire(import.meta.url)("acpx/package.json").version;
 async function cancelOriginal(recordId, targetRequestId) {
@@ -15,11 +16,11 @@ async function cancelOriginal(recordId, targetRequestId) {
   if (!owner) return false;
   const hash = (text, size) => createHash("sha256").update(text).digest("hex").slice(0, size);
   const expected = `/tmp/acpx-${hash(os.homedir(), 10)}/${hash(recordId, 24)}.sock`;
-  if (owner.socketPath !== expected) throw new Error("UNSAFE_OWNER_SOCKET");
+  if (owner.socketPath !== expected) throw new TaskError("UNSAFE_OWNER_SOCKET", { stage: "cancel", field: "session" });
   const parent = fs.lstatSync(path.dirname(expected));
   const socketInfo = fs.lstatSync(expected);
   if (!parent.isDirectory() || parent.uid !== process.getuid() || parent.mode & 0o077 ||
-      !socketInfo.isSocket() || socketInfo.uid !== process.getuid()) throw new Error("UNSAFE_OWNER_SOCKET");
+      !socketInfo.isSocket() || socketInfo.uid !== process.getuid()) throw new TaskError("UNSAFE_OWNER_SOCKET", { stage: "cancel", field: "session" });
   const requestId = randomUUID();
   // 直接取消原 request；原生 helper 的健康回退可能清理不可确认的 owner。
   return new Promise((resolve, reject) => {
@@ -30,7 +31,7 @@ async function cancelOriginal(recordId, targetRequestId) {
       if (settled) return;
       settled = true;
       socket.destroy();
-      error ? reject(new Error("CANCEL_UNCONFIRMED")) : resolve(value);
+      error ? reject(new TaskError("CANCEL_UNCONFIRMED", { stage: "cancel", field: "request" })) : resolve(value);
     };
     socket.setEncoding("utf8");
     socket.setTimeout(3000, () => finish(true));
@@ -56,13 +57,14 @@ async function cancelOriginal(recordId, targetRequestId) {
   });
 }
 export function createTaskRuntime(root, record) {
-  if (installed !== "0.21.1") throw new Error("UNSUPPORTED_ACPX_RUNTIME");
+  if (installed !== "0.21.1") throw new TaskError("UNSUPPORTED_ACPX_RUNTIME", { stage: "setup", field: "installation" });
   const permissions = taskPermissions(
     record.permissions.mode,
     record.permissions.policy,
   );
   const model = taskModel(record.model);
-  privateFile(record.modelConfig);
+  try { privateFile(record.modelConfig); }
+  catch (error) { throw new TaskError(errorCode(error, error?.code === "ENOENT" ? "TASK_MODEL_CONFIG_REQUIRED" : "TASK_READ_FAILED"), { stage: "setup", field: "model_config", reason: error?.code }); }
   const argv = [path.join(root, "bin/opencode"), "--module-task", record.modelConfig,
     model.id, model.variant ?? "", record.modelProfile, "acp"];
   const runtime = createSharedAcpRuntime({
@@ -80,15 +82,15 @@ export function createTaskRuntime(root, record) {
     const existing = await runtime.findSession(input);
     if (record.continuationHandle) {
       if (!existing || ["acpxRecordId", "backendSessionId", "cwd", "sessionKey", "backend"]
-          .some((name) => existing[name] !== record.continuationHandle[name])) throw new Error("SESSION_IDENTITY_CONFLICT");
+          .some((name) => existing[name] !== record.continuationHandle[name])) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" });
       return existing; // 可信续接沿原选择，不控制正在运行或排队的 turn。
     }
-    if (existing) throw new Error("SESSION_IDENTITY_CONFLICT"); // 不接管手工 session。
+    if (existing) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" }); // 不接管手工 session。
     const handle = await ensure({ ...input, sessionOptions: { model: model.id } });
     const status = await runtime.getStatus({ handle });
     if (status.models?.currentModelId !== model.id || (model.variant !== undefined &&
         !status.details?.configOptions?.some((option) => option.id === "effort" && option.currentValue === model.variant)))
-      throw new Error("SESSION_MODEL_UNCONFIRMED");
+      throw new TaskError("SESSION_MODEL_UNCONFIRMED", { stage: "setup", field: "model" });
     return handle;
   };
   runtime.cancelRequest = async ({ handle, requestId }) => {
@@ -99,7 +101,7 @@ export function createTaskRuntime(root, record) {
       !handle.acpxRecordId ||
       requestId !== record.requestId
     )
-      throw new Error("SESSION_IDENTITY_CONFLICT");
+      throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "cancel", field: "session" });
     return cancelOriginal(handle.acpxRecordId, requestId);
   };
   return runtime;

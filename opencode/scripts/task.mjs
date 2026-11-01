@@ -2,12 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { readJson, SNAPSHOT_BYTES } from "./task-read.mjs";
+import { TaskError, errorCode, errorInfo, runtimeError } from "./task-errors.mjs";
 
 export const OUTPUT_BYTES = 32768;
 export const DEFAULT_NO_PROGRESS_MS = 900000;
 export function noProgressTimeout(seconds = 900) {
   if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 86400)
-    throw new Error("INVALID_NO_PROGRESS_TIMEOUT");
+    throw new TaskError("INVALID_NO_PROGRESS_TIMEOUT", { stage: "validate", field: "no_progress_timeout_seconds" });
   return seconds * 1000;
 }
 export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,11 +24,11 @@ const callbackPattern = /^tcb_[A-Za-z0-9_-]{43}$/;
 const settling = Symbol("canonical result received");
 
 // 仅连接错误触发被动重连；消费/落盘异常须传给控制进程，不能伪装通信断开。
-async function* connectionEvents(events) {
+async function* connectionEvents(events, disconnected) {
   const iterator = events[Symbol.asyncIterator]();
   while (true) {
     let item;
-    try { item = await iterator.next(); } catch { return; }
+    try { item = await iterator.next(); } catch (error) { disconnected?.(error); return; }
     if (item.done) return;
     yield item.value;
   }
@@ -37,7 +38,7 @@ export async function within(promise, ms) {
   let timer;
   try {
     return await Promise.race([promise, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("OBSERVATION_TIMEOUT")), ms);
+      timer = setTimeout(() => reject(new TaskError("OBSERVATION_TIMEOUT", { stage: "observe", field: "request" })), ms);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -55,34 +56,40 @@ function directory(dirname) {
   return dirname;
 }
 function syncDirectory(dirname) {
-  const fd = fs.openSync(dirname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  try {
+    const fd = fs.openSync(dirname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch (error) { throw new TaskError("TASK_WRITE_FAILED", { stage: "submit", field: "task_store", reason: error?.code }); }
 }
-export function save(filename, value) {
-  if (fs.existsSync(filename)) privateFile(filename);
-  const temporary = path.join(directory(path.dirname(filename)), `.write-${randomUUID()}`);
-  const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
-  try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); }
-  finally { fs.closeSync(fd); }
-  fs.renameSync(temporary, filename);
-  syncDirectory(path.dirname(filename));
+export function save(filename, value, { stage = "submit", field = "task_record" } = {}) {
+  try {
+    if (fs.existsSync(filename)) privateFile(filename);
+    const temporary = path.join(directory(path.dirname(filename)), `.write-${randomUUID()}`);
+    const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(value)); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, filename);
+    syncDirectory(path.dirname(filename));
+  } catch (error) { throw new TaskError(errorCode(error, "TASK_WRITE_FAILED"), { stage, field, reason: error instanceof TaskError ? error.reason : error?.code }); }
 }
 
 export function taskPermissions(mode = "deny-all", policy = {}) {
-  if (!["deny-all", "approve-reads", "approve-all"].includes(mode) || !policy || typeof policy !== "object" || Array.isArray(policy))
-    throw new Error("INVALID_PERMISSIONS");
+  if (!["deny-all", "approve-reads", "approve-all"].includes(mode))
+    throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: "permissions.mode" });
+  if (!policy || typeof policy !== "object" || Array.isArray(policy))
+    throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: "permissions.policy" });
   const selected = {};
   const names = ["autoApprove", "autoDeny", "escalate", "defaultAction"];
-  if (Object.keys(policy).some((key) => !names.includes(key))) throw new Error("INVALID_PERMISSIONS");
+  if (Object.keys(policy).some((key) => !names.includes(key))) throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: "permissions.policy" });
   for (const name of names.slice(0, 3)) {
     if (policy[name] === undefined) continue;
     if (!Array.isArray(policy[name]) || policy[name].length > 32 || policy[name].some((rule) =>
       typeof rule !== "string" || !rule.trim() || rule.length > 256 || /[\x00-\x1f\x7f]/.test(rule)))
-      throw new Error("INVALID_PERMISSIONS");
+      throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: `permissions.policy.${name}` });
     selected[name] = [...policy[name]];
   }
   if (policy.defaultAction !== undefined) {
-    if (!["approve", "deny", "escalate"].includes(policy.defaultAction)) throw new Error("INVALID_PERMISSIONS");
+    if (!["approve", "deny", "escalate"].includes(policy.defaultAction)) throw new TaskError("INVALID_PERMISSIONS", { stage: "validate", field: "permissions.policy.defaultAction" });
     selected.defaultAction = policy.defaultAction;
   }
   return { mode, policy: selected };
@@ -91,23 +98,25 @@ export function taskModel(model) {
   if (!model || typeof model.id !== "string" || model.id.length > 256 || model.id.includes("tcb_") ||
       !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./:-]+$/.test(model.id) ||
       (model.variant !== undefined && (typeof model.variant !== "string" || !/^[A-Za-z0-9_.-]{1,64}$/.test(model.variant))))
-    throw new Error("INVALID_MODEL");
+    throw new TaskError("INVALID_MODEL", { stage: "validate", field: "model" });
   return { id: model.id, ...(model.variant !== undefined ? { variant: model.variant } : {}) };
 }
 function validateHandle(record, handle) {
   if (!handle || handle.cwd !== record.cwd || handle.sessionKey !== record.sessionKey ||
-      !handle.acpxRecordId || handle.backend !== "acpx-shared") throw new Error("SESSION_IDENTITY_CONFLICT");
+      !handle.acpxRecordId || handle.backend !== "acpx-shared") throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" });
   return handle;
 }
 export function validateCallback(input) {
-  if (!input || typeof input.callback_id !== "string" || !callbackPattern.test(input.callback_id) || typeof input.callback_url !== "string")
-    throw new Error("INVALID_CALLBACK");
-  const url = new URL(input.callback_url);
+  if (!input || typeof input.callback_id !== "string" || !callbackPattern.test(input.callback_id))
+    throw new TaskError("INVALID_CALLBACK", { stage: "validate", field: "callback.callback_id" });
+  let url;
+  try { url = new URL(input.callback_url); }
+  catch { throw new TaskError("INVALID_CALLBACK", { stage: "validate", field: "callback.callback_url" }); }
   if ((url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))) ||
-      url.username || url.password || url.search || url.hash || input.callback_url.includes(input.callback_id) ||
-      url.pathname !== "/api/agents/task-callbacks") throw new Error("INVALID_CALLBACK");
+      typeof input.callback_url !== "string" || url.username || url.password || url.search || url.hash || input.callback_url.includes(input.callback_id) ||
+      url.pathname !== "/api/agents/task-callbacks") throw new TaskError("INVALID_CALLBACK", { stage: "validate", field: "callback.callback_url" });
   const max = input.max_output_bytes ?? OUTPUT_BYTES;
-  if (!Number.isSafeInteger(max) || max < 1 || max > OUTPUT_BYTES) throw new Error("INVALID_CALLBACK");
+  if (!Number.isSafeInteger(max) || max < 1 || max > OUTPUT_BYTES) throw new TaskError("INVALID_CALLBACK", { stage: "validate", field: "callback.max_output_bytes" });
   return { callback_id: input.callback_id, callback_url: url.toString(), max_output_bytes: max };
 }
 export function bounded(value, max = OUTPUT_BYTES) {
@@ -133,8 +142,17 @@ function identifier(value) {
   return value;
 }
 const safeCodes = new Set(["MODEL_OR_SESSION_SETUP_FAILED", "RECOVERED_BEFORE_DISPATCH", "CONTROL_START_FAILED", "NO_PROGRESS",
-  "REQUEST_FAILED", "TURN_TRANSPORT_INTERRUPTED", "REDIRECT_REFUSED", "CALLBACK_REJECTED", "DELIVERY_UNCONFIRMED"]);
+  "REQUEST_FAILED", "REQUEST_OUTCOME_UNKNOWN", "REQUEST_AUTH_REQUIRED", "REQUEST_PERMISSION_DENIED", "TURN_TRANSPORT_INTERRUPTED",
+  "SESSION_IDENTITY_CONFLICT", "SESSION_MODEL_UNCONFIRMED", "UNSUPPORTED_ACPX_RUNTIME", "TASK_MODEL_CONFIG_REQUIRED",
+  "UNSAFE_TASK_FILE", "TASK_READ_FAILED", "INVALID_MODEL", "INVALID_PERMISSIONS", "OBSERVATION_TIMEOUT",
+  "INVALID_RECEIPT", "CALLBACK_RETRYABLE_STATUS", "REDIRECT_REFUSED", "CALLBACK_REJECTED", "DELIVERY_UNCONFIRMED"]);
 function safeCode(value) { return value == null ? null : safeCodes.has(value) ? value : "UNKNOWN_RECORDED_CODE"; }
+function recordedDiagnostic(value, detail, stage, field) {
+  const code = safeCode(value);
+  if (code === null) return null;
+  return errorInfo(code, { stage, field, ...detail,
+    ...(code === "UNKNOWN_RECORDED_CODE" ? { category: "unknown", reason: "unknown", action: "inspect_record" } : {}) });
+}
 function choice(value, values) {
   if (value == null) return null;
   if (!values.includes(value)) throw new Error("INVALID_TASK_RESULT");
@@ -174,7 +192,8 @@ export function retryDelay(attempt, retryAfter, now) {
   return Math.min(86400000, Math.max(Math.min(300000, 5000 * 2 ** Math.min(attempt, 10)), Number.isFinite(seconds) ? seconds : 0));
 }
 async function receipt(response) {
-  if (!response.body) throw new Error("INVALID_RECEIPT");
+  const invalid = () => new TaskError("INVALID_RECEIPT", { stage: "outbox", field: "receipt" });
+  if (!response.body) throw invalid();
   const reader = response.body.getReader(), chunks = [];
   let size = 0;
   try {
@@ -182,12 +201,13 @@ async function receipt(response) {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.length;
-      if (size > 4096) throw new Error("INVALID_RECEIPT");
+      if (size > 4096) throw invalid();
       chunks.push(value);
     }
   } finally { await reader.cancel().catch(() => {}); }
-  const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  resultReceipt(value, { callback_url: "\0" });
+  let value;
+  try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); resultReceipt(value, { callback_url: "\0" }); }
+  catch { throw invalid(); }
   return { version: 1, receipt_id: value.receipt_id, accepted_at: value.accepted_at };
 }
 
@@ -199,7 +219,7 @@ export class TaskRunner {
     this.noProgressMs = noProgressMs; this.pollMs = pollMs; this.ioMs = ioMs; this.drainMs = drainMs;
   }
   filename(id, name = "task.json") {
-    if (!taskPattern.test(id)) throw new Error("INVALID_TASK_ID");
+    if (!taskPattern.test(id)) throw new TaskError("INVALID_TASK_ID", { stage: "read", field: "task_id" });
     return path.join(directory(path.join(this.root, id)), name);
   }
   load(id, options) {
@@ -220,25 +240,27 @@ export class TaskRunner {
     this.resultRecord(record, { output: false });
     return record;
   }
-  write(record) { save(this.filename(record.id), record); }
+  write(record, stage = record.result ? "result" : ({ queued: "submit", preparing: "setup", dispatching: "dispatch", running: "observe", ambiguous: "observe" })[record.state]) {
+    save(this.filename(record.id), record, { stage, field: "task_record" });
+  }
   bindSession({ cwd, session, model, modelConfig, modelProfile }) {
     const sessions = path.join(this.root, ".sessions");
     try {
       fs.mkdirSync(sessions, { mode: 0o700 });
-      save(path.join(sessions, "owner.json"), { schema: 1, uid: process.getuid() }); syncDirectory(this.root);
-    } catch (error) { if (error.code !== "EEXIST") throw error; }
+      save(path.join(sessions, "owner.json"), { schema: 1, uid: process.getuid() }, { stage: "selection", field: "session_record" }); syncDirectory(this.root);
+    } catch (error) { if (error.code !== "EEXIST") throw new TaskError(errorCode(error, "TASK_WRITE_FAILED"), { stage: "selection", field: "session_record", reason: error instanceof TaskError ? error.reason : error?.code }); }
     directory(sessions);
-    if (JSON.stringify(readJson(path.join(sessions, "owner.json"))) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
-      throw new Error("INVALID_SESSION_OWNER");
+    if (JSON.stringify(readJson(path.join(sessions, "owner.json"), undefined, { stage: "selection", field: "session_record" })) !== JSON.stringify({ schema: 1, uid: process.getuid() }))
+      throw new TaskError("INVALID_SESSION_OWNER", { stage: "selection", field: "session_record" });
     const binding = path.join(sessions, `${hash(session)}.json`);
     const sessionKey = `module-task-session_${hash(JSON.stringify([cwd, session]))}`;
     if (fs.existsSync(binding)) {
-      const prior = readJson(binding);
-      if (prior.version !== 2) throw new Error("UNSUPPORTED_SESSION_RECORD");
-      if (prior.cwd !== cwd || prior.name !== session || prior.sessionKey !== sessionKey) throw new Error("SESSION_CWD_CONFLICT");
+      const prior = readJson(binding, undefined, { stage: "selection", field: "session_record" });
+      if (prior.version !== 2) throw new TaskError("UNSUPPORTED_SESSION_RECORD", { stage: "selection", field: "session_record" });
+      if (prior.cwd !== cwd || prior.name !== session || prior.sessionKey !== sessionKey) throw new TaskError("SESSION_CWD_CONFLICT", { stage: "selection", field: "session" });
       if (JSON.stringify(prior.model) !== JSON.stringify(model) || prior.modelConfig !== modelConfig || prior.modelProfile !== modelProfile)
-        throw new Error("SESSION_MODEL_CONFLICT");
-    } else save(binding, { version: 2, name: session, cwd, sessionKey, model, modelConfig, modelProfile });
+        throw new TaskError("SESSION_MODEL_CONFLICT", { stage: "selection", field: "selection" });
+    } else save(binding, { version: 2, name: session, cwd, sessionKey, model, modelConfig, modelProfile }, { stage: "selection", field: "session_record" });
     return sessionKey;
   }
   submit({ key, prompt, cwd, callback, session, permissionMode, permissionPolicy, model, modelConfig, modelProfile,
@@ -284,7 +306,7 @@ export class TaskRunner {
       permission_mode: choice(record.permissions.mode, ["deny-all", "approve-reads", "approve-all"]),
       model: taskModel(record.model).id, variant: identifier(record.model.variant),
       cancel_requested: readJson(this.filename(id, "cancel.json"), SNAPSHOT_BYTES, { optional: true }) !== undefined,
-      execution_error: safeCode(record.executionError), delivery_error: safeCode(record.deliveryError) };
+    };
   }
   result(id) { return this.resultRecord(this.load(id)); }
   resultRecord(record, { output = true } = {}) {
@@ -299,6 +321,12 @@ export class TaskRunner {
       result_status: result ? choice(result.status, ["success", "error", "cancelled"]) : null,
       callback_status: payload?.status ?? null, callback_state: payload ? record.callbackState : null,
       callback_kind: payload ? choice(record.notificationKind, ["no_progress", "request_result"]) : null,
+      execution_error: safeCode(record.executionError),
+      execution_diagnostic: recordedDiagnostic(record.executionError, record.executionDetail, source === "execution_setup_failure" ? "setup" : result ? "result" : "observe", record.executionError === "NO_PROGRESS" ? "no_progress_timeout_seconds" : "request"),
+      observation_error: safeCode(record.observationError),
+      observation_diagnostic: recordedDiagnostic(record.observationError, record.observationDetail, "observe", "request"),
+      delivery_error: safeCode(record.deliveryError),
+      delivery_diagnostic: recordedDiagnostic(record.deliveryError, record.deliveryDetail, "outbox", "callback"),
       no_progress_timeout_seconds: record.noProgressMs / 1000, last_progress_at: record.progress.at,
       timing: { time_basis: "unix_epoch_ms_wall_clock", accepted_at: record.createdAt, started_at: time(record.startedAt),
         terminal_at: time(result?.at), callback_attempted_at: time(record.callbackAttemptedAt),
@@ -337,13 +365,15 @@ export class TaskRunner {
   }
   fail(record, reason) {
     if (record.result) return;
-    record.executionError = reason;
-    this.seal(record, "error", `Task did not dispatch a prompt: ${reason}.`, "execution_setup_failure", "program_generated");
+    const info = errorInfo(reason, { ...(reason instanceof TaskError ? reason : { stage: "setup", field: "session" }) });
+    record.executionError = info.code; record.executionDetail = info;
+    this.seal(record, "error", `Task did not dispatch a prompt: ${info.code}. Stage: ${info.stage}; field: ${info.field}; category: ${info.category}; reason: ${info.reason}. ${info.hint}`, "execution_setup_failure", "program_generated");
   }
   notify(record) {
     if (record.body !== undefined || record.result) return;
-    if (["queued", "preparing"].includes(record.state)) { this.fail(record, "NO_PROGRESS"); return; }
+    if (["queued", "preparing"].includes(record.state)) { this.fail(record, new TaskError("NO_PROGRESS", { stage: "setup", field: "no_progress_timeout_seconds" })); return; }
     record.state = "ambiguous"; record.executionError = "NO_PROGRESS"; record.notificationAt = this.now();
+    record.executionDetail = errorInfo("NO_PROGRESS", { stage: "observe", field: "no_progress_timeout_seconds" });
     this.sealCallback(record, "error", "Original request outcome and side effects are unknown. It may still be running. No original request progress was observed within the configured timeout. Do not automatically retry or cancel; verify the original request before further action.", "no_progress");
     // 继续保存原 output/cursor；晚到结果独立保存，不能改已封存通知。
     this.write(record);
@@ -362,11 +392,13 @@ export class TaskRunner {
     // 共享连接 failed 不等于 canonical 失败；只用原 journal 的失败结果。
     if (result.status === "failed" && (source === "turn.result" || result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN")) return false;
     const status = result.status === "completed" ? "success" : result.status === "cancelled" ? "cancelled" : "error";
+    delete record.observationError; delete record.observationDetail;
     if (status === "error") {
-      record.executionError = "REQUEST_FAILED";
-      this.seal(record, status, "Original request failed (REQUEST_FAILED). Side effects may have occurred; verify before retrying.", source, "program_generated");
+      const info = errorInfo(runtimeError(result.error, { stage: "result", field: "request", fallback: "REQUEST_FAILED" }));
+      record.executionError = info.code; record.executionDetail = info;
+      this.seal(record, status, `Original request failed (${info.code}). Side effects may have occurred; verify before retrying. Category: ${info.category}; reason: ${info.reason}. ${info.hint}`, source, "program_generated");
     } else {
-      delete record.executionError;
+      delete record.executionError; delete record.executionDetail;
       this.seal(record, status, record.output ?? "", source);
     }
     return true;
@@ -375,38 +407,50 @@ export class TaskRunner {
     if (record.callbackState !== "outbox" || record.nextAttemptAt > this.now()) return;
     const body = record.body;
     let retryAfter;
-    record.callbackAttemptedAt = this.now(); this.write(record);
+    record.callbackAttemptedAt = this.now(); this.write(record, "outbox");
     try {
       const response = await this.fetcher(record.callback.callback_url, { method: "POST", headers: { "Content-Type": "application/json" },
         body, redirect: "manual", signal: AbortSignal.timeout(30000) });
       if (response.status === 202) {
         record.receipt = await receipt(response); record.callbackDeliveredAt = this.now(); record.callbackState = "delivered";
-        delete record.deliveryError;
+        delete record.deliveryError; delete record.deliveryDetail;
       } else {
         retryAfter = response.headers.get("retry-after"); await response.body?.cancel();
         if (![408, 425, 429].includes(response.status) && response.status < 500) {
           record.callbackState = "rejected";
           record.deliveryError = response.status >= 300 && response.status < 400 ? "REDIRECT_REFUSED" : "CALLBACK_REJECTED";
-        }
+        } else record.deliveryError = "CALLBACK_RETRYABLE_STATUS";
+        record.deliveryDetail = errorInfo(record.deliveryError, { stage: "outbox", field: "callback", http_status: response.status });
       }
-    } catch { record.deliveryError = "DELIVERY_UNCONFIRMED"; }
+    } catch (error) {
+      record.deliveryDetail = errorInfo(error instanceof TaskError ? error : "DELIVERY_UNCONFIRMED", { stage: "outbox", field: error instanceof TaskError ? error.field : "callback" });
+      record.deliveryError = record.deliveryDetail.code;
+    }
     if (record.callbackState === "outbox") record.nextAttemptAt = this.now() + retryDelay(record.attempts++, retryAfter, this.now());
-    this.write(record);
+    this.write(record, "outbox");
+  }
+  observationFailure(record, error, field = "request") {
+    if (record.result) return;
+    const info = errorInfo(runtimeError(error, { stage: "observe", field, uncertain: true }));
+    if (JSON.stringify(record.observationDetail) === JSON.stringify(info)) return;
+    record.observationError = info.code; record.observationDetail = info;
+    this.write(record, "observe");
   }
   async journal(record, signal) {
     while (!signal.aborted && !record.result) {
       if (!record.handle) {
         let handle;
         try { handle = await within(this.runtime.findSession({ sessionKey: record.sessionKey, agent: "opencode", cwd: record.cwd }), this.ioMs); }
-        catch { /* 沿剩余期限重试被动查找。 */ }
+        catch (error) { this.observationFailure(record, error, "session"); } // 沿剩余期限被动查找，不重派。
         if (signal.aborted) return;
         if (!handle) { await delay(this.pollMs); continue; }
         record.handle = validateHandle(record, handle);
       }
-      for await (const event of connectionEvents(this.runtime.watchSession({ handle: record.handle, cursor: record.cursor, signal }))) {
+      for await (const event of connectionEvents(this.runtime.watchSession({ handle: record.handle, cursor: record.cursor, signal }), (error) => this.observationFailure(record, error))) {
           if (signal.aborted || record.result) return;
           if (event.requestId === record.requestId) {
             const unknown = event.type === "turn_result" && event.result.error?.detailCode === "WATCH_OUTCOME_UNKNOWN";
+            if (unknown) this.observationFailure(record, event.result.error);
             if (!unknown && ["turn_started", "message", "turn_result"].includes(event.type)) {
               this.progress(record);
               const update = event.message?.params?.update;
@@ -436,8 +480,8 @@ export class TaskRunner {
         const handle = await this.runtime.ensureSession({ sessionKey: record.sessionKey, agent: "opencode", mode: "persistent", cwd: record.cwd, model: record.model });
         if (signal.aborted || record.result) return;
         record.handle = validateHandle(record, handle);
-      } catch {
-        if (!signal.aborted && !record.result) this.fail(record, "MODEL_OR_SESSION_SETUP_FAILED");
+      } catch (error) {
+        if (!signal.aborted && !record.result) this.fail(record, runtimeError(error, { stage: "setup", field: "session", fallback: "MODEL_OR_SESSION_SETUP_FAILED" }));
         return;
       }
       if (fs.existsSync(this.filename(record.id, "cancel.json"))) {
@@ -448,8 +492,8 @@ export class TaskRunner {
       let turn;
       try {
         turn = this.runtime.startTurn({ handle: record.handle, text: record.prompt, mode: "prompt", requestId: record.requestId });
-      } catch {
-        record.state = "ambiguous"; record.executionError = "TURN_TRANSPORT_INTERRUPTED"; this.write(record);
+      } catch (error) {
+        record.state = "ambiguous"; this.observationFailure(record, error);
       }
       if (turn) {
         const stream = {};
@@ -458,9 +502,9 @@ export class TaskRunner {
           if (!active()) return;
           if (!record.body) record.state = "running";
           record.startedAt ??= this.now(); this.progress(record); this.write(record);
-        }, () => {}).catch(onError);
+        }, (error) => { if (active()) this.observationFailure(record, error); }).catch(onError);
         const consume = (async () => {
-          for await (const event of connectionEvents(turn.events)) {
+          for await (const event of connectionEvents(turn.events, (error) => { if (active()) this.observationFailure(record, error); })) {
             if (!active()) break;
             if (event.requestId !== undefined && event.requestId !== record.requestId) continue;
             this.progress(record);
@@ -471,14 +515,15 @@ export class TaskRunner {
         consume.catch(onError);
         const journal = this.journal(record, signal);
         Promise.resolve(turn.result).then(async (result) => {
-          if (!active() || result.status === "failed") return;
+          if (!active()) return;
+          if (result.status === "failed") { this.observationFailure(record, result.error); return; }
           if (!record.body && this.remaining(record) <= 0) this.notify(record);
           record[settling] = true; // 仅进程内：终态已到，排空不触发超时；不能保存成恢复授权。
           await within(consume, this.drainMs).catch(() => {});
           if (!active()) return;
           if (stream.output !== undefined) { record.output = stream.output; record.outputTruncated = stream.outputTruncated; }
           this.finish(record, result);
-        }, () => {}).catch(onError);
+        }, (error) => { if (active()) this.observationFailure(record, error); }).catch(onError);
         await journal;
         return;
       }
@@ -508,6 +553,8 @@ export class TaskRunner {
         if (record.result && (!deliver || record.callbackState !== "outbox") && !delivery) return;
         await delay(this.pollMs);
       }
+    } catch (error) {
+      throw new TaskError(error instanceof TaskError ? error.code : "TASK_OPERATION_FAILED", { ...(error instanceof TaskError ? error : { stage: "observe", field: "request" }), task_id: record.id, request_id: record.requestId });
     } finally {
       controller.abort(); signal?.removeEventListener("abort", stop);
     }
@@ -517,10 +564,13 @@ export class TaskRunner {
   async cancel(id) {
     const record = this.load(id);
     if (record.result) throw new Error("TASK_TERMINAL");
-    save(this.filename(id, "cancel.json"), { requested: true });
+    save(this.filename(id, "cancel.json"), { requested: true }, { stage: "cancel", field: "cancel_record" });
     if (record.handle && record.dispatchedAt) {
       validateHandle(record, record.handle);
-      await within(Promise.resolve(this.runtime.cancelRequest?.({ handle: record.handle, requestId: record.requestId })), this.ioMs);
+      try { await within(Promise.resolve(this.runtime.cancelRequest?.({ handle: record.handle, requestId: record.requestId })), this.ioMs); }
+      catch (error) { throw new TaskError(error instanceof TaskError && error.code !== "OBSERVATION_TIMEOUT" ? error.code : "CANCEL_UNCONFIRMED",
+        { ...(error instanceof TaskError ? error : {}), stage: "cancel", field: error instanceof TaskError ? error.field : "request",
+          reason: error instanceof TaskError && error.code === "OBSERVATION_TIMEOUT" ? "timeout" : error instanceof TaskError ? error.reason : error?.code, task_id: id, request_id: record.requestId }); }
     }
   }
 }

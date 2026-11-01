@@ -60,7 +60,9 @@ def read_json(path, maximum=65536):
 
 def error_code(error):
     if isinstance(error, ReadError):
-        return str(error)
+        known = {'UNSAFE_FILE', 'READ_LIMIT', 'FILE_CHANGED', 'INVALID_RECORD', 'OWNER_MISMATCH',
+                 'TASK_STORE_MISSING', 'INVALID_ARGUMENTS', 'DIRECTORY_READ_FAILED', 'CURSOR_STALE', 'INSTALLATION_MISMATCH'}
+        return str(error) if str(error) in known else 'READ_FAILED'
     if isinstance(error, FileNotFoundError):
         return 'MISSING'
     if isinstance(error, OSError):

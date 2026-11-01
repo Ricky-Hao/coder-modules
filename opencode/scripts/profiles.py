@@ -23,6 +23,7 @@ class ProfileError(ValueError):
     """Only module-defined variable names are allowed in actionable diagnostics."""
     def __init__(self, reason, names):
         assert reason in ('missing', 'invalid') and set(names) <= PROFILE_KEYS
+        self.reason, self.names = reason, sorted(set(names))
         super().__init__('Env profile: ' + reason + ' environment names: ' + ', '.join(sorted(names)))
 
 

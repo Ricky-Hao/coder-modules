@@ -12,7 +12,7 @@ From the repository root, with Python 3.11+ and Node 22+ available:
 
 ```sh
 python3 -B -m unittest discover -s opencode/tests -v
-node --test opencode/tests/task.test.mjs
+node --test opencode/tests/task.test.mjs opencode/tests/task-launch.test.mjs opencode/tests/task-read.test.mjs
 python3 -B opencode/build_bundle.py --check
 git diff --check
 ```
