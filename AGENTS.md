@@ -37,5 +37,5 @@
 - 继承的 CI、定时健康检查和 registry 部署已归档到 `.github/workflows-archive/`，当前源码没有 active workflows，也没有替代 CI。不因文档恢复 workflow、创建发布或部署 registry；源码候选不等于当前模板已使用。
 - Git 交付前保留 `CONTRIBUTING.md` 的 fork-local 检查：`python3 -B -m unittest discover -s opencode/tests -v`、`node --test opencode/tests/task.test.mjs`、`git diff --check`，并核 active workflow 为空、归档字节与指定历史版本一致。
 - 这些检查使用合成工具/凭据及 mock ACP/local HTTP。Terraform mock/render、可选 acpx runtime/CLI 验收按相应文档和改动范围执行，不默认运行真实付费 OpenCode 或 Provider/MCP smoke，不把离线检查当作发布、部署或 live 验收。
-- 只提交用户指定 owner/ref。沿用现有 Git 身份和严格主机校验，不把旧 feature 分支或第三方 upstream 当作默认推送目标。
+- 只提交用户指定 owner/ref，不把旧 feature 分支或第三方 upstream 当作默认推送目标。沿用 Workspace 注入的 Git SSH 身份和继承 PATH；仅 Git SSH 自动接受缺失或变化的主机密钥，变化时只移除当前 Git 目标 host/port 的旧记录。设备 SSH 不变。
 - 内置 env profile 恰好为 copilot、codex，默认 codex/Sol/max 与 title/low。维护时保留完整模型一致性回归、四变量独立校验和单任务 ACP 选择；named session 固定选择，不在 running/queued 时控制切换。详见 `opencode/PROVIDERS.md`。

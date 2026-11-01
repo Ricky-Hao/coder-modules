@@ -65,6 +65,9 @@ test("new: fetched main, dirty checkout preserved, private intent and same-key r
   const f = fixture(t), result = await f.launch();
   assert.equal(result.error, undefined, JSON.stringify(result));
   assert.equal(result.accepted, true); assert.equal(result.base_sha, f.latest);
+  assert.equal(result.base, "main"); assert.equal(f.saved(result).base, "main");
+  assert.match(result.base_sha, /^[a-f0-9]{40}$/);
+  assert.equal(git(result.worktree, "rev-parse", "HEAD"), result.base_sha);
   assert.equal(git(f.repo, "rev-parse", "HEAD"), f.old);
   assert.equal(git(f.repo, "rev-parse", "main"), f.old);
   assert.equal(fs.readFileSync(path.join(f.repo, "dirty"), "utf8"), "keep unrelated work");
@@ -77,6 +80,103 @@ test("new: fetched main, dirty checkout preserved, private intent and same-key r
   const again = await f.launch();
   assert.equal(again.request_id, result.request_id); assert.equal(again.reused, true);
   assert.equal((await f.launch({ ...f.input, prompt: "changed" })).error.code, "LAUNCH_CONFLICT");
+});
+
+test("自选含斜线的远端 base：新 key fresh fetch，同 key 保留原 SHA 和 request", async (t) => {
+  const f = fixture(t), base = "rickyhao/stable", remote = `refs/heads/${base}`;
+  git(f.origin, "update-ref", remote, f.old);
+  git(f.repo, "update-ref", `refs/remotes/origin/${base}`, f.old);
+  const fetchHead = path.join(f.repo, ".git/FETCH_HEAD"); fs.writeFileSync(fetchHead, "unrelated fetch\n");
+  const input = { ...f.input, base }, first = await f.launch(input);
+  assert.equal(first.error, undefined, JSON.stringify(first));
+  assert.equal(first.base, base); assert.equal(first.base_sha, f.old);
+  assert.equal(git(first.worktree, "rev-parse", "HEAD"), f.old);
+  const saved = f.saved(first), fetched = `refs/opencode-launch/${saved.token}`;
+  assert.equal(saved.base, base); assert.equal(saved.base_sha, f.old);
+  assert.equal(git(f.repo, "rev-parse", fetched), f.old);
+  git(f.origin, "update-ref", remote, f.latest);
+  const retry = await f.launch(input);
+  assert.equal(retry.request_id, first.request_id); assert.equal(retry.reused, true);
+  assert.equal(retry.base, base); assert.equal(retry.base_sha, f.old);
+  assert.equal(git(f.repo, "rev-parse", fetched), f.old);
+  assert.equal((await f.launch({ ...input, base: "main" })).error.code, "LAUNCH_CONFLICT");
+  const next = await f.launch({ ...input, key: "fresh", branch: "feat/fresh", worktree: "fresh-work" });
+  assert.equal(next.error, undefined, JSON.stringify(next));
+  assert.equal(next.base, base); assert.equal(next.base_sha, f.latest);
+  assert.match(next.base_sha, /^[a-f0-9]{40}$/);
+  assert.equal(git(next.worktree, "rev-parse", "HEAD"), f.latest);
+  assert.equal(fs.readFileSync(fetchHead, "utf8"), "unrelated fetch\n");
+  assert.equal(git(f.repo, "rev-parse", "HEAD"), f.old);
+  assert.equal(fs.readFileSync(path.join(f.repo, "dirty"), "utf8"), "keep unrelated work");
+});
+
+test("base 输入拒绝无效名称、参数注入和 revision 表达式，且不领取 key 或修改 Git", async (t) => {
+  const f = fixture(t), before = git(f.repo, "show-ref");
+  for (const base of [null, 1, {}, [], "", "HEAD", "-main", "--upload-pack=evil", "main other", "main\nother",
+    "../main", "a..b", "a//b", "a/.hidden", "a.lock", "a/b.lock", "a.", "a/", "/main", "a\\b",
+    "main~1", "main^", "main^{commit}", "main:refs/heads/escape", "@{-1}", "a?b", "a*b", "a[b", "a".repeat(241),
+    f.input.callback.callback_id, f.input.callback.callback_url]) {
+    const result = await f.launch({ ...f.input, base });
+    assert.equal(result.error?.code, "INVALID_LAUNCH_INPUT", JSON.stringify(base));
+    assert.equal(result.accepted, false);
+  }
+  assert.equal(git(f.repo, "show-ref"), before);
+  assert.equal(fs.existsSync(path.join(f.tasks, ".launches")), false);
+});
+
+test("不存在的远端 base 不使用同名缓存或 tag；失败后同 key 仍 fail closed", async (t) => {
+  const f = fixture(t), base = "rickyhao/missing", input = { ...f.input, base };
+  git(f.repo, "update-ref", `refs/remotes/origin/${base}`, f.latest);
+  git(f.origin, "update-ref", `refs/tags/${base}`, f.latest);
+  const before = git(f.repo, "show-ref"), failed = await f.launch(input);
+  assert.equal(failed.error.code, "GIT_FETCH_FAILED"); assert.equal(failed.stage, "fetch");
+  assert.equal(failed.base, base); assert.equal(failed.base_sha, null); assert.equal(failed.accepted, false);
+  assert.equal(git(f.repo, "show-ref"), before);
+  assert.equal(fs.existsSync(path.join(f.base, "new-work")), false);
+  const file = path.join(f.tasks, ".launches", `${failed.task_id}.json`), bytes = fs.readFileSync(file);
+  git(f.origin, "update-ref", `refs/heads/${base}`, f.latest);
+  assert.equal((await f.launch(input)).error.code, "GIT_PREPARATION_INTERRUPTED");
+  assert.deepEqual(fs.readFileSync(file), bytes);
+  assert.equal(git(f.repo, "show-ref"), before); assert.equal(f.launches(), 0);
+});
+
+test("自选 base 的续接保留原 SHA、worktree 和 session，不接受 base 或重新 fetch", async (t) => {
+  const f = fixture(t), base = "rickyhao/stable";
+  git(f.origin, "update-ref", `refs/heads/${base}`, f.old);
+  const original = await f.launch({ ...f.input, base }), task = f.runner.load(original.task_id);
+  task.handle = { backend: "acpx-shared", cwd: task.cwd, sessionKey: task.sessionKey,
+    acpxRecordId: "fixture-record", backendSessionId: "fixture-session" };
+  f.runner.seal(task, "success", "done", "turn.result");
+  fs.writeFileSync(path.join(original.worktree, "file"), "task commit\n");
+  git(original.worktree, "commit", "-am", "task change");
+  const head = git(original.worktree, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(original.worktree, "dirty"), "keep task work");
+  git(f.origin, "update-ref", `refs/heads/${base}`, f.latest);
+  fs.renameSync(f.origin, f.origin + "-unavailable");
+  const input = { schema_version: 1, key: "next", prompt: "next", callback: f.input.callback };
+  const flags = { "--continue-from": original.task_id };
+  for (const value of [base, "main"])
+    assert.equal((await f.launch({ ...input, base: value }, flags)).error.code, "INVALID_LAUNCH_INPUT");
+  const next = await f.launch(input, flags);
+  assert.equal(next.error, undefined, JSON.stringify(next));
+  assert.equal(next.base, base); assert.equal(next.base_sha, f.old);
+  assert.equal(next.worktree, original.worktree); assert.equal(next.session, original.session);
+  assert.equal(f.runner.load(next.task_id).continuationHandle.backendSessionId, "fixture-session");
+  assert.equal(git(next.worktree, "rev-parse", "HEAD"), head);
+  assert.equal(fs.readFileSync(path.join(next.worktree, "dirty"), "utf8"), "keep task work");
+});
+
+test("未存 base 的现有 v2 记录按 main 返回，同输入重试保留原 task/launch 字节", async (t) => {
+  const f = fixture(t), original = await f.launch();
+  const launchFile = path.join(f.tasks, ".launches", `${original.task_id}.json`);
+  const taskFile = path.join(f.tasks, original.task_id, "task.json"), record = f.saved(original);
+  delete record.base; write(launchFile, record);
+  const launchBytes = fs.readFileSync(launchFile), taskBytes = fs.readFileSync(taskFile);
+  const retry = await f.launch();
+  assert.equal(retry.error, undefined, JSON.stringify(retry));
+  assert.equal(retry.base, "main"); assert.equal(retry.base_sha, f.latest);
+  assert.equal(retry.request_id, original.request_id);
+  assert.deepEqual(fs.readFileSync(launchFile), launchBytes); assert.deepEqual(fs.readFileSync(taskFile), taskBytes);
 });
 
 test("continue: terminal proof, same session/context intent, explicit permission policy, latest-round guard", async (t) => {

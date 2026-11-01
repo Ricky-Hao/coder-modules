@@ -42,6 +42,7 @@ Agent 沿现有工具完成三次调用：
   "repo_path": "/workspaces/project",
   "branch": "feat/review-1",
   "worktree": "project-review-1",
+  "base": "rickyhao/stable",
   "prompt": "完成已授权修改并报告实际测试。",
   "callback": {
     "callback_id": "<原生工具返回的私密值>",
@@ -56,7 +57,8 @@ Agent 沿现有工具完成三次调用：
 }
 ```
 
-新任务要求前七个字段（直到 callback）；其余可选。key 为 1～256 字符，无控制字符或 `tcb_`；
+新任务要求 schema_version/key/repo_path/branch/worktree/prompt/callback，其余可选。
+`base` 是 origin 的远端分支名称，省略为 `main`。key 为 1～256 字符，无控制字符或 `tcb_`；
 prompt 非空，UTF-8 最多 1 MiB。完整 callback 最多 4096 字节，原生 expiry/guidance 等附加字段
 保留在输入指纹。整个文件最多 1 MiB+16 KiB。prompt、名称、权限策略不能含 callback bearer/URL。
 输入与选择在 Git 修改前校验。未知字段、`start`、`base_sha` 和无效组合明确拒绝。
@@ -67,19 +69,21 @@ prompt 非空，UTF-8 最多 1 MiB。完整 callback 最多 4096 字节，原生
 
 repo_path 须为无 symlink 的绝对 Git checkout 顶层并有 origin。worktree 为 1～64 位名称，首位
 字母/数字，其余允许字母、数字、下划线或连字符；目录固定为 repo 的父目录加名称。
-branch 最长 240 字符，按 `/` 分段，每段首位字母/数字，其余允许字母、数字、`.`、`_`、`-`；
-禁止 HEAD、`..`、尾点、`.lock` 和 `tcb_`。
+branch 和 base 最长 240 字符，按 `/` 分段，每段首位字母/数字，其余允许字母、数字、`.`、`_`、`-`；
+禁止 HEAD、`..`、尾点、`.lock` 和 `tcb_`。base 可写 `main` 或 `rickyhao/stable`，不接受参数或 revision 表达式。
 
 Git 沿调用者 HOME、SSH 身份、hostkey、PATH 和网络环境运行，只清除仓库/index/对象路由变量。
-新任务 fresh fetch `origin refs/heads/main`，保存完整 base SHA，再用正常 branch/worktree 操作准备。
+新任务 fresh fetch `origin refs/heads/<base>`，保存所选 base 名称和完整 40 位 base_sha，再从该提交创建 branch/worktree。
 fetch 使用本次独立 ref，避免其他 fetch 改写 FETCH_HEAD；该 ref 不授权中断恢复。
-不使用缓存 origin/main，不更新原 checkout 的 main，不要求无关 checkout 干净。已有 branch/目录
+远端分支不存在则报 GIT_FETCH_FAILED，不采用缓存或同名 tag。新任务不使用缓存 origin 分支，
+不更新原 checkout 的分支，不要求无关 checkout 干净。已有 branch/目录
 保留并报冲突；不 stash/reset、覆盖、删除、换名称或强推。Git stderr、remote 值不进入输出或记录。
 
 ### 续接与同 key 去重
 
-续接只要求 schema_version/key/prompt/callback，可带上述可选字段；不接受 repo/branch/worktree。
-须从最新一轮可信 launch 续接，保留 repo、branch、worktree、base、session、模型/profile。
+续接只要求 schema_version/key/prompt/callback，可带权限、模型选择及时限；不接受 repo_path/branch/worktree/base，
+即使 base 与原值相同也拒绝。须从最新一轮可信 launch 续接，保留 repo、branch、worktree、base 名称、
+完整 base_sha、session、模型/profile；不重新 fetch，不改向当前远端提交。
 省略权限沿保存值，显式覆盖只作用该轮。权限模式为 deny-all、approve-reads、approve-all，新任务
 默认 deny-all；approve-all 须已有该轮授权。policy 的 autoApprove/autoDeny/escalate 各最多 32 个
 非空规则，每条最多 256 字符；defaultAction 为 approve/deny/escalate。未知字段拒绝。
@@ -96,7 +100,8 @@ fetch 使用本次独立 ref，避免其他 fetch 改写 FETCH_HEAD；该 ref �
 
 私有 `.launches/task_<key摘要>.json` 保存输入指纹、选择、Git 身份和 task 关联，不另存 prompt
 或完整 callback。submit.lock 串行整个准备/提交链，Git 继承锁；同 key 并发只有一个提交者。
-同 key/完整同输入复用已提交的 task/request，异输入报 LAUNCH_CONFLICT。
+同 key/完整同输入复用已提交的 task/request，异输入报 LAUNCH_CONFLICT。新任务显式 base 参与输入指纹，
+省略与显式 `main` 也是不同输入；重试须保留原输入，不重新 fetch 或更改已保存的 SHA。
 
 Git 准备中断采取 **fail closed**：没有完整 task 关联的旧 claim 报 GIT_PREPARATION_INTERRUPTED。
 保留分支、目录和现场，人工核对后处理。没有分阶段自动续完、staging/rename/reflog 恢复协议。
@@ -104,6 +109,7 @@ task 已持久提交但响应丢失时，核对原关联，禁止再次 submit/s
 request 或补投原 body。原 queued 也不重新派发，而是如实封存未派发失败。
 
 成功响应包含 key/task_id/request_id/accepted/stage/reused、Git/session、selection 和权限摘要。
+`base` 返回 origin 分支名称，`base_sha` 返回本轮最初 fetch 的完整提交 SHA；续接返回原值。
 accepted=true 只证明持久意图和控制进程接管确认，或原任务已有结果且无待投递；不证明模型收到。
 ACK 等待最多 10 秒；丢失不能证明没有派发，不自动杀控制进程、换 key 或重发。
 失败退出 1，安全 JSON 包含 error.code/hint 和 outcome_unknown；保留原 key/输入/注册和现场。
@@ -112,6 +118,7 @@ ACK 等待最多 10 秒；丢失不能证明没有派发，不自动杀控制进
 
 仅支持当前 task.json 与 launch 记录 **version: 2**。task 必须有完整模型/config/profile、权限、
 createdAt、noProgressMs 和进展起点；结果单独存入 result，callback body/state 单独保存。
+已有 v2 launch 未存 base 时，沿其原约定按 main 返回及续接，保留已存 base_sha，不回填字段或迁移数据。
 旧 version=1、旧 callback/ACK/unknown 和所有 runtime/session/cache/private 数据不迁移、不改字节。
 不支持记录报 UNSUPPORTED_TASK_RECORD（launch 元数据为 UNSUPPORTED_LAUNCH_RECORD）。
 定向操作退出 1；list 列 errors/不完整 coverage；无参数 recover 明列 unsupported 并继续支持项。
