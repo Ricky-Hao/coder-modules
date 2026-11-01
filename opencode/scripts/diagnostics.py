@@ -60,7 +60,7 @@ def read_json(path, maximum=65536):
 def error_code(error):
     if isinstance(error, ReadError):
         known = {'UNSAFE_FILE', 'READ_LIMIT', 'FILE_CHANGED', 'INVALID_RECORD', 'OWNER_MISMATCH',
-                 'TASK_STORE_MISSING', 'INVALID_ARGUMENTS', 'DIRECTORY_READ_FAILED', 'CURSOR_STALE', 'INSTALLATION_MISMATCH'}
+                 'TASK_STORE_MISSING', 'INVALID_ARGUMENTS', 'INSTALLATION_MISMATCH'}
         return str(error) if str(error) in known else 'READ_FAILED'
     if isinstance(error, FileNotFoundError):
         return 'MISSING'
@@ -155,10 +155,7 @@ def doctor(root, launched_version=None, quick=False):
             with private_fd(root / 'bin' / tool, 8192) as (fd, info):
                 require(os.read(fd, 8193).decode() == install.wrapper(root, tool) and info.st_mode & 0o100)
         step('git_trust')
-        store = directory(root / 'runtime/git')
-        require(read_json(store / 'owner.json') == {'schema': 1, 'uid': os.getuid(), 'workspace_id': settings['workspace_id']})
-        with private_fd(store / 'known_hosts', 1024 * 1024):
-            pass
+        directory(root / 'runtime/git')
         step('module_profile')
         profile = profiles.information(settings.get('runtime_profile', 'none'),
                                        bool(os.environ.get('OPENCODE_MODULE_CONFIG')), os.environ, version)

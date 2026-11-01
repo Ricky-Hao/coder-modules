@@ -3,106 +3,74 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { TaskRunner, save } from "../scripts/task.mjs";
-import { listTasks, readJson, RECORD_BYTES } from "../scripts/task-read.mjs";
+import { TaskStore, save, readJson } from "../scripts/task.mjs";
+import { readyTask } from "./task-fixture.mjs";
 
-const callback = { callback_id: `tcb_${"q".repeat(43)}`, callback_url: "http://localhost:1/api/agents/task-callbacks" };
-const intent = { model: { id: 'codex/gpt-6.1-sol', variant: 'max' }, modelConfig: '/fixture/config.json', modelProfile: 'env' };
-function fixture(t, count = 1) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "task-read-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const runner = new TaskRunner({ root, now: () => 100000 });
-  const ids = Array.from({ length: count }, (_, index) => runner.submit({ ...intent, key: `key-${index}`, cwd: root,
-    prompt: "PRIVATE-PROMPT", callback, ...(index % 2 ? { session: "shared" } : {}) }).task_id);
-  for (const method of ["execute", "cancel", "deliver", "write"])
-    runner[method] = () => { throw new Error(`unexpected mutation: ${method}`); };
-  return { root, runner, ids, id: ids[0] };
+function fixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "thin-read-")); fs.chmodSync(root, 0o700);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true })); return new TaskStore(root);
 }
 function snapshot(root) {
   return Object.fromEntries(fs.readdirSync(root).sort().map((name) => {
     const file = path.join(root, name), info = fs.statSync(file);
-    return [name, info.isDirectory() ? snapshot(file) : [info.mode, info.mtimeMs, createHash("sha256").update(fs.readFileSync(file)).digest("hex")]];
+    return [name, info.isDirectory() ? snapshot(file) : [info.mode, info.mtimeMs, fs.readFileSync(file).toString()]];
   }));
 }
-
-test("list is sorted, filtered, bounded and read only; ordinary local files need no ownership inspection", (t) => {
-  const { root, runner, ids } = fixture(t, 24);
-  const changed = runner.load(ids[1]); changed.state = "running"; save(runner.filename(ids[1]), changed);
-  fs.chmodSync(runner.filename(ids[0]), 0o644);
-  const before = snapshot(root), page = listTasks(runner, { "--limit": "2" });
-  assert.deepEqual(page.items.map((item) => item.task_id), [...ids].sort().slice(0, 2));
-  assert.equal(page.truncated, true); assert.equal(page.records_checked, 2);
-  const filtered = listTasks(runner, { "--state": "running", "--session": "shared" });
-  assert.deepEqual(filtered.items.map((item) => item.task_id), [ids[1]]);
-  runner.status(ids[0]); runner.result(ids[0]);
-  assert.deepEqual(snapshot(root), before);
-  for (const secret of ["PRIVATE-PROMPT", callback.callback_id, callback.callback_url, '"output"'])
-    assert.equal(JSON.stringify(page).includes(secret), false);
-  for (const flags of [{ "--limit": "51" }, { "--limit": "0" }, { "--state": "secret" }, { "--session": callback.callback_id }])
-    assert.throws(() => listTasks(runner, flags), /INVALID_ARGUMENTS/);
+test("all records filtered before time sort/limit, including active record beyond 200 hashes", (t) => {
+  const store = fixture(t), tasks = Array.from({ length: 205 }, (_, index) => readyTask(store, { key: `key-${index}` }, { createdAt: index }));
+  const lastHash = [...tasks].sort((a, b) => a.id.localeCompare(b.id)).at(-1);
+  lastHash.phase = "dispatched"; lastHash.dispatchedAt = 123; lastHash.sessionKey = "selected"; store.write(lastHash);
+  fs.chmodSync(store.filename(tasks[0].id), 0o644);
+  const before = snapshot(store.root), list = store.list({ limit: 2 });
+  assert.deepEqual(list.items.map((task) => task.task_id), [tasks[204].id, tasks[203].id]); assert.equal(list.truncated, true);
+  assert.deepEqual(store.list({ phase: "dispatched", session: "selected" }).items.map((task) => task.task_id), [lastHash.id]);
+  store.summary(store.load(lastHash.id), { output: true });
+  assert.deepEqual(snapshot(store.root), before); assert.equal(JSON.stringify(list).includes("tcb_"), false);
+  assert.equal(JSON.stringify(list).includes("private fixture prompt"), false);
+  for (const value of [{ limit: 51 }, { limit: 0 }, { phase: "unknown" }]) assert.throws(() => store.list(value), /INVALID_ARGUMENTS/);
 });
-
-test("list caps records; malformed, missing, oversize and non-v3 records report safe errors", (t) => {
-  const { root, runner, ids } = fixture(t, 205);
-  const page = listTasks(runner, { "--limit": "50", "--state": "ambiguous" });
-  assert.equal(page.records_checked, 200); assert.equal(page.truncated, true);
-  fs.writeFileSync(runner.filename(ids[0]), '{"PRIVATE-RAW-ERROR":');
-  fs.unlinkSync(runner.filename(ids[1]));
-  save(runner.filename(ids[2]), { version: 2, id: ids[2] });
-  fs.truncateSync(runner.filename(ids[3]), RECORD_BYTES + 1);
-  for (const [id, code] of [[ids[0], "INVALID_TASK_RESULT"], [ids[1], "TASK_NOT_FOUND"], [ids[2], "UNSUPPORTED_TASK_RECORD"], [ids[3], "TASK_RECORD_TOO_LARGE"]])
-    assert.throws(() => runner.status(id), new RegExp(code));
-  const errors = listTasks(runner, { "--state": "ambiguous" }).errors;
-  assert.equal(errors.length, 4); assert.equal(JSON.stringify(errors).includes("PRIVATE-"), false);
-  const file = path.join(root, "atomic.json"); save(file, { n: 1 }); save(file, { n: 2 });
-  assert.deepEqual(readJson(file), { n: 2 });
+test("bad JSON is an error, not missing; per-record list errors remain visible", (t) => {
+  const store = fixture(t), tasks = [readyTask(store), readyTask(store), readyTask(store), readyTask(store)];
+  fs.writeFileSync(store.filename(tasks[0].id), '{"PRIVATE":'); fs.unlinkSync(store.filename(tasks[1].id));
+  save(store.filename(tasks[2].id), { version: 2 }); fs.truncateSync(store.filename(tasks[3].id), 2 * 1024 * 1024 + 1);
+  for (const [i, code] of ["INVALID_JSON", "TASK_NOT_FOUND", "INVALID_TASK_RECORD", "RECORD_TOO_LARGE"].entries())
+    assert.throws(() => store.load(tasks[i].id), new RegExp(code));
+  const list = store.list(); assert.equal(list.errors.length, 4); assert.equal(JSON.stringify(list).includes("PRIVATE"), false);
 });
-
-test("status separates callback handoff, request uncertainty and late canonical output", (t) => {
-  const { runner, id } = fixture(t), record = runner.load(id);
-  Object.assign(record, { state: "ambiguous", dispatchedAt: 10000, startedAt: 11000,
-    notificationAt: 20000, callbackDeliveredAt: 30000, notificationKind: "no_progress", callbackState: "delivered",
-    body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "error", output: "unknown notification" }),
-    executionError: "PRIVATE-RAW-ERROR", executionDetail: { reason: "PRIVATE-REASON", cause: "PRIVATE-CAUSE" } });
-  save(runner.filename(id), record);
-  const before = snapshot(runner.root), inspected = runner.status(id);
-  assert.equal(inspected.result_status, null); assert.equal(inspected.callback_status, "error");
-  assert.equal(inspected.callback_state, "delivered"); assert.equal(inspected.dispatch_state, "attempted");
-  assert.deepEqual(inspected.unknown_scope, ["request"]); assert.equal(inspected.execution_error, "UNKNOWN_RECORDED_CODE");
-  assert.equal(inspected.timing.terminal_at, null);
-  assert.equal(JSON.stringify(inspected).includes("PRIVATE-"), false); assert.deepEqual(snapshot(runner.root), before);
-  record.state = "completed"; record.result = { status: "success", output: "late canonical", truncated: false, at: 40000, source: "watchSession.turn_result", outputSource: "assistant_output" };
-  save(runner.filename(id), record);
-  assert.equal(runner.result(id).output, "late canonical"); assert.equal(runner.result(id).callback_output, "unknown notification");
+test("query reads no original input; canonical and callback output are independent", (t) => {
+  const store = fixture(t), task = readyTask(store); fs.unlinkSync(task.inputFile);
+  task.dispatchedAt = 1; task.phase = "finished"; task.output = { text: "late canonical", truncated: false };
+  task.result = { status: "success", source: "watchSession.turn_result", outputComplete: true }; store.write(task);
+  save(store.filename(task.id, "outbox.json"), { url: "https://private.invalid", state: "delivered", kind: "no_progress",
+    body: JSON.stringify({ version: 1, callback_id: `tcb_${"x".repeat(43)}`, status: "error", output: "outcome unknown" }) });
+  const before = snapshot(store.root), result = store.summary(store.load(task.id), { output: true });
+  assert.equal(result.output, "late canonical"); assert.equal(result.callback_output, "outcome unknown"); assert.equal(result.outcome_unknown, false);
+  assert.deepEqual(snapshot(store.root), before); assert.equal(JSON.stringify(result).includes("private.invalid"), false);
 });
-
-test("installed query/help ignore old namespace, never initialize or lock, and need no Provider", (t) => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "task-read-launcher-"));
-  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-  const root = path.join(base, "toolset"), version = path.join(root, "version");
+test("installed pure help/query never create stores, locks, config or read Provider credentials", (t) => {
+  const store = fixture(t), root = path.join(store.root, "toolset"), version = path.join(root, "version");
   for (const name of [version, path.join(root, "runtime/tasks"), path.join(root, "bin"), path.join(version, "node/bin")]) fs.mkdirSync(name, { recursive: true, mode: 0o700 });
   fs.copyFileSync(process.execPath, path.join(version, "node/bin/node"));
-  for (const name of ["runtime.py", "git_ssh.py", "safety.py", "profiles.py", "diagnostics.py", "task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-receipt.mjs"])
+  for (const name of ["runtime.py", "git_ssh.py", "profiles.py", "safety.py", "diagnostics.py", "task-cli.mjs", "task.mjs"])
     fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(version, name));
-  save(path.join(version, "settings.json"), { install_root: root, workspace_id: "readonly-fixture", runtime_profile: "env" });
-  fs.writeFileSync(path.join(root, "runtime/tasks", "do-not-scan"), "PRIVATE-OLD-TASK");
-  const query = (...args) => spawnSync("python3", ["-B", path.join(version, "runtime.py"), "opencode-task", ...args], { cwd: base,
-    env: { PATH: "/usr/bin:/bin", OPENCODE_MODULE_CONFIG: "/DO-NOT-OPEN/private-config" }, encoding: "utf8", timeout: 5000 });
+  save(path.join(version, "settings.json"), { install_root: root, workspace_id: "readonly", runtime_profile: "env" });
+  fs.writeFileSync(path.join(root, "runtime/tasks/old-private"), "preserve old namespace");
+  const call = (...args) => spawnSync("python3", ["-B", path.join(version, "runtime.py"), "opencode-task", ...args],
+    { env: { PATH: "/usr/bin:/bin", OPENCODE_MODULE_CONFIG: "/DO-NOT-READ/config" }, encoding: "utf8", timeout: 5000 });
   let before = snapshot(root);
-  for (const args of [[], ["--help"], ["-h"], ["launch", "--help"], ["status", "-h"], ["result", "--help"], ["list", "--help"], ["doctor", "--help"], ["recover", "--help"], ["cancel", "--help"]]) {
-    const response = query(...args); assert.equal(response.status, 0, response.stderr); assert.match(response.stdout, /approve-all/);
+  for (const args of [[], ["--version"], ["--help"], ["launch", "--help"], ["recover", "-h"], ["status", "--help"], ["doctor", "--help"]]) {
+    const response = call(...args); assert.equal(response.status, 0, response.stderr);
   }
-  const missing = query("list"); assert.equal(missing.status, 1); assert.equal(JSON.parse(missing.stderr).error.code, "TASK_STORE_MISSING");
-  assert.deepEqual(snapshot(root), before);
+  assert.equal(call("list").status, 1); assert.deepEqual(snapshot(root), before);
   const tasks = path.join(root, "runtime/tasks-v3"); fs.mkdirSync(tasks, { mode: 0o700 });
-  const runner = new TaskRunner({ root: tasks }), accepted = runner.submit({ ...intent, key: "readonly", prompt: "PRIVATE-PROMPT", callback, cwd: base });
-  before = snapshot(root);
-  for (const args of [["list"], ["status", accepted.task_id], ["result", accepted.task_id]]) {
-    const response = query(...args); assert.equal(response.status, 0, response.stderr);
-    assert.equal(response.stdout.includes("PRIVATE-"), false);
+  const current = new TaskStore(tasks), task = readyTask(current); before = snapshot(root);
+  for (const args of [["list"], ["status", task.id], ["result", task.id]]) {
+    const response = call(...args); assert.equal(response.status, 0, response.stderr);
+    assert.equal(response.stdout.includes("private fixture prompt"), false);
   }
-  assert.deepEqual(snapshot(root), before); assert.equal(fs.existsSync(path.join(tasks, "submit.lock")), false);
+  assert.deepEqual(snapshot(root), before);
+  assert.deepEqual(fs.readdirSync(path.dirname(current.filename(task.id))), ["task.json"]);
   assert.equal(fs.existsSync(path.join(root, "runtime/module-profiles")), false);
+  assert.equal(fs.readFileSync(path.join(root, "runtime/tasks/old-private"), "utf8"), "preserve old namespace");
 });

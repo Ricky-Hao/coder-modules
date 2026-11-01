@@ -248,7 +248,7 @@ class StartupTests(unittest.TestCase):
         self.fixture.bundle['config']['install_root'] = str(root)
         self.fixture.install()
         manifest = json.loads((root / 'active/installed.json').read_text())
-        for name in ('task.mjs', 'task-errors.mjs', 'task-read.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs'):
+        for name in ('task.mjs', 'task-worker.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs'):
             self.assertIn(name, manifest['files'])
         self.assertIn('opencode-task', {p.name for p in (root / 'bin').iterdir()})
         task = root / 'runtime/tasks' / ('task_' + 'a' * 64)
@@ -298,7 +298,7 @@ class StartupTests(unittest.TestCase):
         task_id = 'task_' + 'b' * 64
         task = root / 'runtime/tasks-v3' / task_id
         task.mkdir(mode=0o700, parents=True)
-        for name, value in (('task.json', {'state': 'queued'}), ('cancel.json', {'requested': True})):
+        for name, value in (('task.json', {'phase': 'ready'}), ('cancel.request', {'requested': True})):
             (task / name).write_text(json.dumps(value))
             (task / name).chmod(0o600)
         result = subprocess.run([str(root / 'bin/opencode-task'), '_run', task_id],

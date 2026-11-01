@@ -31,7 +31,6 @@ def environment(environ, root, profile='none', workspace_id=None, arguments=(), 
     if profile not in ('none', 'env'):
         raise ValueError('unknown runtime profile')
     child = filtered_environment(environ)
-    child = git_ssh.environment(child, root, VERSION)
     state = root / 'runtime'
     child.setdefault('PATH', '/usr/bin:/bin')
     child.update({'HOME': str(state / 'home'),
@@ -43,6 +42,7 @@ def environment(environ, root, profile='none', workspace_id=None, arguments=(), 
     model = task.get('model') if task else None
     if profiles.harmless(list(arguments)):
         return child
+    child = git_ssh.environment(child, root)
     config = None
     if config_path:
         # 不展开秘密；配置只保留 {env:NAME} 引用。
@@ -241,14 +241,14 @@ def main():
                 fcntl.flock(task_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 if '--ready' in arguments[2:]:
-                    os.write(3, b'ready\n')
+                    os.write(3, b'{"already_running":true}\n')
                 return
             os.set_inheritable(task_lock, True)
     if tool == 'opencode-task' and arguments[:1] == ['launch']:
         # Git 沿调用者的 HOME/SSH/PATH；选择和 agent 再走各自的模块环境。
         caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
         child = filtered_environment(os.environ, caller_paths)
-        child = git_ssh.environment(child, root, VERSION)
+        child = git_ssh.environment(child, root)
     else:
         child = environment(os.environ, root, profile, settings['workspace_id'], task_arguments, task)
     if tool == 'opencode' and 'acp' in arguments and not child.get('OPENCODE_ACP_REQUIRED_MODEL'):

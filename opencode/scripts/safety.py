@@ -81,17 +81,6 @@ def sync_directory(path):
 def git_trust(root, workspace):
     """Initialize only the module's private trust store; preserve existing keys."""
     store = root / 'runtime/git'
-    created = not os.path.lexists(store)
     directory(store, create=True)
-    if created:
-        write_json(store / 'owner.json', {'schema': 1, 'uid': os.getuid(), 'workspace_id': workspace})
-    owner(store, workspace)
-    file = store / 'known_hosts'
-    if not os.path.lexists(file):
-        with file.open('x'):
-            file.chmod(0o600)
-    regular(file)
-    if file.stat().st_mode & 0o077:
-        raise ValueError('Git trust must be private')
     sync_directory(store)
     sync_directory(store.parent)

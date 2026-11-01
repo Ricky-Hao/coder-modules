@@ -6,7 +6,8 @@ import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { TaskRunner } from "../scripts/task.mjs";
+import { TaskStore } from "../scripts/task.mjs";
+import { readyTask } from "./task-fixture.mjs";
 import { stopFixtureProcesses, finishFixture, recordFixtureSpawns, fixtureProcessSnapshot, processBirth } from "./cli-fixture.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts/", import.meta.url));
@@ -18,7 +19,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture");
     fs.mkdirSync(version, { recursive: true, mode: 0o700 });
-    for (const name of ["runtime.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-launch.mjs", "task-receipt.mjs", "task-cli.mjs", "task-acp.mjs"])
+    for (const name of ["runtime.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     const copiedCli = path.join(version, "task-cli.mjs");
     fs.writeFileSync(copiedCli, recordFixtureSpawns(fs.readFileSync(copiedCli, "utf8"), path.join(base, "drivers.ndjson")));
@@ -77,6 +78,12 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const inputFile = (value) => { const file = path.join(base, value.key + ".json"); write(file, value); return file; };
     const launch = (value, from) => checked(["launch", "--input-file", inputFile(value), ...(from ? ["--continue-from", from] : [])]);
     const load = (id) => JSON.parse(fs.readFileSync(path.join(root, "runtime/tasks-v3", id, "task.json"), "utf8"));
+    const cancel = (id) => {
+      const response = cli(["cancel", id]);
+      if (response.status) assert.equal(JSON.parse(response.stderr).error.code, "CANCEL_UNCONFIRMED", response.stderr);
+      assert.equal(fs.existsSync(path.join(root, "runtime/tasks-v3", id, "cancel.request")), true);
+    };
+    const box = (id) => { try { return JSON.parse(fs.readFileSync(path.join(root, "runtime/tasks-v3", id, "outbox.json"), "utf8")); } catch (error) { if (error.code !== "ENOENT") throw error; } };
     const controls = (id) => fixtureProcessSnapshot(base).filter((proof) => proof.role === "_run" && proof.taskId === id && proof.same_birth && !["Z", "X"].includes(proof.state));
     const killControl = async (id) => {
       const proofs = controls(id); assert.equal(proofs.length, 1); const proof = proofs[0];
@@ -88,19 +95,19 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const firstInput = input("first", "model selection", "a", { base: "rickyhao/stable" }), first = launch(firstInput);
       assert.equal(first.base_sha, baseSha); assert.equal(first.accepted, true);
       assert.equal(first.base, "rickyhao/stable");
-      await until(() => load(first.task_id).attempts === 1, "lost receipt persisted");
-      const exact = load(first.task_id).body; await killControl(first.task_id);
+      await until(() => box(first.task_id)?.attempts === 1, "lost receipt persisted");
+      const exact = box(first.task_id).body; await killControl(first.task_id);
       const attempts = seen.length; await pause(300); assert.equal(seen.length, attempts);
       checked(["recover", first.task_id]);
-      await until(() => load(first.task_id).callbackState === "delivered", "explicit outbox recover");
-      assert.equal(load(first.task_id).body, exact);
+      await until(() => box(first.task_id)?.state === "delivered", "explicit outbox recover");
+      assert.equal(box(first.task_id).body, exact);
       const selected = JSON.parse(checked(["result", first.task_id]).output);
       assert.equal(selected.model, "codex/gpt-6.1-sol"); assert.equal(selected.effort, "max");
       assert.equal(selected.title.variant, "low");
       assert.equal(launch(firstInput).request_id, first.request_id);
       const follow = launch({ schema_version: 1, key: "follow", prompt: "continuity", callback: callback("b") }, first.task_id);
       assert.equal(follow.base, first.base); assert.equal(follow.base_sha, first.base_sha);
-      await until(() => load(follow.task_id).callbackState === "delivered", "trusted followup");
+      await until(() => box(follow.task_id)?.state === "delivered", "trusted followup");
       assert.equal(checked(["result", follow.task_id]).output, "Session turn 2");
       assert.equal(load(follow.task_id).handle.backendSessionId, load(first.task_id).handle.backendSessionId);
 
@@ -112,7 +119,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       ]) {
         const selected = launch({ schema_version: 1, key, prompt: "write fixture", callback: callback(letter),
           ...(permissions ? { permissions } : {}) }, prior);
-        await until(() => load(selected.task_id).callbackState === "delivered", "per-turn permissions");
+        await until(() => box(selected.task_id)?.state === "delivered", "per-turn permissions");
         assert.match(checked(["result", selected.task_id]).output, allowed ? /Write permitted/ : /Write denied/);
         assert.equal(fs.existsSync(path.join(follow.worktree, "authorized-write.txt")), allowed);
         prior = selected.task_id;
@@ -120,6 +127,8 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
 
       const waiting = launch(input("waiting", "wait for cancellation", "c", { no_progress_timeout_seconds: 10 }));
       await until(() => load(waiting.task_id).startedAt, "waiting started");
+      await until(() => lines(env.TASK_FIXTURE_EVENT_LOG).some((event) => event.type === "prompt_received" &&
+        event.sessionId === load(waiting.task_id).handle.backendSessionId), "original prompt received");
       assert.equal(controls(waiting.task_id).length, 1);
       for (const name of ["monitor.lock", "worker.lock", "monitor.json", "worker.json"])
         assert.equal(fs.existsSync(path.join(root, "runtime/tasks-v3", waiting.task_id, name)), false);
@@ -134,7 +143,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => controls(waiting.task_id).length === 1, "duplicate recover exits without lock");
       assert.equal(controls(waiting.task_id).length, 1);
       assert.equal(controls(waiting.task_id)[0].pid, observer.pid);
-      checked(["cancel", waiting.task_id]);
+      cancel(waiting.task_id);
       await until(() => load(waiting.task_id).result?.status === "cancelled", "canonical cancel");
       assert.equal(load(waiting.task_id).requestId, requestId);
       assert.equal(fs.readFileSync(env.TASK_FIXTURE_LOG, "utf8").trim().split("\n").length, executionCount);
@@ -143,22 +152,23 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => load(late.task_id).startedAt, "controlled started");
       const sessionId = load(late.task_id).handle.backendSessionId;
       fs.writeFileSync(path.join(progress, sessionId + ".stall"), "stall");
-      await until(() => load(late.task_id).callbackState === "delivered", "one unknown callback");
-      const body = load(late.task_id).body, posts = seen.length;
+      await until(() => box(late.task_id)?.state === "delivered", "one unknown callback");
+      const body = box(late.task_id).body, posts = seen.length;
       assert.equal(checked(["status", late.task_id]).result_status, null);
       const busy = cli(["launch", "--input-file", inputFile({ schema_version: 1, key: "busy", prompt: "next", callback: callback("f") }), "--continue-from", late.task_id]);
       assert.equal(JSON.parse(busy.stdout).error.code, "CONTINUE_BUSY_OR_UNKNOWN");
       fs.writeFileSync(path.join(progress, sessionId + ".finish"), "finish");
       await until(() => load(late.task_id).result?.status === "success", "late canonical");
       assert.equal(checked(["result", late.task_id]).output, "Controlled result");
-      assert.equal(load(late.task_id).body, body); assert.equal(seen.length, posts);
+      assert.equal(box(late.task_id).body, body); assert.equal(seen.length, posts);
 
       // 同一 session 的请求级 queued cancel；另一条 queued 请求继续执行。
       const source = load(late.task_id);
-      const runner = new TaskRunner({ root: path.join(root, "runtime/tasks-v3") });
-      const internal = (key, prompt, letter) => runner.submit({ key, cwd: source.cwd, prompt, callback: callback(letter), session: source.sessionName,
-        ...Object.fromEntries(["model", "modelConfig", "modelProfile"].map((name) => [name, source[name]])), continuationHandle: source.handle,
-        noProgressMs: 15000 }).task_id;
+      const store = new TaskStore(path.join(root, "runtime/tasks-v3"));
+      const internal = (key, prompt, letter) => readyTask(store, { key, prompt, callback: callback(letter) },
+        { cwd: source.cwd, sessionKey: source.sessionKey,
+          ...Object.fromEntries(["model", "modelConfig", "modelProfile"].map((name) => [name, source[name]])),
+          continueFrom: source.id, handle: source.handle, noProgressMs: 15000 }).id;
       const active = internal("active", "wait for cancellation", "g");
       // 只此隔离测试通过内部原语派发排队请求，公开 submit 始终删除。
       const runInternal = (id) => {
@@ -170,10 +180,10 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const cancelled = internal("queued-cancel", "continuity", "h"), survivor = internal("queued-survivor", "continuity", "i");
       runInternal(cancelled); runInternal(survivor);
       await until(() => load(cancelled).dispatchedAt && load(survivor).dispatchedAt, "two requests queued");
-      checked(["cancel", cancelled]);
+      cancel(cancelled);
       await until(() => load(cancelled).result?.status === "cancelled", "queued canonical cancel");
       assert.equal(load(active).result, undefined); assert.equal(load(survivor).result, undefined);
-      checked(["cancel", active]);
+      cancel(active);
       await until(() => load(survivor).result?.status === "success", "other queued survived");
 
       // 两个公开 launch 竞争同一 key；整个准备/提交链只有一个提交者。
@@ -183,7 +193,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
         let out = "", err = ""; child.stdout.on("data", (data) => { out += data; }); child.stderr.on("data", (data) => { err += data; });
         child.once("error", reject); child.once("close", (status) => {
           const value = JSON.parse(out);
-          if (status) assert.equal(value.error.code, "GIT_PREPARATION_INTERRUPTED", err);
+          if (status) assert.equal(value.error.code, "PREPARATION_INCOMPLETE", err);
           resolve(value);
         });
       });
@@ -209,24 +219,22 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     }, (value) => t.diagnostic(JSON.stringify(value)));
   });
 
-test("CLI reports partial recovery ACK and setup failure without generic read hints or secret stderr", { timeout: 15000 }, async (t) => {
+test("CLI recovery errors stay safe; cancel intent persists before broken adapter import", { timeout: 15000 }, async (t) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-errors-")); fs.chmodSync(base, 0o700);
   const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture"), tasks = path.join(root, "runtime/tasks-v3");
   for (const directory of [version, tasks]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  for (const name of ["task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs", "task-receipt.mjs"])
+  for (const name of ["task-cli.mjs", "task.mjs"])
     fs.copyFileSync(path.join(scripts, name), path.join(version, name));
   const cliFile = path.join(version, "task-cli.mjs");
   fs.writeFileSync(cliFile, recordFixtureSpawns(fs.readFileSync(cliFile, "utf8"), path.join(base, "drivers.ndjson")));
   fs.writeFileSync(path.join(version, "settings.json"), JSON.stringify({ install_root: root }), { mode: 0o600 });
-  const runner = new TaskRunner({ root: tasks });
-  const ids = ["first", "second"].map((key) => runner.submit({ key, cwd: base, prompt: "PRIVATE-PROMPT", callback: {
-    callback_id: `tcb_${"x".repeat(43)}`, callback_url: "http://127.0.0.1:1/api/agents/task-callbacks" },
-    model: { id: "fixture/test" }, modelConfig: "/fixture/config", modelProfile: "external" }).task_id).sort();
+  const store = new TaskStore(tasks);
+  const ids = ["first", "second"].map((key) => readyTask(store, { key }).id).sort();
   fs.writeFileSync(path.join(version, "runtime.py"), `import os, sys
 if sys.argv[3] == ${JSON.stringify(ids[1])}:
     print('PTC_TOOL_FAILED 502 EAGAIN PRIVATE-STDERR', file=sys.stderr)
     sys.exit(1)
-os.write(3, b'ready\\n')
+os.write(3, b'{"accepted":true}\\n')
 `);
   const call = (...args) => spawnSync(process.execPath, [cliFile, ...args], { cwd: base, env: { PATH: process.env.PATH }, encoding: "utf8", timeout: 10000 });
   let primaryError;
@@ -234,26 +242,15 @@ os.write(3, b'ready\\n')
     const recovering = call("recover"), value = JSON.parse(recovering.stderr);
     assert.equal(recovering.status, 1); assert.equal(value.error.code, "CONTROL_ACK_UNKNOWN");
     assert.equal(value.error.reason, "process_exit"); assert.equal(value.error.stage, "control"); assert.equal(value.error.field, "control_ack");
-    assert.equal(value.recovery_confirmed, 1); assert.equal(value.task_recorded, true); assert.equal(value.outcome_unknown, true);
-    assert.equal(value.error.task_id, ids[1]); assert.equal(recovering.stderr.includes("PRIVATE-"), false);
-    const record = runner.load(ids[1]); record.state = "running"; record.dispatchedAt = 1; runner.write(record);
-    fs.writeFileSync(path.join(version, "task-acp.mjs"), 'export function createTaskRuntime() { throw new Error("PRIVATE-SETUP provider auth policy denied"); }\n');
+    assert.equal(recovering.stderr.includes("PRIVATE-"), false);
+    const record = store.load(ids[1]); record.phase = "dispatched"; record.dispatchedAt = 1;
+    record.handle = { backend: "acpx-shared", cwd: record.cwd, sessionKey: record.sessionKey, acpxRecordId: "fixture-record", backendSessionId: "fixture-session" }; store.write(record);
+    fs.writeFileSync(path.join(version, "task-acp.mjs"), 'throw new Error("PRIVATE-SETUP provider auth policy denied");\n');
     const cancelled = call("cancel", ids[1]), error = JSON.parse(cancelled.stderr);
-    assert.equal(cancelled.status, 1); assert.equal(error.error.code, "TASK_OPERATION_FAILED");
-    assert.equal(error.error.stage, "setup"); assert.equal(error.error.category, "unknown");
-    assert.equal(error.task_recorded, true); assert.equal(error.outcome_unknown, true);
-    assert.equal(cancelled.stderr.includes("PRIVATE-"), false); assert.equal(runner.result(ids[1]).result_status, null);
-    fs.writeFileSync(path.join(version, "runtime.py"), `import os
-with open(${JSON.stringify(runner.filename(ids[1]))}, 'w') as record:
-    record.write('{"PRIVATE-RECORD":')
-os.write(3, b'ready\\n')
-`);
-    const changed = call("recover"), read = JSON.parse(changed.stderr);
-    assert.equal(changed.status, 1); assert.equal(read.error.code, "INVALID_TASK_RESULT");
-    assert.equal(read.error.stage, "read"); assert.equal(read.error.field, "task_record");
-    assert.equal(read.error.task_id, ids[1]); assert.equal(read.error.request_id, undefined);
-    assert.equal(read.task_recorded, null); assert.equal(read.outcome_unknown, true); assert.equal(read.recovery_confirmed, 1);
-    assert.equal(changed.stderr.includes("PRIVATE-"), false);
+    assert.equal(cancelled.status, 1); assert.equal(error.error.code, "CANCEL_UNCONFIRMED");
+    assert.equal(error.error.stage, "cancel");
+    assert.deepEqual(JSON.parse(fs.readFileSync(store.filename(ids[1], "cancel.request"))), { requested: true });
+    assert.equal(cancelled.stderr.includes("PRIVATE-"), false); assert.equal(store.summary(store.load(ids[1])).result_status, null);
   } catch (error) { primaryError = error; t.diagnostic(`retained fixture: ${base}`); }
   await finishFixture(primaryError, async () => { await stopFixtureProcesses(base, version); if (!primaryError) fs.rmSync(base, { recursive: true }); },
     (value) => t.diagnostic(JSON.stringify(value)));

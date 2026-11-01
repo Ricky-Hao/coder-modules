@@ -7,8 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { createSharedAcpRuntime, createAgentRegistry } from "acpx/runtime";
 import { l as readQueueOwnerRecord } from "acpx/dist/ipc-BbYFsKOj.js";
-import { privateFile } from "./task.mjs";
-import { TaskError, errorCode } from "./task-errors.mjs";
+import { TaskError } from "./task.mjs";
 
 const installed = createRequire(import.meta.url)("acpx/package.json").version;
 async function cancelOriginal(recordId, targetRequestId) {
@@ -56,11 +55,15 @@ async function cancelOriginal(recordId, targetRequestId) {
     socket.once("close", () => finish(true));
   });
 }
+export function cancelTask(record) {
+  const handle = record.handle;
+  if (!record.requestId || !handle || handle.backend !== "acpx-shared" || handle.cwd !== record.cwd || handle.sessionKey !== record.sessionKey || !handle.acpxRecordId)
+    throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "cancel", field: "session" });
+  return cancelOriginal(handle.acpxRecordId, record.requestId);
+}
 export function createTaskRuntime(root, record) {
   if (installed !== "0.21.1") throw new TaskError("UNSUPPORTED_ACPX_RUNTIME", { stage: "setup", field: "installation" });
-  const { permissions, model } = record; // TaskRunner.load 已校验当前格式。
-  try { privateFile(record.modelConfig); }
-  catch (error) { throw new TaskError(errorCode(error, error?.code === "ENOENT" ? "TASK_MODEL_CONFIG_REQUIRED" : "TASK_READ_FAILED"), { stage: "setup", field: "model_config", reason: error?.code }); }
+  const { permissions, model } = record;
   const argv = [path.join(root, "bin/opencode"), "--module-task", record.modelConfig,
     model.id, model.variant ?? "", record.modelProfile, "acp"];
   const runtime = createSharedAcpRuntime({
@@ -76,9 +79,9 @@ export function createTaskRuntime(root, record) {
   const ensure = runtime.ensureSession.bind(runtime);
   runtime.ensureSession = async (input) => {
     const existing = await runtime.findSession(input);
-    if (record.continuationHandle) {
+    if (record.continueFrom) {
       if (!existing || ["acpxRecordId", "backendSessionId", "cwd", "sessionKey", "backend"]
-          .some((name) => existing[name] !== record.continuationHandle[name])) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" });
+          .some((name) => existing[name] !== record.handle[name])) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" });
       return existing; // 可信续接沿原选择，不控制正在运行或排队的 turn。
     }
     if (existing) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "setup", field: "session" }); // 不接管手工 session。
@@ -90,15 +93,8 @@ export function createTaskRuntime(root, record) {
     return handle;
   };
   runtime.cancelRequest = async ({ handle, requestId }) => {
-    if (
-      handle.backend !== "acpx-shared" ||
-      handle.cwd !== record.cwd ||
-      handle.sessionKey !== record.sessionKey ||
-      !handle.acpxRecordId ||
-      requestId !== record.requestId
-    )
-      throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "cancel", field: "session" });
-    return cancelOriginal(handle.acpxRecordId, requestId);
+    if (requestId !== record.requestId) throw new TaskError("SESSION_IDENTITY_CONFLICT", { stage: "cancel", field: "request" });
+    return cancelTask({ ...record, handle });
   };
   return runtime;
 }

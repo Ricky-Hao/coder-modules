@@ -1,5 +1,6 @@
 """普通 UID 的隔离验收；由 test_nonroot.py 准备并降权。"""
 import http.server
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,13 @@ def main(work, node, pvc):
         root = fixture.root
         version = (root / 'active').resolve()
         assert root.stat().st_uid == 65534 and root.stat().st_mode & 0o777 == 0o700
+        trust = root / 'runtime/git'
+        saved = subprocess.run(['python3', '-B', str(version / 'git_ssh.py'), '_remember', 'HOSTNAME', 'nonroot.invalid', 'ssh-ed25519', 'A' * 44],
+                               env={'PATH': '/usr/bin:/bin', 'OPENCODE_GIT_TRUST': str(trust)}, capture_output=True, timeout=10)
+        assert saved.returncode == 0
+        host = trust / (hashlib.sha256(b'nonroot.invalid').hexdigest() + '.host')
+        before = host.read_bytes(); fixture.install()
+        assert host.read_bytes() == before and host.stat().st_uid == 65534 and host.stat().st_mode & 0o777 == 0o600
         # 只读路径使用真实私有 Node；不模拟 Node 的命令投影。
         shutil.copyfile(node, version / 'node/bin/node')
         (version / 'node/bin/node').chmod(0o700)
@@ -82,24 +90,27 @@ def main(work, node, pvc):
             task.mkdir(mode=0o700)
             record = task / 'task.json'
             record.write_text(json.dumps({'version': 3, 'id': task_id, 'requestId': 'fixture-request',
-                'cwd': str(work), 'prompt': 'synthetic prompt', 'sessionKey': 'fixture-session',
+                'cwd': str(work), 'inputFile': str(work / 'unread-private-input'), 'inputHash': 'a' * 64, 'sessionKey': 'fixture-session',
+                'git': {'repo': str(work), 'worktree': str(work), 'branch': 'fixture', 'base': 'main', 'baseSha': 'a' * 40},
                 'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
                 'modelConfig': str(root / 'runtime/fixture-config.json'), 'modelProfile': 'env',
                 'permissions': {'mode': 'deny-all', 'policy': {}}, 'createdAt': 1000,
-                'progress': {'at': 1000, 'tick': 0, 'clock': None}, 'noProgressMs': 900000,
-                'result': {'status': 'success', 'output': 'sealed fixture output', 'truncated': False,
-                           'at': 2000, 'source': 'turn.result', 'outputSource': 'assistant_output'},
-                'state': 'completed', 'callbackState': 'outbox', 'notificationKind': 'request_result', 'callback': {'callback_id': 'tcb_' + 'q' * 43,
-                'callback_url': f'http://127.0.0.1:{server.server_port}/api/agents/task-callbacks'},
+                'progress': {'at': 1000, 'tick': 0, 'boot': None}, 'noProgressMs': 900000,
+                'result': {'status': 'success', 'outputComplete': True, 'at': 2000, 'source': 'turn.result'},
+                'output': {'text': 'sealed fixture output', 'truncated': False}, 'phase': 'finished'}))
+            outbox = task / 'outbox.json'
+            outbox.write_text(json.dumps({'state': 'pending', 'kind': 'request_result',
+                'url': f'http://127.0.0.1:{server.server_port}/api/agents/task-callbacks',
                 'body': json.dumps({'version': 1, 'callback_id': 'tcb_' + 'q' * 43,
                                     'status': 'success', 'output': 'sealed fixture output'}), 'nextAttemptAt': 0}))
+            outbox.chmod(0o600)
             record.chmod(0o600)
             before = snapshot(root)
             page = query('list')
             assert page['items'] and page['items'][0]['task_id'] == task_id, page['errors']
             inspected = query('status', task_id)
             assert inspected['result_status'] == 'success'
-            assert inspected['callback_state'] == 'outbox'
+            assert inspected['callback_state'] == 'pending'
             assert snapshot(root) == before and not calls
             record.chmod(0o640)
             assert query('status', task_id)['result_status'] == 'success'

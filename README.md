@@ -35,7 +35,7 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
    续接保留原 SHA、session 和选择。
    新 launch 默认 approve-all；continue 沿保存权限。受理不等于 started。
    task 仅用 `runtime/tasks-v3`；旧目录保留且不扫描。旧 submit/resolve 已删除。
-   launch/status 直接提供安全回执、查询命令和 claim-only 准备摘要。
+   launch/status 直接提供安全事实与查询命令；task 单记录保留准备现场，worker 只派发一次。
 
 e.g.
 

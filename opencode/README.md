@@ -116,6 +116,7 @@ python3 -B opencode/build_bundle.py --check
 同时验证首次/缓存启动和数据保留，确认不自动恢复任务。历史 E2BIG 及旧体积记录见 [UPGRADE.md](UPGRADE.md)。
 
 源码不做 minify。每次维护须重新生成无损源码包并 render 全部配置；较长 settings 可被 plan 拒绝。
+生成包使用标准 XZ/LZMA2 的文本参数（pb=0、1 MiB 字典），解包仍逐字节核对源码摘要。
 预算始终为 **65536 字节**；交付报告记录本轮 payload 和实际 Terraform 字节数。
 
 ## 固定工具与输入
@@ -186,7 +187,7 @@ Context7 默认 `Authorization: Bearer {env:CONTEXT7_MCP_API_KEY}`；其余默�
 拒绝控制/非 ASCII、JSON 插值字符、URL 用户信息/query/fragment/坏端口。
 Provider 须用 HTTPS，loopback 可 HTTP；MCP 支持 HTTP(S)，需要传输保密时使用 HTTPS。
 错误只列变量名。0600 内容寻址配置位于 `runtime/module-profiles`，在自动发现目录外；
-安全父目录锁覆盖首次目录和 owner 创建，已有无标记/外来状态拒绝接管。
+文件排他原子发布并核对原字节，无目录锁或重复 owner；已有不安全文件、链接和变化内容拒绝使用。
 
 非空 `OPENCODE_MODULE_CONFIG` 优先于内置 profile。`none` 无外部配置时保留显式
 ACP readiness 模型/环境契约；任务 launch 仍须有完整模型配置。help/version 不要求凭据。
@@ -201,9 +202,14 @@ ACP、交互式 OpenCode 和指定旧 session 的 run 沿原生/保存选择，�
 <a id="git-ssh"></a>
 ## Git SSH
 
-模块初始化建立私有 `runtime/git/known_hosts`。launch 及模块启动的 OpenCode/acpx 模型工具 Git
-共用一个小型 SSH 适配入口，保留注入的 Coder gitssh 身份命令、普通参数和 PATH；不导出认证私钥或 Token，不改 HTTPS。
-仅这些子进程的 `GIT_SSH_COMMAND` 指向适配器，不改设备 SSH、用户 `.ssh` 或全局 SSH 设置。
+模块初始化建立私有 `runtime/git/`。每个实际 lookup host/port 或 HostKeyAlias 用固定 SHA256 文件名独立保存一条公共 key，
+不同目标并发不会覆盖彼此；同目标最后一次 atomic replace 胜出，无额外锁或集中全库读写。
+launch 及模块启动的 OpenCode/acpx 模型工具 Git 共用一个小型 SSH 适配入口，保留继承 PATH。
+固定支持当前 Workspace 注入的 `executable gitssh --`，也可显式提供 OpenSSH 命令或 GIT_SSH。
+GIT_SSH_COMMAND 的原身份和参数保留，只在这些子环境指向适配器；不复制认证材料。
+没有 `bin/git`、通用 shell/wrapper 或 core.sshCommand 解析层。仅靠隐式 core.sshCommand 选择身份
+不受支持：未提供显式 SSH 命令时，SSH 操作报 SSH_OPTIONS_UNSUPPORTED，避免静默改换身份。
+不改设备 SSH、用户 `.ssh` 或全局 SSH 设置，不改 HTTPS。
 envbuilder 在 Agent 启动前的首次 clone 不在此范围。
 
 适配器用原生 OpenSSH `KnownHostsCommand` 得到本次协商的公共 key 和实际 host/port 或 HostKeyAlias，
@@ -211,12 +217,15 @@ envbuilder 在 Agent 启动前的首次 clone 不在此范围。
 按用户选择自动信任变化 key 会降低主机身份保证。此策略无需静态 GitHub/Gitea 种子：首次连接直接保存本次 key，安装时不联网获取 key。
 不将公开服务器 key 当成认证私钥，不输出 key、remote、凭据或任意 stderr。
 
-身份、代理、端口、HostKeyAlias 等调用者参数原样传递。显式 UserKnownHostsFile、GlobalKnownHostsFile、
+身份、端口、HostKeyAlias 等受支持参数原样传递。显式 UserKnownHostsFile、GlobalKnownHostsFile、
 StrictHostKeyChecking 保留；这些文件只读，本次 key 由 hook 另存到模块信任文件。
 调用者显式 KnownHostsCommand、UpdateHostKeys 或 VerifyHostKeyDNS 会报固定 SSH_OPTIONS_UNSUPPORTED，
 避免拼接未知 hook、写调用者文件或绕过本次 key 的记录。缺省模块选项优先于 ssh_config。
-只支持 OpenSSH 兼容参数；其他 Git SSH variant 和带 shell 控制操作符的命令明确拒绝。
-首次/缓存初始化保留已记 key；不扫描旧任务、不递归 chown 旧卷。doctor 仅核必要信任文件的私有属性，不联系远端。
+只接受当前 Coder 命令形态或显式 OpenSSH 的少量常用参数（-o/-p/-i/-F/-l、-v/-G/-T/-q/-4/-6），识别 `-vo...`。
+其他 Git SSH variant、未知 wrapper 参数、shell 控制操作符或需 shell 展开的复杂身份命令明确拒绝。
+主机证书由 hook 成功返回空内容，沿 OpenSSH 既有 known_hosts/CA 与原生回退规则；模块不自动信任或保存证书。
+hook 的代码位置和信任路径经环境传给 Python，不经 OpenSSH 再展开；支持字面量 `${HOME}`、空格、引号和 `%`。
+首次/缓存初始化保留已记 key；不扫描旧任务、不递归 chown 旧卷。doctor 只核必要信任目录，无重复 owner 或全库扫描，不联系远端。
 
 <a id="validation-and-publication-boundary"></a>
 ## 验证与交付边界

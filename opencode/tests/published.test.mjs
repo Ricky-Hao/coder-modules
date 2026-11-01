@@ -7,7 +7,9 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { createSharedAcpRuntime, createAgentRegistry } from "../scripts/node_modules/acpx/dist/runtime.js";
-import { TaskRunner } from "../scripts/task.mjs";
+import { TaskStore } from "../scripts/task.mjs";
+import { TaskWorker } from "../scripts/task-worker.mjs";
+import { readyTask } from "./task-fixture.mjs";
 
 for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider}: HTTP 200 response.failed becomes request failure; same session can continue`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
@@ -78,26 +80,29 @@ for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider
     };
     const taskRoot = path.join(base, "tasks");
     fs.mkdirSync(taskRoot, { mode: 0o700 });
-    const runner = new TaskRunner({ root: taskRoot, runtime, pollMs: 100, noProgressMs: 30000 });
+    const store = new TaskStore(taskRoot);
     let handle;
     try {
-      const submit = (key, letter) => runner.submit({ key, cwd: base, prompt: "Synthetic fixture: answer one short sentence.", session: "original",
-        model: { id: `${provider}/gpt-6.1-sol`, variant: 'max' }, modelConfig: configFile, modelProfile: 'external',
-        callback: { callback_id: `tcb_${letter.repeat(43)}`, callback_url: endpoint + "/api/agents/task-callbacks" } }).task_id;
+      const submit = (key, letter) => readyTask(store, { key, prompt: "Synthetic fixture: answer one short sentence.",
+        callback: { callback_id: `tcb_${letter.repeat(43)}`, callback_url: endpoint + "/api/agents/task-callbacks" } },
+        { cwd: base, sessionKey: "original", noProgressMs: 30000, model: { id: `${provider}/gpt-6.1-sol`, variant: 'max' }, modelConfig: configFile });
       const failed = submit("failed-response", "f");
-      await runner.execute(failed);
-      handle = runner.load(failed).handle;
-      assert.equal(runner.result(failed).result_status, "error");
-      assert.equal(runner.result(failed).evidence.terminal_source, "watchSession.turn_result");
-      assert.equal(runner.result(failed).output.includes("Synthetic response stream failure"), false);
-      await runner.deliver(runner.load(failed));
+      const worker = () => new TaskWorker(store, { runtime, pollMs: 100 });
+      // This fixture deliberately reuses the native client for a second turn;
+      // production workers each detach their own client at exit.
+      const shutdown = runtime.shutdown.bind(runtime); runtime.shutdown = async () => {};
+      await worker().run(failed); handle = failed.handle;
+      const firstResult = store.summary(failed, { output: true });
+      assert.equal(firstResult.result_status, "error");
+      assert.equal(firstResult.terminal_source, "watchSession.turn_result");
+      assert.equal(firstResult.callback_output.includes("Synthetic response stream failure"), false);
       failing = false;
       const success = submit("followup", "s");
-      await runner.execute(success);
-      assert.equal(runner.result(success).result_status, "success", JSON.stringify({ status: runner.status(success), calls, journalEvents }));
-      assert.equal(runner.result(success).output, "Published loopback result");
-      assert.equal(runner.load(success).handle.acpxRecordId, handle.acpxRecordId);
-      await runner.deliver(runner.load(success));
+      await worker().run(success);
+      assert.equal(store.summary(success).result_status, "success", JSON.stringify({ calls, journalEvents }));
+      assert.equal(store.summary(success, { output: true }).output, "Published loopback result");
+      assert.equal(success.handle.acpxRecordId, handle.acpxRecordId);
+      runtime.shutdown = shutdown;
       assert.equal(notifications.length, 2);
       assert.ok(calls.includes("max"));
     } finally {

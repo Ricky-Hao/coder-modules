@@ -36,7 +36,10 @@ def main():
         if value['sha256'] != digest or lzma.decompress(base64.b64decode(value['data'], validate=True)) != source:
             sys.exit('OpenCode source bundle is stale or damaged; run python3 -B opencode/build_bundle.py')
     else:
-        target.write_text(json.dumps({'sha256': digest, 'data': base64.b64encode(lzma.compress(source)).decode()},
+        # 标准 XZ/LZMA2；文本无需位置对齐，1 MiB 字典足够当前源码，不改原文。
+        compressed = lzma.compress(source, filters=[{'id': lzma.FILTER_LZMA2, 'preset': 9 | lzma.PRESET_EXTREME,
+                                                   'dict_size': 1 << 20, 'pb': 0}])
+        target.write_text(json.dumps({'sha256': digest, 'data': base64.b64encode(compressed).decode()},
                                      indent=2) + '\n')
 
 
