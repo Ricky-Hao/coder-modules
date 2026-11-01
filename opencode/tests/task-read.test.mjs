@@ -193,7 +193,9 @@ test("status separates callback notification from canonical result without readi
     notificationAt: 20000, callbackDeliveredAt: 30000, attempts: 2,
     notificationKind: "no_progress", callbackState: "delivered",
     body: JSON.stringify({ version: 1, callback_id: callback.callback_id, status: "error", output: "PRIVATE-OUTPUT" }),
-    executionError: "PRIVATE-RAW-ERROR", deliveryError: "PRIVATE-RAW-ERROR" });
+    executionError: "PRIVATE-RAW-ERROR", deliveryError: "PRIVATE-RAW-ERROR",
+    executionDetail: { stage: "PRIVATE-STAGE", field: "PRIVATE-FIELD", reason: "PRIVATE-REASON", hint: "PRIVATE-HINT", cause: "PRIVATE-CAUSE" },
+    deliveryDetail: { environment_names: ["CODEX_API_KEY", "PRIVATE-NAME"], stack: "PRIVATE-STACK", http_status: "PRIVATE-STATUS" } });
   save(runner.filename(id), record);
   save(runner.filename(id, "monitor.json"), { at: 1000, workerAssessment: "suspected", workerSuspectedAt: 500 });
   save(runner.filename(id, "worker.json"), { at: 110000 });
@@ -203,9 +205,11 @@ test("status separates callback notification from canonical result without readi
   assert.equal(inspected.callback_status, "error");
   assert.equal(inspected.callback_state, "delivered");
   assert.equal(inspected.delivery_error, "UNKNOWN_RECORDED_CODE");
+  assert.equal(inspected.execution_diagnostic.category, "unknown"); assert.equal(inspected.execution_diagnostic.field, "unknown");
+  assert.deepEqual(inspected.delivery_diagnostic.environment_names, ["CODEX_API_KEY"]);
   assert.equal(inspected.timing.terminal_at, null);
   assert.equal(inspected.health, undefined);
-  for (const secret of ["PRIVATE-OUTPUT", "PRIVATE-PROMPT", "PRIVATE-RAW-ERROR", callback.callback_id, callback.callback_url])
+  for (const secret of ["PRIVATE-", callback.callback_id, callback.callback_url])
     assert.equal(JSON.stringify(inspected).includes(secret), false, secret);
   assert.deepEqual(fs.readFileSync(runner.filename(id)), before);
 });
@@ -222,7 +226,7 @@ test("installed launcher queries do not initialize storage, materialize profiles
   fs.mkdirSync(path.join(version, "node/bin"), { recursive: true, mode: 0o700 });
   fs.copyFileSync(process.execPath, path.join(version, "node/bin/node"));
   const scripts = new URL("../scripts/", import.meta.url);
-  for (const name of ["runtime.py", "safety.py", "profiles.py", "diagnostics.py", "task-cli.mjs", "task.mjs", "task-read.mjs"])
+  for (const name of ["runtime.py", "safety.py", "profiles.py", "diagnostics.py", "task-cli.mjs", "task.mjs", "task-errors.mjs", "task-read.mjs"])
     fs.copyFileSync(new URL(name, scripts), path.join(version, name));
   save(path.join(version, "settings.json"), { install_root: root, workspace_id: "readonly-fixture", runtime_profile: "env" });
   save(path.join(root, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "readonly-fixture" });
@@ -260,6 +264,16 @@ test("installed launcher queries do not initialize storage, materialize profiles
   assert.deepEqual(snapshot(root), before);
   assert.equal(fs.existsSync(path.join(root, "runtime/module-profiles")), false);
   assert.equal(fs.existsSync(path.join(tasks, "submit.lock")), false);
+  for (const [args, code, stage, field] of [
+    [["list", "--limit", "0"], "INVALID_ARGUMENTS", "list", "limit"],
+    [["status", accepted.task_id, "PRIVATE-EXTRA"], "INVALID_ARGUMENTS", "validate", "arguments"],
+    [["result", callback.callback_id], "INVALID_TASK_ID", "read", "task_id"],
+  ]) {
+    const response = query(...args), value = JSON.parse(response.stderr);
+    assert.equal(response.status, 1); assert.equal(value.error.code, code); assert.equal(value.error.stage, stage); assert.equal(value.error.field, field);
+    assert.equal(response.stderr.includes("PRIVATE-"), false); assert.equal(response.stderr.includes(callback.callback_id), false);
+  }
+  assert.deepEqual(snapshot(root), before);
   fs.unlinkSync(path.join(version, "task-read.mjs"));
   before = snapshot(root);
   const broken = query("list");

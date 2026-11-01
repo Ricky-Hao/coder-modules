@@ -3,13 +3,14 @@ import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { TaskError, errorCode, errorInfo } from "./task-errors.mjs";
 
 export const RECORD_BYTES = 8 * 1024 * 1024;
 export const PAGE_BYTES = 32 * 1024 * 1024;
 export const SNAPSHOT_BYTES = 16384;
 const states = ["queued", "preparing", "dispatching", "running", "ambiguous", "completed"];
 
-export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = false } = {}) {
+function jsonFile(filename, maximum, { budget, optional }) {
   for (let attempt = 0; attempt < 3; attempt++) {
     let fd;
     try {
@@ -45,19 +46,27 @@ export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = 
   throw new Error("TASK_RECORD_CHANGED");
 }
 
+export function readJson(filename, maximum = RECORD_BYTES, { budget, optional = false, stage = "read", field = "task_record",
+  invalidCode = "INVALID_TASK_RESULT", readCode } = {}) {
+  try { return jsonFile(filename, maximum, { budget, optional }); }
+  catch (error) {
+    const code = readError(error);
+    throw new TaskError(code === "INVALID_TASK_RESULT" ? invalidCode : readCode && ["TASK_NOT_FOUND", "TASK_READ_FAILED"].includes(code) ? readCode : code,
+      { stage, field, reason: error?.code });
+  }
+}
+
 export function readError(error) {
-  const known = ["UNSAFE_TASK_FILE", "UNSAFE_TASK_DIRECTORY", "INVALID_TASK_RESULT", "INVALID_TASK_ID",
-    "TASK_RECORD_TOO_LARGE", "TASK_READ_BUDGET", "TASK_RECORD_CHANGED", "CURSOR_STALE", "INVALID_CURSOR",
-    "INVALID_ARGUMENTS", "TASK_DIRECTORY_UNREADABLE", "UNSUPPORTED_TASK_RECORD", "UNSUPPORTED_SESSION_RECORD"];
-  if (known.includes(error.message)) return error.message;
-  if (error.code === "ENOENT") return "TASK_NOT_FOUND";
-  if (["ELOOP", "ENOTDIR"].includes(error.code)) return "UNSAFE_TASK_DIRECTORY";
+  const known = errorCode(error, null);
+  if (known) return known;
+  if (error?.code === "ENOENT") return "TASK_NOT_FOUND";
+  if (["ELOOP", "ENOTDIR"].includes(error?.code)) return "UNSAFE_TASK_DIRECTORY";
   return "TASK_READ_FAILED";
 }
 
-function integer(value, fallback, maximum) {
+function integer(value, fallback, maximum, field) {
   if (value === undefined) return fallback;
-  if (!/^[1-9][0-9]{0,3}$/.test(value) || Number(value) > maximum) throw new Error("INVALID_ARGUMENTS");
+  if (!/^[1-9][0-9]{0,3}$/.test(value) || Number(value) > maximum) throw new TaskError("INVALID_ARGUMENTS", { stage: "list", field });
   return Number(value);
 }
 
@@ -70,17 +79,17 @@ function decodeCursor(value, filter) {
         parsed.directory.length !== 4 || parsed.directory.some((part) => !/^[0-9]{1,20}$/.test(part)) ||
         !/^[0-9]{1,19}$/.test(parsed.position) || BigInt(parsed.position) > 9223372036854775807n) throw 0;
     return parsed;
-  } catch { throw new Error("INVALID_CURSOR"); }
+  } catch { throw new TaskError("INVALID_CURSOR", { stage: "list", field: "cursor" }); }
 }
 
 export function listTasks(runner, flags = {}) {
-  const limit = integer(flags["--limit"], 20, 50);
-  const scanLimit = integer(flags["--scan-limit"], 100, 200);
+  const limit = integer(flags["--limit"], 20, 50, "limit");
+  const scanLimit = integer(flags["--scan-limit"], 100, 200, "scan_limit");
   const state = flags["--state"];
   const session = flags["--session"];
-  if (state !== undefined && !states.includes(state) || session !== undefined &&
-      (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(session) || session.includes("tcb_")))
-    throw new Error("INVALID_ARGUMENTS");
+  if (state !== undefined && !states.includes(state)) throw new TaskError("INVALID_ARGUMENTS", { stage: "list", field: "state" });
+  if (session !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(session) || session.includes("tcb_")))
+    throw new TaskError("INVALID_ARGUMENTS", { stage: "list", field: "session" });
   const filter = createHash("sha256").update(JSON.stringify([state ?? null, session ?? null])).digest("hex");
   const cursor = decodeCursor(flags["--cursor"], filter);
   const helper = spawnSync("python3", ["-B", fileURLToPath(new URL("./diagnostics.py", import.meta.url)),
@@ -88,8 +97,8 @@ export function listTasks(runner, flags = {}) {
   { encoding: "utf8", timeout: 5000, maxBuffer: 65536, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", PYTHONDONTWRITEBYTECODE: "1" } });
   let page;
   try { page = JSON.parse(helper.stdout); }
-  catch { throw new Error("TASK_DIRECTORY_UNREADABLE"); }
-  if (helper.status !== 0) throw new Error(page.error?.code === "CURSOR_STALE" ? "CURSOR_STALE" : "TASK_DIRECTORY_UNREADABLE");
+  catch { throw new TaskError("TASK_DIRECTORY_UNREADABLE", { stage: "list", field: "task_store" }); }
+  if (helper.status !== 0) throw new TaskError(page.error?.code === "CURSOR_STALE" ? "CURSOR_STALE" : "TASK_DIRECTORY_UNREADABLE", { stage: "list", field: "task_store" });
   const items = [], errors = [];
   const budget = { remaining: PAGE_BYTES };
   let scanned = 0, checked = 0, position = cursor?.position ?? "0", stopped = null;
@@ -105,7 +114,7 @@ export function listTasks(runner, flags = {}) {
         }
       } catch (error) {
         if (error.message === "TASK_READ_BUDGET") { stopped = "read_budget"; break; }
-        errors.push({ task_id: entry.id, code: readError(error) });
+        errors.push(errorInfo(readError(error), { field: "task_record", ...(error instanceof TaskError ? error : {}), stage: "read", task_id: entry.id }));
       }
     }
     scanned++;

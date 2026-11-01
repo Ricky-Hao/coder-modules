@@ -41,6 +41,7 @@ test(
     const first = createSharedAcpRuntime(options);
     let second;
     let handle;
+    let failedHandle;
     try {
       const runner = new TaskRunner({ root: taskRoot, runtime: first });
       const accepted = runner.submit({
@@ -126,7 +127,23 @@ test(
       assert.equal(slowRecord.state, 'completed');
       assert.equal(slowRunner.result(slow.task_id).output, 'Slow tool completed');
       await second.close({ handle: slowRecord.handle, reason: 'slow fixture cleanup' });
+      let starts = 0;
+      const startTurn = second.startTurn.bind(second);
+      second.startTurn = (input) => { starts++; return startTurn(input); };
+      const failedRunner = new TaskRunner({ root: taskRoot, runtime: second, pollMs: 20 });
+      const failed = failedRunner.submit({ model: { id: 'fixture/test' }, modelConfig: path.join(base, 'config.json'), modelProfile: 'external',
+        key: 'real-failed-provider', cwd: base, prompt: 'provider failed', callback: {
+          callback_id: `tcb_${'f'.repeat(43)}`, callback_url: 'http://127.0.0.1:1/api/agents/task-callbacks' } });
+      await failedRunner.execute(failed.task_id);
+      failedHandle = failedRunner.load(failed.task_id).handle;
+      const result = failedRunner.result(failed.task_id);
+      assert.equal(result.execution_error, 'REQUEST_FAILED'); assert.equal(result.execution_diagnostic.category, 'unknown');
+      assert.equal(result.execution_diagnostic.reason, 'QUEUE_RUNTIME_PROMPT_FAILED');
+      assert.equal(result.evidence.terminal_source, 'watchSession.turn_result'); assert.equal(starts, 1);
+      assert.equal(JSON.stringify(failedRunner.load(failed.task_id)).includes('synthetic provider.internal'), false);
+      await second.close({ handle: failedHandle, reason: 'failed fixture cleanup' }); failedHandle = undefined;
     } finally {
+      if (failedHandle) await second?.close({ handle: failedHandle, reason: 'failed fixture cleanup' }).catch(() => {});
       if (handle)
         await (second ?? first)
           .close({ handle, reason: "fixture cleanup" })
@@ -173,7 +190,7 @@ test('pinned cancel adapter checks socket and generation, only sends target requ
     try {
       assert.equal(await runtime.cancelRequest({ handle, requestId: record.requestId }), true);
       generation = 2;
-      await assert.rejects(runtime.cancelRequest({ handle, requestId: record.requestId }), /CANCEL_UNCONFIRMED/);
+      await assert.rejects(runtime.cancelRequest({ handle, requestId: record.requestId }), (error) => error.code === 'CANCEL_UNCONFIRMED' && error.stage === 'cancel' && error.field === 'request' && error.cause === undefined);
       await assert.rejects(runtime.cancelRequest({ handle, requestId: 'someone-else' }), /SESSION_IDENTITY_CONFLICT/);
       fs.writeFileSync(file, JSON.stringify({ ...owner, socketPath: '/untrusted/socket' }));
       await assert.rejects(runtime.cancelRequest({ handle, requestId: record.requestId }), /UNSAFE_OWNER_SOCKET/);

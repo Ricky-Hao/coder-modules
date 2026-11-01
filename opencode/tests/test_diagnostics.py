@@ -224,6 +224,9 @@ class DoctorTests(unittest.TestCase):
         with self.assertRaisesRegex(diagnostics.ReadError, 'UNSAFE_FILE'):
             diagnostics.read_json(file)
 
+    def test_unknown_read_error_does_not_echo_an_untrusted_message(self):
+        self.assertEqual(diagnostics.error_code(diagnostics.ReadError('PRIVATE-CALLBACK-PROMPT')), 'READ_FAILED')
+
 
 if __name__ == '__main__':
     unittest.main()

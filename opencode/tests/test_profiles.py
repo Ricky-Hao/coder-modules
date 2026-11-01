@@ -499,6 +499,31 @@ else:
         self.assertEqual(restored['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
         self.assertEqual(source.read_bytes(), before)
 
+    def test_selection_diagnostics_use_only_fixed_fields_and_environment_names(self):
+        import runtime
+        self.fixture.install()
+        response = subprocess.run([str(self.root / 'bin/opencode-task'), '_selection'], input='{}',
+                                  env={'PATH': '/usr/bin:/bin'}, cwd=self.base, capture_output=True, text=True)
+        self.assertEqual(response.returncode, 1)
+        error = json.loads(response.stdout)['error']
+        self.assertEqual(error['code'], 'LAUNCH_ENVIRONMENT_INVALID')
+        self.assertEqual(error['field'], 'environment')
+        self.assertEqual(error['reason'], 'missing')
+        self.assertEqual(error['environment_names'], ['CODEX_API_KEY', 'CODEX_BASE_URL'])
+        unknown = runtime.selection_diagnostic(ValueError('PRIVATE-ERROR-PROMPT-URL'))
+        self.assertEqual(unknown['code'], 'LAUNCH_SELECTION_INVALID')
+        self.assertEqual(unknown['reason'], 'unknown')
+        self.assertNotIn('PRIVATE-', json.dumps(unknown))
+        source = self.base / 'invalid-selection.json'
+        source.write_text('{"PRIVATE-CONFIG":')
+        source.chmod(0o600)
+        with patch.dict(os.environ, {'OPENCODE_MODULE_CONFIG': str(source)}, clear=True):
+            with self.assertRaises(runtime.SelectionError) as caught:
+                runtime.launch_selection({**self.fixture.bundle['config'], 'install_root': str(self.root)}, {})
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertNotIn('PRIVATE-', str(caught.exception))
+
     def test_required_payload_profile_validation_and_cached_profile_inventory(self):
         for name in ('profiles.py', 'profile-env.json', 'shell_path.py'):
             bundle = copy.deepcopy(self.fixture.bundle)

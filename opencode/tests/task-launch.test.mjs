@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { TaskRunner } from "../scripts/task.mjs";
 import { launchTask } from "../scripts/task-launch.mjs";
+import { TaskError } from "../scripts/task-errors.mjs";
 
 const scripts = fileURLToPath(new URL("../scripts", import.meta.url));
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -346,4 +347,104 @@ test("new selections resolve provider/model defaults and standalone variant", as
   const same = await f.launch({ schema_version: 1, key: 'same-model', prompt: 'follow-up', callback: f.input.callback,
     provider: 'codex', model: 'gpt-6.1-sol' }, { '--continue-from': original.task_id });
   assert.equal(same.error, undefined, JSON.stringify(same)); assert.equal(same.selection.variant, 'high');
+});
+
+test("input classification keeps callback/permissions/timeout codes and fixed field names before Git", async (t) => {
+  const f = fixture(t), before = git(f.repo, "show-ref");
+  for (const [change, code, field] of [
+    [{ schema_version: 2 }, "INVALID_LAUNCH_INPUT", "schema_version"],
+    [{ prompt: "" }, "INVALID_LAUNCH_INPUT", "prompt"],
+    [{ prompt: f.input.callback.callback_id }, "CALLBACK_IN_PROMPT", "prompt"],
+    [{ callback: { ...f.input.callback, callback_id: "PRIVATE-BAD-BEARER" } }, "INVALID_CALLBACK", "callback.callback_id"],
+    [{ callback: { ...f.input.callback, callback_url: "https://user:PRIVATE-URL@callback.invalid/api/agents/task-callbacks" } }, "INVALID_CALLBACK", "callback.callback_url"],
+    [{ callback: { ...f.input.callback, callback_url: "PRIVATE-MALFORMED-URL" } }, "INVALID_CALLBACK", "callback.callback_url"],
+    [{ callback: { ...f.input.callback, max_output_bytes: 32769 } }, "INVALID_CALLBACK", "callback.max_output_bytes"],
+    [{ permissions: { mode: "PRIVATE-MODE" } }, "INVALID_PERMISSIONS", "permissions.mode"],
+    [{ permissions: { policy: { autoDeny: [""] } } }, "INVALID_PERMISSIONS", "permissions.policy.autoDeny"],
+    [{ no_progress_timeout_seconds: "900" }, "INVALID_NO_PROGRESS_TIMEOUT", "no_progress_timeout_seconds"],
+    [{ provider: 1 }, "LAUNCH_SELECTION_INVALID", "provider"],
+    [{ branch: "../escape" }, "INVALID_LAUNCH_INPUT", "branch"],
+    [{ worktree: "/escape" }, "INVALID_LAUNCH_INPUT", "worktree"],
+    [{ "PRIVATE-UNKNOWN-FIELD": f.input.callback }, "INVALID_LAUNCH_INPUT", "fields"],
+  ]) {
+    const result = await f.launch({ ...f.input, ...change });
+    assert.equal(result.error.code, code); assert.equal(result.error.field, field);
+    assert.equal(result.error.stage, "validate"); assert.equal(result.task_recorded, false); assert.equal(result.outcome_unknown, false);
+    for (const secret of ["PRIVATE-", f.input.prompt, f.input.callback.callback_id, f.input.callback.callback_url]) assert.equal(JSON.stringify(result).includes(secret), false);
+  }
+  fs.writeFileSync(f.inputFile, '{"PRIVATE-JSON":');
+  const malformed = await launchTask(f.runner, { "--input-file": f.inputFile }, f.options);
+  assert.equal(malformed.error.code, "INVALID_LAUNCH_JSON"); assert.equal(malformed.error.stage, "input"); assert.equal(malformed.error.field, "input_file");
+  const missing = await launchTask(f.runner, { "--input-file": path.join(f.base, "PRIVATE-NOT-FOUND.json") }, f.options);
+  assert.equal(missing.error.code, "LAUNCH_INPUT_UNREADABLE"); assert.equal(missing.error.reason, "ENOENT");
+  assert.equal(JSON.stringify(missing).includes("PRIVATE-"), false);
+  assert.equal(git(f.repo, "show-ref"), before); assert.equal(fs.existsSync(path.join(f.tasks, ".launches")), false); assert.equal(f.launches(), 0);
+});
+
+test("missing selection environment is named without values and an existing claim still fails closed", async (t) => {
+  const f = fixture(t), before = git(f.repo, "show-ref"), key = process.env.CODEX_API_KEY;
+  let result;
+  delete process.env.CODEX_API_KEY;
+  try { result = await f.launch(); } finally { process.env.CODEX_API_KEY = key; }
+  assert.equal(result.error.code, "LAUNCH_ENVIRONMENT_INVALID"); assert.equal(result.error.field, "environment");
+  assert.equal(result.error.reason, "missing"); assert.deepEqual(result.error.environment_names, ["CODEX_API_KEY"]);
+  assert.equal(result.task_recorded, false); assert.equal(result.outcome_unknown, true); assert.equal(result.error.action, "inspect_preparation");
+  const file = path.join(f.tasks, ".launches", `${result.task_id}.json`), bytes = fs.readFileSync(file);
+  assert.equal((await f.launch()).error.code, "GIT_PREPARATION_INTERRUPTED");
+  assert.deepEqual(fs.readFileSync(file), bytes); assert.equal(git(f.repo, "show-ref"), before); assert.equal(f.launches(), 0);
+});
+
+test("selection process errors keep only fixed codes/fields/variable names, never stderr/cause", async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.version, "runtime.py"), `import json, sys
+print(json.dumps({'error': {'code': 'LAUNCH_SELECTION_INVALID', 'field': 'PRIVATE-FIELD', 'reason': 'PRIVATE-REASON',
+ 'environment_names': ['CODEX_API_KEY', 'PRIVATE-NAME'], 'message': 'PRIVATE-MESSAGE', 'cause': 'PRIVATE-CAUSE', 'stack': 'PRIVATE-STACK'}}))
+print('PRIVATE-STDERR', file=sys.stderr)
+sys.exit(1)
+`);
+  const result = await f.launch();
+  assert.equal(result.error.code, "LAUNCH_SELECTION_INVALID"); assert.equal(result.error.field, "selection");
+  assert.equal(result.error.reason, "unknown"); assert.deepEqual(result.error.environment_names, ["CODEX_API_KEY"]);
+  assert.equal(JSON.stringify(result).includes("PRIVATE-"), false); assert.equal(JSON.stringify(f.saved(result)).includes("PRIVATE-"), false);
+  assert.equal(f.launches(), 0);
+});
+
+test("fsync failure after task rename keeps the original request but does not claim acceptance or dispatch", async (t) => {
+  const f = fixture(t), taskDir = path.join(f.tasks, `task_${digest(f.input.key)}`), sync = fs.fsyncSync;
+  t.mock.method(fs, "fsyncSync", (fd) => {
+    if (fs.readlinkSync(`/proc/self/fd/${fd}`) === taskDir && fs.existsSync(path.join(taskDir, "task.json")))
+      throw Object.assign(new Error("PRIVATE-FSYNC-CAUSE"), { code: "ENOSPC" });
+    return sync(fd);
+  });
+  const failed = await f.launch();
+  assert.equal(failed.error.code, "TASK_WRITE_FAILED"); assert.equal(failed.error.stage, "submit"); assert.equal(failed.error.field, "task_record");
+  assert.equal(failed.error.reason, "ENOSPC"); assert.equal(failed.accepted, false); assert.equal(failed.task_recorded, null); assert.equal(failed.outcome_unknown, true);
+  assert.ok(failed.request_id); assert.equal(f.launches(), 0);
+  assert.equal(f.runner.load(failed.task_id).dispatchedAt, undefined); assert.equal(JSON.stringify(failed).includes("PRIVATE-"), false);
+  t.mock.restoreAll();
+  f.runner.submit = () => assert.fail("must not resubmit");
+  const retry = await f.launch(f.input, {}, { spawnControl: (id, reused) => { assert.equal(reused, true); return f.runner.execute(id, { observeOnly: true }); } });
+  assert.equal(retry.request_id, failed.request_id); assert.equal(f.runner.status(failed.task_id).execution_error, "RECOVERED_BEFORE_DISPATCH");
+});
+
+test("lost control ACK is unknown with a durable request, not invalid input or permission to resend", async (t) => {
+  const f = fixture(t);
+  const failed = await f.launch(f.input, {}, { spawnControl: async () => { throw new TaskError("CONTROL_ACK_UNKNOWN", { reason: "timeout" }); } });
+  assert.equal(failed.error.code, "CONTROL_ACK_UNKNOWN"); assert.equal(failed.error.stage, "control"); assert.equal(failed.error.field, "control_ack");
+  assert.equal(failed.error.reason, "timeout"); assert.equal(failed.task_recorded, true); assert.equal(failed.outcome_unknown, true);
+  assert.equal(failed.error.request_id, failed.request_id); assert.equal(failed.error.action, "observe_original");
+  f.runner.submit = () => assert.fail("must not resubmit");
+  assert.equal((await f.launch()).request_id, failed.request_id);
+});
+
+test("reused error response does not expand untrusted launch metadata strings", async (t) => {
+  const f = fixture(t), original = await f.launch(), record = f.saved(original);
+  record.repo_path = "PRIVATE-REPO"; record.worktree = f.input.callback.callback_url; record.selection.model.id = "PRIVATE-MODEL";
+  write(path.join(f.tasks, ".launches", `${original.task_id}.json`), record);
+  const bytes = fs.readFileSync(path.join(f.tasks, ".launches", `${original.task_id}.json`));
+  const result = await f.launch(f.input, {}, { spawnControl: async () => { throw new Error("PTC_TOOL_FAILED 502 EAGAIN PRIVATE-STDERR"); } });
+  assert.equal(result.error.code, "CONTROL_ACK_UNKNOWN"); assert.equal(result.error.reason, "unknown");
+  assert.equal(result.outcome_unknown, true); assert.equal(result.task_recorded, true);
+  for (const secret of ["PRIVATE-", f.input.callback.callback_url]) assert.equal(JSON.stringify(result).includes(secret), false);
+  assert.deepEqual(fs.readFileSync(path.join(f.tasks, ".launches", `${original.task_id}.json`)), bytes);
 });

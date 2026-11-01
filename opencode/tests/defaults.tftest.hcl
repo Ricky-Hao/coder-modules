@@ -36,7 +36,7 @@ run "agent_only" {
     error_message = "Automation must not rely on agent PATH."
   }
   assert {
-    condition     = output.opencode_task_command == "\"$HOME\"/.coder-opencode/bin/opencode-task" && alltrue([for name in ["task.mjs", "task-read.mjs", "diagnostics.py"] : contains(keys(local.bundle_files), name)])
+    condition     = output.opencode_task_command == "\"$HOME\"/.coder-opencode/bin/opencode-task" && alltrue([for name in ["task.mjs", "task-errors.mjs", "task-read.mjs", "diagnostics.py"] : contains(keys(local.bundle_files), name)])
     error_message = "Detached task wrapper and runtime must be bundled together."
   }
 }

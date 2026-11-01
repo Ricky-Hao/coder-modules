@@ -6,10 +6,16 @@ import http from "node:http";
 import { test } from "node:test";
 import { TaskRunner, appendOutput, callbackBody, retryDelay, save, validateCallback,
   DEFAULT_NO_PROGRESS_MS, noProgressTimeout, delay } from "../scripts/task.mjs";
+import { TaskError, errorInfo, runtimeError } from "../scripts/task-errors.mjs";
 
 const callback = { callback_id: `tcb_${"x".repeat(43)}`, callback_url: "http://127.0.0.1:1/api/agents/task-callbacks" };
 const never = () => new Promise(() => {});
 const ok = () => new Response(JSON.stringify({ version: 1, receipt_id: "receipt", accepted_at: "2026-10-20T00:00:00Z" }), { status: 202 });
+// 这些用例只测派发后的静默。合成准备阶段耗时为零，不依赖并行 fsync 的实耗。
+function dispatchClock() {
+  let start;
+  return { tick: () => start === undefined ? 0 : performance.now() - start, start: () => { start = performance.now(); } };
+}
 async function until(predicate, ms = 2000) {
   const end = performance.now() + ms;
   while (!predicate()) { if (performance.now() > end) throw new Error("fixture wait expired"); await delay(5); }
@@ -56,8 +62,11 @@ for (const [result, status] of [["completed", "success"], ["failed", "error"], [
     await f.run();
     assert.equal(f.result().state, "completed"); assert.equal(f.result().result_status, status);
     assert.equal(f.result().callback_state, "delivered");
-    assert.equal(f.result().output, status === "error"
-      ? "Original request failed (REQUEST_FAILED). Side effects may have occurred; verify before retrying." : "Done ✓");
+    if (status === "error") {
+      assert.match(f.result().output, /^Original request failed \(REQUEST_FAILED\)\. Side effects may have occurred;/);
+      assert.equal(f.result().execution_diagnostic.category, "unknown");
+      assert.equal(f.result().execution_diagnostic.stage, "result");
+    } else assert.equal(f.result().output, "Done ✓");
     assert.equal(bodies.length, 1); assert.equal(f.executions(), 1);
     const before = fs.readFileSync(f.runner.filename(f.id));
     for (const value of [f.result(), f.runner.status(f.id)]) {
@@ -147,11 +156,13 @@ test("setup crossing deadline between polls cannot dispatch; terminal receipt st
   const ensure = f.runtime.ensureSession;
   f.runtime.ensureSession = async (input) => { tick = 21; return ensure(input); };
   await f.run(); assert.equal(f.executions(), 0); assert.equal(f.result().result_status, "error");
-  const g = fixture(t, { noProgressMs: 50, drainMs: 100 });
-  g.runtime.startTurn = () => ({ promptStarted: never(), events: (async function* () { await never(); })(),
-    result: delay(10).then(() => ({ status: "completed" })) });
+  tick = 0;
+  const g = fixture(t, { tick: () => tick, noProgressMs: 50, drainMs: 100 });
+  // 先收到终态，再在排空期间越过期限；不让准备阶段的 fsync 决定此断言。
+  g.runtime.startTurn = () => ({ promptStarted: never(), events: (async function* () { await delay(10); tick = 51; await never(); })(),
+    result: Promise.resolve({ status: "completed" }) });
   g.runtime.watchSession = async function* () { await never(); };
-  await g.run(); assert.equal(g.result().callback_kind, "request_result"); assert.equal(g.result().callback_status, "success");
+  await g.run(); assert.equal(tick, 51); assert.equal(g.result().callback_kind, "request_result"); assert.equal(g.result().callback_status, "success");
 });
 
 test("terminal journal beats hanging promptStarted and events", async (t) => {
@@ -200,10 +211,11 @@ for (const update of [{ sessionUpdate: "tool_call", toolCallId: "build", status:
 
 for (const status of ["completed", "failed", "cancelled"]) {
   test(`one timeout notification then late canonical ${status}; body and POST count unchanged`, async (t) => {
-    const bodies = [], f = fixture(t, { noProgressMs: 45, fetcher: async (_url, init) => { bodies.push(init.body); return ok(); } });
+    const clock = dispatchClock();
+    const bodies = [], f = fixture(t, { tick: clock.tick, noProgressMs: 45, fetcher: async (_url, init) => { bodies.push(init.body); return ok(); } });
     let finish;
     const done = new Promise((resolve) => { finish = resolve; });
-    f.runtime.startTurn = () => ({ promptStarted: Promise.resolve(), events: (async function* () {})(), result: never() });
+    f.runtime.startTurn = () => { clock.start(); return { promptStarted: Promise.resolve(), events: (async function* () {})(), result: never() }; };
     f.runtime.watchSession = async function* () {
       await done;
       yield { type: "message", requestId: f.accepted.request_id, cursor: "text", message: { params: { update:
@@ -287,8 +299,8 @@ test("cross-boot recover uses original wall interval and never gives a fresh tim
 });
 
 test("uncertain transport failed is never canonical failure or replay authorization", async (t) => {
-  const f = fixture(t, { noProgressMs: 35 }); let starts = 0;
-  f.runtime.startTurn = () => { starts++; return { promptStarted: never(), events: (async function* () {})(),
+  const clock = dispatchClock(), f = fixture(t, { tick: clock.tick, noProgressMs: 35 }); let starts = 0;
+  f.runtime.startTurn = () => { clock.start(); starts++; return { promptStarted: never(), events: (async function* () {})(),
     result: Promise.resolve({ status: "failed", error: { detailCode: "QUEUE_DISCONNECTED_BEFORE_COMPLETION" } }) }; };
   f.runtime.watchSession = async function* () { yield { type: "turn_result", requestId: f.accepted.request_id, cursor: "unknown",
     result: { status: "failed", error: { detailCode: "WATCH_OUTCOME_UNKNOWN" } } }; await never(); };
@@ -343,4 +355,116 @@ test("HTTP redirect cannot leak bearer to another endpoint", async (t) => {
   t.after(() => { source.close(); target.close(); });
   const f = fixture(t, { fetcher: fetch, callback: { ...callback, callback_url: `http://127.0.0.1:${source.address().port}/api/agents/task-callbacks` } });
   await f.run(); assert.equal(received, 0); assert.equal(f.runner.status(f.id).delivery_error, "REDIRECT_REFUSED");
+});
+
+test("safe errors discard arbitrary fields, messages, cause and stack; host failures stay unknown", () => {
+  const secret = "PRIVATE-ERROR-PROMPT-URL-ENCODING";
+  const raw = Object.assign(new Error(`PTC_TOOL_FAILED 502 EAGAIN provider policy auth: ${secret}`), {
+    cause: new Error(secret), stack: secret, stage: secret, field: secret, code: secret, detailCode: secret,
+  });
+  const wrapped = runtimeError(raw);
+  assert.equal(wrapped.code, "REQUEST_OUTCOME_UNKNOWN");
+  assert.equal(wrapped.category, "unknown"); assert.equal(wrapped.reason, "unknown");
+  assert.equal(wrapped.cause, undefined); assert.equal(wrapped.stack, "TaskError: REQUEST_OUTCOME_UNKNOWN");
+  assert.equal(runtimeError(new Error("REQUEST_AUTH_REQUIRED")).category, "unknown");
+  assert.equal(runtimeError({ code: -32000, message: "authentication required" }).category, "unknown");
+  assert.equal(runtimeError({ code: -32000, data: { authRequired: true } }).category, "auth");
+  const info = errorInfo(wrapped, { stage: secret, field: secret, reason: secret, action: secret,
+    request_id: callback.callback_id, task_id: secret, environment_names: ["CODEX_API_KEY", secret], http_status: secret, cause: raw });
+  assert.equal(info.stage, "unknown"); assert.equal(info.field, "unknown");
+  assert.deepEqual(info.environment_names, ["CODEX_API_KEY"]);
+  assert.equal(info.request_id, undefined); assert.equal(info.task_id, undefined);
+  assert.equal(JSON.stringify(info).includes(secret), false);
+});
+
+for (const [name, error, code, category] of [
+  ["auth", Object.assign(new Error("PRIVATE-AUTH-DETAIL"), { detailCode: "AUTH_REQUIRED", retryable: true }), "REQUEST_AUTH_REQUIRED", "auth"],
+  ["permission", Object.assign(new Error("PRIVATE-POLICY-DETAIL"), { outputCode: "PERMISSION_DENIED", retryable: true }), "REQUEST_PERMISSION_DENIED", "permission"],
+  ["unknown", new Error("PRIVATE-DETAIL provider policy rejected 403"), "MODEL_OR_SESSION_SETUP_FAILED", "unknown"],
+]) {
+  test(`setup ${name} is sanitized and never dispatches, changes selection or grants permissions`, async (t) => {
+    const f = fixture(t, { noProgressMs: 1000 }); f.runtime.ensureSession = async () => { throw error; };
+    await f.run();
+    const value = f.result(), record = f.load();
+    assert.equal(f.executions(), 0); assert.equal(value.execution_error, code);
+    assert.equal(value.execution_diagnostic.stage, "setup"); assert.equal(value.execution_diagnostic.category, category);
+    if (category !== "unknown") assert.equal(value.execution_diagnostic.action, "respect_denial");
+    assert.equal(record.model.id, f.intent.model.id); assert.equal(record.permissions.mode, "deny-all");
+    assert.equal(record.dispatchedAt, undefined);
+    for (const output of [record.body, JSON.stringify(record.executionDetail), JSON.stringify(record)]) assert.equal(output.includes("PRIVATE-"), false);
+  });
+}
+
+for (const [native, code, category] of [
+  [{ code: "PERMISSION_PROMPT_UNAVAILABLE" }, "REQUEST_PERMISSION_DENIED", "permission"],
+  [{ detailCode: "AUTH_REQUIRED" }, "REQUEST_AUTH_REQUIRED", "auth"],
+  [{ code: "RUNTIME", detailCode: "QUEUE_RUNTIME_PROMPT_FAILED" }, "REQUEST_FAILED", "unknown"],
+]) {
+  test(`canonical ${code} only uses fixed ACP fields, not text or retryable hints`, async (t) => {
+    const f = fixture(t, { noProgressMs: 1000 }); let starts = 0;
+    f.runtime.startTurn = () => { starts++; return { promptStarted: never(), events: (async function* () {})(), result: never() }; };
+    f.runtime.watchSession = async function* () { yield { type: "turn_result", requestId: f.accepted.request_id, cursor: "done",
+      result: { status: "failed", error: { ...native, message: "PRIVATE-PROVIDER-POLICY-AUTH", retryable: true, cause: { secret: "PRIVATE-CAUSE" } } } }; };
+    await f.run();
+    const result = f.result(); assert.equal(result.result_status, "error"); assert.equal(result.execution_error, code);
+    assert.equal(result.execution_diagnostic.category, category); assert.equal(starts, 1);
+    assert.equal(JSON.stringify(f.load()).includes("PRIVATE-"), false);
+    assert.equal(f.load().model.id, f.intent.model.id); assert.equal(f.load().permissions.mode, "deny-all");
+  });
+}
+
+test("noncanonical auth evidence stays observable and unknown through timeout without replay", async (t) => {
+  const clock = dispatchClock(), f = fixture(t, { tick: clock.tick, noProgressMs: 45 }); let starts = 0;
+  f.runtime.startTurn = () => { clock.start(); starts++; return { promptStarted: never(), events: (async function* () {})(),
+    result: Promise.resolve({ status: "failed", error: { detailCode: "AUTH_REQUIRED", message: "PRIVATE-AUTH", retryable: true } }) }; };
+  f.runtime.watchSession = async function* () { await never(); };
+  const running = f.run(); await until(() => f.result().callback_state === "delivered");
+  assert.equal(f.result().result_status, null); assert.equal(starts, 1);
+  assert.equal(f.result().observation_error, "REQUEST_OUTCOME_UNKNOWN");
+  assert.equal(f.result().observation_diagnostic.category, "auth");
+  assert.equal(f.result().observation_diagnostic.action, "respect_denial");
+  assert.equal(f.result().execution_error, "NO_PROGRESS");
+  assert.equal(JSON.stringify(f.load()).includes("PRIVATE-AUTH"), false);
+  f.stop.abort(); await running;
+});
+
+test("result persistence failure cannot become a transport reconnect, callback or replay", async (t) => {
+  const f = fixture(t, { noProgressMs: 1000 }); const write = f.runner.write.bind(f.runner); let posts = 0;
+  f.runner.fetcher = async () => { posts++; return ok(); };
+  f.runner.write = (record, stage) => {
+    if (record.result) throw new TaskError("TASK_WRITE_FAILED", { stage: "result", field: "task_record", reason: "ENOSPC", cause: new Error("PRIVATE-WRITE-CAUSE") });
+    return write(record, stage);
+  };
+  await assert.rejects(f.run(), (error) => {
+    assert.equal(error.code, "TASK_WRITE_FAILED"); assert.equal(error.stage, "result"); assert.equal(error.reason, "ENOSPC");
+    assert.equal(error.task_id, f.id); assert.equal(error.request_id, f.accepted.request_id);
+    assert.equal(error.cause, undefined); assert.equal(JSON.stringify(error).includes("PRIVATE-WRITE"), false); return true;
+  });
+  assert.equal(posts, 0); assert.equal(f.executions(), 1); assert.equal(f.result().result_status, null);
+});
+
+test("cancel failure retains the original intent and request handle, not a terminal result", async (t) => {
+  const f = fixture(t), record = f.load(); record.state = "running"; record.dispatchedAt = Date.now();
+  record.handle = await f.runtime.ensureSession({ cwd: f.root, sessionKey: record.sessionKey }); f.runner.write(record);
+  f.runtime.cancel = () => assert.fail("session-wide cancel");
+  f.runtime.cancelRequest = async ({ requestId }) => { assert.equal(requestId, record.requestId); throw new Error("PRIVATE-CANCEL-CAUSE"); };
+  await assert.rejects(f.runner.cancel(f.id), (error) => error.code === "CANCEL_UNCONFIRMED" && error.stage === "cancel" && error.request_id === record.requestId);
+  assert.equal(f.runner.status(f.id).cancel_requested, true); assert.equal(f.result().result_status, null);
+  assert.equal(JSON.stringify(f.load()).includes("PRIVATE-CANCEL"), false);
+});
+
+test("outbox distinguishes retry status, receipt and unknown handoff without new body or business execution", async (t) => {
+  const bodies = [], replies = [new Response("", { status: 429, headers: { "Retry-After": "60" } }), new Response("PRIVATE-RECEIPT", { status: 202 }),
+    new Error("PTC_TOOL_FAILED EAGAIN 502 PRIVATE-NETWORK"), new Error("REQUEST_AUTH_REQUIRED"), new Response("", { status: 403 })];
+  const f = fixture(t, { fetcher: async (_url, init) => { bodies.push(init.body); const reply = replies.shift(); if (reply instanceof Error) throw reply; return reply; } });
+  await f.runner.execute(f.id);
+  for (const [index, code, field, category] of [[0, "CALLBACK_RETRYABLE_STATUS", "callback", "callback"], [1, "INVALID_RECEIPT", "receipt", "callback"],
+    [2, "DELIVERY_UNCONFIRMED", "callback", "unknown"], [3, "DELIVERY_UNCONFIRMED", "callback", "unknown"], [4, "CALLBACK_REJECTED", "callback", "callback"]]) {
+    const record = f.load(); record.nextAttemptAt = 0; const progress = record.progress; await f.runner.deliver(record);
+    const result = f.result(); assert.equal(result.delivery_error, code); assert.equal(result.delivery_diagnostic.field, field);
+    assert.equal(result.delivery_diagnostic.category, category); assert.deepEqual(f.load().progress, progress);
+    if (index === 0) assert.ok(record.nextAttemptAt >= record.callbackAttemptedAt + 60000);
+    assert.equal(JSON.stringify(f.load()).includes("PRIVATE-"), false);
+  }
+  assert.equal(new Set(bodies).size, 1); assert.equal(f.executions(), 1); assert.equal(f.result().callback_state, "rejected");
 });
