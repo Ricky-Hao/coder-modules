@@ -22,7 +22,7 @@ NODE_SHA256 = '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce'
 NODE_URL = 'https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz'
 ACPX_VERSION = '0.21.1'
 TARGET = 'opencode-linux-x64-baseline'
-PAYLOAD_FILES = {'install.py', 'runtime.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-errors.mjs', 'task-read.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs',
+PAYLOAD_FILES = {'install.py', 'runtime.py', 'git_ssh.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-worker.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}
 
 
@@ -285,10 +285,11 @@ def install(bundle):
             # All generated runtime data is workspace-private. Never serialize the caller environment.
             for name in ('home', 'config', 'data', 'cache', 'state', 'tmp'):
                 safety['directory'](root / 'runtime' / name, create=True)
+            safety['git_trust'](root, config['workspace_id'])
             acpx = safety['directory'](root / 'runtime/home/.acpx', create=True)
             if not os.path.lexists(acpx / 'config.json'):
                 safety['write_json'](acpx / 'config.json', {
-                    'defaultAgent': 'opencode', 'defaultPermissions': 'deny-all',
+                    'defaultAgent': 'opencode', 'defaultPermissions': 'approve-all',
                     'nonInteractivePermissions': 'deny', 'authPolicy': 'skip',
                     'agents': {'opencode': {'argv': [str(root / 'bin/opencode'), 'acp']}}})
             else:

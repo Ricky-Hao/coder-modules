@@ -130,7 +130,7 @@ class InstallerTests(unittest.TestCase):
         for name in ('opencode', 'acpx'):
             self.assertFalse((self.root / 'bin' / name).is_symlink())
         cfg = json.loads((self.root / 'runtime/home/.acpx/config.json').read_text())
-        self.assertEqual(cfg['defaultPermissions'], 'deny-all')
+        self.assertEqual(cfg['defaultPermissions'], 'approve-all')
         self.assertEqual(cfg['nonInteractivePermissions'], 'deny')
 
     def test_checksum_mismatch_preserves_active(self):
@@ -194,7 +194,7 @@ class InstallerTests(unittest.TestCase):
             result = self.original_run([str(self.root / 'bin' / tool), *args], cwd=project,
                                        env=env, capture_output=True, text=True, check=True)
             actual = json.loads(result.stdout)
-            defaults = ['--deny-all', '--non-interactive-permissions', 'deny'] if tool == 'acpx' else []
+            defaults = ['--approve-all', '--non-interactive-permissions', 'deny'] if tool == 'acpx' else []
             self.assertEqual(actual['argv'], defaults + args)
             self.assertEqual(actual['cwd'], str(project))
             child = actual['env']

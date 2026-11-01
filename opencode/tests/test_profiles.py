@@ -17,29 +17,19 @@ sys.path.insert(0, str(fixtures.SCRIPTS))
 import profiles
 
 
-def concurrent_profile_launch(root, config, creator, created, resume, observations, results):
-    """Pause A after mkdir; observe B's real lock attempt without sleeps/retries."""
-    mkdir, flock = Path.mkdir, profiles.fcntl.flock
-
-    def paused_mkdir(path, *args, **kwargs):
-        result = mkdir(path, *args, **kwargs)
-        if path == root / 'runtime/module-profiles':
-            created.set()
-            if not resume.wait(10):
-                raise TimeoutError('creator was not resumed')
-        return result
-
-    def observed_flock(fd, operation):
-        try:
-            flock(fd, operation | profiles.fcntl.LOCK_NB)
-        except BlockingIOError:
-            observations.put('blocked')
-            return flock(fd, operation)
-        observations.put('acquired')
-
+def concurrent_profile_launch(root, config, creator, created, resume, results, after_link=False):
+    """Pause A on either side of publication; B must finish without A."""
+    link = os.link
+    def paused_link(source, destination):
+        if after_link:
+            link(source, destination)
+        created.set()
+        if not resume.wait(10):
+            raise TimeoutError('creator was not resumed')
+        if not after_link:
+            link(source, destination)
     try:
-        with patch.object(Path, 'mkdir', paused_mkdir if creator else mkdir), patch.object(
-                profiles.fcntl, 'flock', flock if creator else observed_flock):
+        with patch.object(profiles.os, 'link', paused_link if creator else link):
             path = profiles.materialize(root, 'test-workspace', config)
         results.put(('ok', str(path)))
     except Exception as error:
@@ -131,7 +121,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads(result.stdout)
         child = actual['env']
-        self.assertEqual(actual['argv'], ['run', 'argument with spaces', '', '$HOME', "a'b"])
+        self.assertEqual(actual['argv'], ['run', '--auto', 'argument with spaces', '', '$HOME', "a'b"])
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(child['PATH'], self.env['PATH'])
         self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
@@ -275,39 +265,34 @@ class ProfileTests(unittest.TestCase):
         self.assertNotEqual(self.call().returncode, 0)
         self.assertEqual(json.loads(self.call(args=['--module-profile-info']).stdout)['source'], 'none')
 
-    def test_concurrent_first_launch_serializes_directory_and_marker(self):
+    def test_concurrent_first_launch_publishes_content_without_lock_or_owner(self):
         self.fixture.install()
         config = profiles.configuration(self.env, fixtures.SCRIPTS)
         context = multiprocessing.get_context('fork')
         created, resume = context.Event(), context.Event()
-        observations, results = context.Queue(), context.Queue()
+        results = context.Queue()
         workers = [context.Process(target=concurrent_profile_launch, args=(
-            self.root, config, creator, created, resume, observations, results))
+            self.root, config, creator, created, resume, results))
             for creator in (True, False)]
         outcomes = []
         try:
             workers[0].start()
-            self.assertTrue(created.wait(10), 'A did not reach the mkdir/marker gap')
+            self.assertTrue(created.wait(10), 'A did not reach atomic publication')
             store = self.root / 'runtime/module-profiles'
             self.assertTrue(store.is_dir())
-            self.assertFalse((store / 'owner.json').exists())
+            self.assertFalse(list(store.glob('*.json')))
             workers[1].start()
-            observation = observations.get(timeout=10)
-            if observation == 'acquired':
-                # Old implementation: let B finish while A is still paused, making
-                # its missing-marker failure deterministic rather than scheduler-dependent.
-                outcomes.append(results.get(timeout=10))
+            outcomes.append(results.get(timeout=10))
             resume.set()
             while len(outcomes) < 2:
                 outcomes.append(results.get(timeout=10))
             self.assertEqual([item[0] for item in outcomes], ['ok', 'ok'], outcomes)
-            self.assertEqual(observation, 'blocked')
             self.assertEqual(outcomes[0][1], outcomes[1][1])
             path = Path(outcomes[0][1])
             self.assertEqual(path.read_bytes(), profiles.encoded(config))
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(len(list(store.glob('*.json'))), 2)
-            profiles.private_file(store / 'owner.json')
+            self.assertEqual(len(list(store.glob('*.json'))), 1)
+            self.assertFalse((store / 'owner.json').exists())
         finally:
             resume.set()
             for worker in workers:
@@ -316,7 +301,6 @@ class ProfileTests(unittest.TestCase):
                     if worker.is_alive():
                         worker.terminate()
                         worker.join(10)
-            observations.close()
             results.close()
 
     def test_atomic_store_rejects_unmanaged_links_owners_and_changed_content(self):
@@ -324,9 +308,11 @@ class ProfileTests(unittest.TestCase):
         store = self.root / 'runtime/module-profiles'
         store.mkdir(mode=0o700)
         (store / 'unmanaged.json').write_text('user content')
-        self.assertNotEqual(self.call().returncode, 0)
+        response = self.call()
+        self.assertEqual(response.returncode, 0, response.stderr)
         self.assertEqual((store / 'unmanaged.json').read_text(), 'user content')
         (store / 'unmanaged.json').unlink()
+        Path(json.loads(response.stdout)['env']['OPENCODE_CONFIG']).unlink()
         store.rmdir()
         store.symlink_to(self.base)
         self.assertNotEqual(self.call().returncode, 0)
@@ -347,7 +333,7 @@ class ProfileTests(unittest.TestCase):
                     elif kind == 'foreign': os.chown(path, 12345, 12345)
                     elif kind == 'mode': path.chmod(0o644)
                     else: path.write_text('unmanaged user config')
-                self.assertNotEqual(self.call().returncode, 0)
+                self.assertEqual(self.call().returncode, 0 if kind == 'hardlink' else 1)
                 if kind == 'changed': self.assertEqual(path.read_text(), 'unmanaged user config')
         path.unlink()
         cfg = profiles.configuration(self.env, fixtures.SCRIPTS)
@@ -356,7 +342,58 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertFalse(list(store.glob('.profile-*')))
 
-    def test_acpx_to_opencode_readiness_env_and_deny_defaults(self):
+    def test_linked_publication_survives_publisher_exit_in_runtime_and_continuation(self):
+        self.fixture.install()
+        config = profiles.configuration(self.env, fixtures.SCRIPTS)
+        context = multiprocessing.get_context('fork')
+        created, resume, results = context.Event(), context.Event(), context.Queue()
+        publisher = context.Process(target=concurrent_profile_launch, args=(
+            self.root, config, True, created, resume, results, True))
+        def select(request):
+            return subprocess.run([str(self.root / 'bin/opencode-task'), '_selection'], input=json.dumps(request),
+                                  env=self.env, cwd=self.base, capture_output=True, text=True)
+        def run_profile(path):
+            return self.call(args=['--module-task', str(path), 'codex/gpt-6.1-sol', 'max', 'env', 'acp'])
+        try:
+            publisher.start()
+            self.assertTrue(created.wait(10), 'publisher did not reach link/unlink window')
+            path = next((self.root / 'runtime/module-profiles').glob('*.json'))
+            self.assertEqual(path.stat().st_nlink, 2)
+            self.assertEqual(self.call().returncode, 0)
+            selected = select({})
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            saved = json.loads(selected.stdout)
+            self.assertEqual(saved['modelConfig'], str(path))
+            self.assertEqual(select({'saved': saved}).returncode, 0)
+            launched = run_profile(path)
+            self.assertEqual(launched.returncode, 0, launched.stderr)
+            self.assertEqual(json.loads(launched.stdout)['env']['OPENCODE_CONFIG'], str(path))
+            publisher.terminate(); publisher.join(10)
+            self.assertFalse(publisher.is_alive())
+            self.assertNotEqual(publisher.exitcode, 0)
+            self.assertEqual(path.stat().st_nlink, 2)
+            self.assertEqual(path.read_bytes(), profiles.encoded(config))
+            self.assertEqual(self.call().returncode, 0)
+            self.assertEqual(select({'saved': saved}).returncode, 0)
+            self.assertEqual(run_profile(path).returncode, 0)
+            # Other files retain nlink=1, even with identical valid profile bytes.
+            external = self.base / 'external-linked.json'
+            external.write_bytes(path.read_bytes()); external.chmod(0o600)
+            os.link(external, self.base / 'external-link')
+            self.assertNotEqual(select({'saved': {**saved, 'modelConfig': str(external)}}).returncode, 0)
+            self.assertNotEqual(run_profile(external).returncode, 0)
+            # A syntactically valid, same-model config still fails its content address.
+            path.write_bytes(profiles.encoded({**config, 'description': 'changed fixture'}))
+            self.assertNotEqual(self.call().returncode, 0)
+            self.assertNotEqual(select({'saved': saved}).returncode, 0)
+            self.assertNotEqual(run_profile(path).returncode, 0)
+        finally:
+            if publisher.pid is not None:
+                if publisher.is_alive(): publisher.terminate()
+                publisher.join(10)
+            results.close()
+
+    def test_acpx_to_opencode_readiness_env_and_approve_defaults(self):
         node_program = '''#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
@@ -370,7 +407,7 @@ elif sys.argv[-1] == '--version':
 elif sys.argv[1].endswith('task-cli.mjs'):
     assert sys.argv[2:] == ['recover']
 else:
-    assert sys.argv[2:5] == ['--deny-all','--non-interactive-permissions','deny']
+    assert sys.argv[2:5] == ['--approve-all','--non-interactive-permissions','deny']
     assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.1-sol'
     assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
     for name in ('CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY', 'UNLISTED_SERVICE_AUTH', 'HTTPS_PROXY'):
@@ -404,7 +441,7 @@ else:
         bundled = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
         for key in ('model', 'providers', 'agents', 'compaction'):
             self.assertEqual(cfg[key], bundled[key])
-        self.assertEqual(len(list((self.root / 'runtime/module-profiles').glob('*.json'))), 2)
+        self.assertEqual(len(list((self.root / 'runtime/module-profiles').glob('*.json'))), 1)
         self.no_serialized_values()
 
     def test_profile_cache_upgrade_payload_fingerprint_and_rollback(self):

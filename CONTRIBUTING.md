@@ -27,6 +27,11 @@ not establish live acceptance, publication or deployment.
 与源码一起提交；固定 source 的安装者无需此步骤。plan 拒绝过期摘要，启动拒绝损坏原文，
 具体封装和预算见 [启动传输契约](opencode/README.md#startup-execution-budget)。
 
+本轮 task 只用 `runtime/tasks-v3`，测试不迁移或扫描旧 task 目录。原生 OpenSSH hostkey
+回环 fixture 另需测试环境的 paramiko 3.5.1，可从隔离 PYTHONPATH 加载；它不进入安装 payload。
+有 root 权限时，Python suite 还会降到 UID65534 验证非 root 启动；设置
+`NODE_FIXTURE_BINARY` 为可读取的固定 Node 路径。未运行的 fixture 须在交付中明列。
+
 修改 Provider/任务选模型时，还须运行 pinned acpx 的 runtime/CLI fixtures、相关
 Terraform mock/render，并用真实已发布 OpenCode 与本地候选做隔离 Responses/回调验收。
 检查默认 codex、显式 copilot 的主请求和 title 路由、session 固定选择、恢复与取消队列。

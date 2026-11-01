@@ -1,5 +1,4 @@
 """Module-owned configuration with env-only endpoint/key references."""
-import fcntl
 import hashlib
 import json
 import os
@@ -9,7 +8,7 @@ import stat
 import tempfile
 from urllib.parse import urlsplit
 
-from safety import directory, regular
+from safety import directory, regular, sync_directory
 
 MCP_NAMES = ('CONTEXT7', 'FIRECRAWL', 'GITHUB', 'GITHUB_ACTIONS')
 PROVIDERS = ('copilot', 'codex')
@@ -136,10 +135,14 @@ def task_configuration(config, model=None, variant=None):
     return selected
 
 
-def private_file(path):
-    regular(path)
+def private_file(path, root):
+    # Exclusive link publication may leave its temporary name, even after a crash.
+    managed = path.parent == root / 'runtime/module-profiles' and re.fullmatch(r'[a-f0-9]{64}\.json', path.name)
+    regular(path, single_link=not managed)
     if stat.S_IMODE(path.lstat().st_mode) != 0o600:
         raise ValueError('managed profile file must be mode 0600')
+    if managed and hashlib.sha256(path.read_bytes()).hexdigest() != path.stem:
+        raise ValueError('changed profile content address')
 
 
 def create_json(path, data):
@@ -163,43 +166,20 @@ def materialize(root, workspace_id, config):
     """Content-addressed files outside auto-discovery; none/external never load them."""
     parent = directory(root / 'runtime')
     store = root / 'runtime/module-profiles'
-    # Lock the existing safe parent before creating either directory or marker.
-    # A second first launch must not observe our temporarily unmarked directory.
-    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        created = False
+    directory(store, create=True)
+    data = encoded(config)
+    path = store / (hashlib.sha256(data).hexdigest() + '.json')
+    if not os.path.lexists(path):
         try:
-            store.mkdir(mode=0o700)
-            created = True
-        except FileExistsError:
-            pass
-        directory(store)
-        marker = store / 'owner.json'
-        identity = encoded({'schema': 1, 'kind': 'opencode-module-profiles',
-                            'uid': os.getuid(), 'workspace_id': workspace_id})
-        if created:
-            create_json(marker, identity)
-        private_file(marker)
-        if marker.read_bytes() != identity:
-            raise ValueError('unmanaged profile store')
-        data = encoded(config)
-        path = store / (hashlib.sha256(data).hexdigest() + '.json')
-        if os.path.lexists(path):
-            private_file(path)
-            if path.read_bytes() != data:
-                raise ValueError('unmanaged or changed profile file')
-        else:
             create_json(path, data)
-        store_fd = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(store_fd)
-        finally:
-            os.close(store_fd)
-        os.fsync(fd)
-        return path
-    finally:
-        os.close(fd)
+        except FileExistsError:
+            pass  # 同内容地址的另一发布者胜出；下面核对原字节。
+    private_file(path, root)
+    if path.read_bytes() != data:
+        raise ValueError('unmanaged or changed profile file')
+    sync_directory(store)
+    sync_directory(parent)
+    return path
 
 
 def harmless(arguments):

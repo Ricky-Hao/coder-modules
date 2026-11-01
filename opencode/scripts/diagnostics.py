@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """本机只读诊断。"""
-import ctypes
 from contextlib import contextmanager
 import errno
 import hashlib
@@ -61,7 +60,7 @@ def read_json(path, maximum=65536):
 def error_code(error):
     if isinstance(error, ReadError):
         known = {'UNSAFE_FILE', 'READ_LIMIT', 'FILE_CHANGED', 'INVALID_RECORD', 'OWNER_MISMATCH',
-                 'TASK_STORE_MISSING', 'INVALID_ARGUMENTS', 'DIRECTORY_READ_FAILED', 'CURSOR_STALE', 'INSTALLATION_MISMATCH'}
+                 'TASK_STORE_MISSING', 'INVALID_ARGUMENTS', 'INSTALLATION_MISMATCH'}
         return str(error) if str(error) in known else 'READ_FAILED'
     if isinstance(error, FileNotFoundError):
         return 'MISSING'
@@ -70,68 +69,9 @@ def error_code(error):
     return 'INVALID_RECORD'
 
 
-def task_root(root, settings):
-    try:
-        ancestors(root)
-        for folder in (root, root / 'runtime', root / 'runtime/tasks'):
-            directory(folder)
-        expected = {'schema': 1, 'uid': os.getuid(), 'workspace_id': settings['workspace_id']}
-        for marker in (root / 'owner.json', root / 'runtime/tasks/owner.json'):
-            if read_json(marker) != expected:
-                raise ReadError('OWNER_MISMATCH')
-    except FileNotFoundError:
-        raise ReadError('TASK_STORE_MISSING') from None
-
-
-class Dirent(ctypes.Structure):
-    # Linux x86-64 glibc ABI。
-    _fields_ = [('ino', ctypes.c_ulong), ('offset', ctypes.c_long),
-                ('length', ctypes.c_ushort), ('type', ctypes.c_ubyte), ('name', ctypes.c_char * 256)]
-
-
-def directory_page(root, cursor, maximum):
-    """按 libc cookie 续读。"""
-    if not 1 <= maximum <= 200:
-        raise ReadError('INVALID_ARGUMENTS')
-    directory(root)
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.fdopendir.argtypes, libc.fdopendir.restype = [ctypes.c_int], ctypes.c_void_p
-    libc.readdir.argtypes, libc.readdir.restype = [ctypes.c_void_p], ctypes.POINTER(Dirent)
-    libc.telldir.argtypes, libc.telldir.restype = [ctypes.c_void_p], ctypes.c_long
-    libc.seekdir.argtypes = [ctypes.c_void_p, ctypes.c_long]
-    libc.closedir.argtypes = [ctypes.c_void_p]
-    stream = libc.fdopendir(fd)
-    if not stream:
-        os.close(fd)
-        raise ReadError('DIRECTORY_READ_FAILED')
-    try:
-        def identity():
-            info = os.fstat(fd)
-            return [str(value) for value in (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)]
-        before = identity()
-        if cursor and cursor['directory'] != before:
-            raise ReadError('CURSOR_STALE')
-        if cursor:
-            libc.seekdir(stream, int(cursor['position']))
-        entries, ended = [], False
-        for _ in range(maximum):
-            ctypes.set_errno(0)
-            entry = libc.readdir(stream)
-            if not entry:
-                if ctypes.get_errno():
-                    raise ReadError('DIRECTORY_READ_FAILED')
-                ended = True
-                break
-            # 隐藏其他名字，仍计入扫描。
-            name = os.fsdecode(entry.contents.name)
-            entries.append({'id': name if re.fullmatch(r'task_[a-f0-9]{64}', name) else None,
-                            'position': str(libc.telldir(stream))})
-        if before != identity():
-            raise ReadError('CURSOR_STALE')
-        return {'directory': before, 'entries': entries, 'ended': ended}
-    finally:
-        libc.closedir(stream)
+def task_root(root):
+    if not (root / 'runtime/tasks-v3').is_dir():
+        raise ReadError('TASK_STORE_MISSING')
 
 
 def doctor(root, launched_version=None, quick=False):
@@ -143,7 +83,7 @@ def doctor(root, launched_version=None, quick=False):
     files.update(binaries)
     names = ['active_launcher', 'installed_inventory', 'settings', 'private_layout',
              *(item for name in files for item in ([name + ':metadata', name] if name in binaries else [name])),
-             'runtime_pins', 'bin/opencode', 'bin/acpx', 'bin/opencode-task', 'module_profile', 'task_capabilities']
+             'runtime_pins', 'bin/opencode', 'bin/acpx', 'bin/opencode-task', 'git_trust', 'module_profile', 'task_capabilities']
     checks = {name: {'name': name, 'status': 'not_checked'} for name in names}
     actual = profile = features = None
     current = 'active_launcher'
@@ -214,6 +154,8 @@ def doctor(root, launched_version=None, quick=False):
             step('bin/' + tool)
             with private_fd(root / 'bin' / tool, 8192) as (fd, info):
                 require(os.read(fd, 8193).decode() == install.wrapper(root, tool) and info.st_mode & 0o100)
+        step('git_trust')
+        directory(root / 'runtime/git')
         step('module_profile')
         profile = profiles.information(settings.get('runtime_profile', 'none'),
                                        bool(os.environ.get('OPENCODE_MODULE_CONFIG')), os.environ, version)
@@ -239,9 +181,7 @@ def doctor(root, launched_version=None, quick=False):
 
 def main():
     try:
-        if len(sys.argv) == 5 and sys.argv[1] == '_page':
-            value = directory_page(Path(sys.argv[2]), json.loads(sys.argv[3]), int(sys.argv[4]))
-        elif sys.argv[1:2] == ['--root'] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ['--quick']):
+        if sys.argv[1:2] == ['--root'] and len(sys.argv) in (3, 4) and sys.argv[3:] in ([], ['--quick']):
             value = doctor(Path(sys.argv[2]), quick=sys.argv[3:] == ['--quick'])
         else:
             raise ReadError('INVALID_ARGUMENTS')

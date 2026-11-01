@@ -19,9 +19,9 @@ def directory(path, create=False):
     return path
 
 
-def regular(path):
+def regular(path, *, single_link=True):
     info = Path(path).lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or single_link and info.st_nlink != 1:
         raise ValueError('unsafe managed file')
 
 
@@ -68,3 +68,19 @@ def owner(root, workspace):
     if json.loads((root / 'owner.json').read_text()) != {
             'schema': 1, 'uid': os.getuid(), 'workspace_id': workspace}:
         raise ValueError('state belongs to a different UID or workspace')
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def git_trust(root, workspace):
+    """Initialize only the module's private trust store; preserve existing keys."""
+    store = root / 'runtime/git'
+    directory(store, create=True)
+    sync_directory(store)
+    sync_directory(store.parent)
