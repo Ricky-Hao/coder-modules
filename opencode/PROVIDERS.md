@@ -5,6 +5,19 @@
 不启用官方登录；其余 Provider 保持禁用。默认主模型 **codex/gpt-6.1-sol / max**，
 title 为同 Provider Sol/low。完整元数据一致性、context/input/output 和 variants 回归保留。
 
+codex 默认设置 `providers.codex.settings.transport = "websocket"`，使用固定 fork 原生
+Responses WebSocket；copilot 保持未指定 transport，主请求沿 HTTP/SSE。
+固定 fork 的 session 主请求消费此设置；独立的 title/low 请求仍走 HTTP/SSE。
+WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑，不改模型或权限选择。
+原生实现会在连接/升级失败时回退 HTTP，并将该 session 保持在 HTTP；
+请求可能已发送后的中断仍按原生错误语义处理，不把任意中断说成透明回退。
+已有 task 的不可变 profile 保留原传输；新 task 才采用更新默认值。
+
+固定 `v2.2.0-ricky.1` 已用候选配置通过 loopback WebSocket、工具续接和同 session 下一轮验证，
+另用既有 CODEX 环境完成一次隔离真实请求：观测到 WebSocket `response.create` 和
+`response.completed`，返回 `OK`，未发生主请求 HTTP POST。真实验收只证明该次端点请求；
+不包含持续运行、所有模型或所有代理链路。脚本和配置只保存合成信息及 env 引用。
+
 ## 环境变量
 
 在原 Secret/env 机制中独立填写，不把实际值放进 Terraform、JSON、argv 或聊天：
@@ -54,4 +67,5 @@ runtime_profile=none 无外部完整配置时，直接 ACP 保留显式 readines
 不支持不完整模型定义。`opencode --module-profile-info` 不读凭据或联系端点。
 
 本地 fixture 使用 pinned acpx、合成 ACP 和隔离正式 OpenCode/Responses/callback；
-真实服务的端点、访问权与健康由使用方核实，未联系真实 Provider/MCP。
+真实服务的端点、访问权与持续健康由使用方核实；上面的单次 CODEX WebSocket 请求是显式授权的
+隔离验收，其他 fixture 仅使用合成凭据、loopback，不联系真实 Provider/MCP。

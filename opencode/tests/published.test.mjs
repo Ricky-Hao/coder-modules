@@ -6,20 +6,60 @@ import path from "node:path";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { createRequire } from "node:module";
 import { createSharedAcpRuntime, createAgentRegistry } from "../scripts/node_modules/acpx/dist/runtime.js";
 import { TaskStore } from "../scripts/task.mjs";
 import { TaskWorker } from "../scripts/task-worker.mjs";
 import { readyTask } from "./task-fixture.mjs";
 
-for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider}: HTTP 200 response.failed becomes request failure; same session can continue`,
+for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], ["codex", true]]) test(`published OpenCode ${provider}${rejectUpgrade ? " fallback" : ""}: transport, failure, tool continuation and same session`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "published-acp-"));
     fs.chmodSync(base, 0o700);
     const prior = { ...process.env };
     let failing = true;
     const calls = [];
+    const upgrades = [];
     const notifications = [];
     const journalEvents = [];
+    let toolSent = false;
+    const reference = path.join(base, "reference.txt");
+    fs.writeFileSync(reference, "Synthetic WebSocket tool continuation\n", { mode: 0o600 });
+    const respond = (body, transport, event) => {
+      assert.equal(JSON.stringify(body).includes("tcb_"), false);
+      calls.push({ model: body.model, effort: body.reasoning?.effort, transport, type: body.type, previous: body.previous_response_id,
+        toolOutput: body.input?.some((item) => item.type === "function_call_output" && item.output.includes("Synthetic WebSocket tool continuation")) });
+      if (transport === "websocket") {
+        assert.equal(body.type, "response.create"); assert.equal(body.stream, undefined);
+      }
+      const id = `resp_${randomUUID()}`;
+      if (failing && body.reasoning?.effort !== "low") {
+        event({ type: "response.failed", response: { id, object: "response", status: "failed",
+          error: { type: "invalid_request_error", code: "invalid_request", message: "Synthetic response stream failure" } } });
+        return;
+      }
+      const tool = !toolSent && body.reasoning?.effort !== "low";
+      if (tool) toolSent = true;
+      const item = tool ? { id: "fc_fixture", type: "function_call", call_id: "call_read", name: "read",
+        arguments: JSON.stringify({ path: reference }), status: "completed" } :
+        { id: "msg_fixture", type: "message", role: "assistant", status: "completed",
+          content: [{ type: "output_text", text: "Published loopback result", annotations: [] }] };
+      event({ type: "response.created", response: { id, object: "response", status: "in_progress", output: [] } });
+      event({ type: "response.output_item.added", output_index: 0, item: tool ? { ...item, arguments: "", status: "in_progress" } :
+        { ...item, status: "in_progress", content: [] } });
+      if (tool) {
+        event({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: 0, delta: item.arguments });
+        event({ type: "response.function_call_arguments.done", item_id: item.id, output_index: 0, arguments: item.arguments });
+      } else {
+        event({ type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] } });
+        event({ type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: "Published loopback result" });
+        event({ type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text: "Published loopback result" });
+      }
+      event({ type: "response.output_item.done", output_index: 0, item });
+      event({ type: "response.completed", response: { id, object: "response", status: "completed", output: [item],
+        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } });
+    };
     const server = http.createServer((request, response) => {
       let input = "";
       request.on("data", (chunk) => { input += chunk; });
@@ -31,37 +71,28 @@ for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider
           return;
         }
         assert.ok(request.url.endsWith("/responses"));
-        assert.equal(input.includes("tcb_"), false);
         const body = JSON.parse(input);
-        calls.push(body.reasoning?.effort);
-        const id = `resp_${randomUUID()}`;
         const event = (value) => response.write(`event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`);
         response.writeHead(200, { "Content-Type": "text/event-stream" });
-        if (failing && body.reasoning?.effort !== "low") {
-          event({ type: "response.failed", response: { id, object: "response", status: "failed",
-            error: { type: "server_error", code: "upstream_stream_error", message: "Synthetic response stream failure" } } });
-        } else {
-          const item = { id: "msg_fixture", type: "message", role: "assistant", status: "completed",
-            content: [{ type: "output_text", text: "Published loopback result", annotations: [] }] };
-          event({ type: "response.created", response: { id, object: "response", status: "in_progress", output: [] } });
-          event({ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } });
-          event({ type: "response.content_part.added", item_id: item.id, output_index: 0, content_index: 0,
-            part: { type: "output_text", text: "", annotations: [] } });
-          event({ type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: "Published loopback result" });
-          event({ type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text: "Published loopback result" });
-          event({ type: "response.output_item.done", output_index: 0, item });
-          event({ type: "response.completed", response: { id, object: "response", status: "completed", output: [item],
-            usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } });
-        }
+        respond(body, "http", event);
         response.end();
       });
+    });
+    const { WebSocketServer } = createRequire(import.meta.url)(process.env.OPENCODE_FIXTURE_WS || "ws");
+    const sockets = new WebSocketServer({ noServer: true });
+    server.on("upgrade", (request, socket, head) => {
+      upgrades.push({ path: request.url, beta: request.headers["openai-beta"] });
+      if (rejectUpgrade) { socket.end("HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n"); return; }
+      sockets.handleUpgrade(request, socket, head, (ws) => ws.on("message", (data) => {
+        respond(JSON.parse(data), "websocket", (value) => ws.send(JSON.stringify(value)));
+      }));
     });
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const endpoint = `http://127.0.0.1:${server.address().port}`;
     const config = JSON.parse(fs.readFileSync(new URL("../scripts/profile-env.json", import.meta.url), "utf8"));
     config.model.providerID = provider; config.agents.title.model.providerID = provider;
     config.mcp = { servers: {} };
-    for (const provider of Object.values(config.providers)) provider.settings = { baseURL: endpoint + "/v1", apiKey: "synthetic-key" };
+    for (const provider of Object.values(config.providers)) provider.settings = { ...provider.settings, baseURL: endpoint + "/v1", apiKey: "synthetic-key" };
     const configFile = path.join(base, "config.json");
     fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
     Object.assign(process.env, { HOME: base, TMPDIR: base, XDG_DATA_HOME: path.join(base, "data"),
@@ -82,6 +113,7 @@ for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider
     fs.mkdirSync(taskRoot, { mode: 0o700 });
     const store = new TaskStore(taskRoot);
     let handle;
+    const shutdown = runtime.shutdown.bind(runtime);
     try {
       const submit = (key, letter) => readyTask(store, { key, prompt: "Synthetic fixture: answer one short sentence.",
         callback: { callback_id: `tcb_${letter.repeat(43)}`, callback_url: endpoint + "/api/agents/task-callbacks" } },
@@ -90,7 +122,7 @@ for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider
       const worker = () => new TaskWorker(store, { runtime, pollMs: 100 });
       // This fixture deliberately reuses the native client for a second turn;
       // production workers each detach their own client at exit.
-      const shutdown = runtime.shutdown.bind(runtime); runtime.shutdown = async () => {};
+      runtime.shutdown = async () => {};
       await worker().run(failed); handle = failed.handle;
       const firstResult = store.summary(failed, { output: true });
       assert.equal(firstResult.result_status, "error");
@@ -102,12 +134,29 @@ for (const provider of ["codex", "copilot"]) test(`published OpenCode ${provider
       assert.equal(store.summary(success).result_status, "success", JSON.stringify({ calls, journalEvents }));
       assert.equal(store.summary(success, { output: true }).output, "Published loopback result");
       assert.equal(success.handle.acpxRecordId, handle.acpxRecordId);
-      runtime.shutdown = shutdown;
       assert.equal(notifications.length, 2);
-      assert.ok(calls.includes("max"));
+      assert.ok(calls.some((call) => call.effort === "max"));
+      assert.ok(calls.some((call) => call.effort === "low"));
+      assert.ok(calls.every((call) => call.model === "gpt-6.1-sol"));
+      assert.ok(calls.filter((call) => call.effort === "low").every((call) => call.transport === "http"));
+      assert.ok(calls.some((call) => call.toolOutput));
+      if (provider === "codex") {
+        assert.ok(upgrades.length > 0);
+        assert.ok(upgrades.every((upgrade) => upgrade.path === "/v1/responses" && upgrade.beta === "responses_websockets=2026-02-06"));
+        assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
+        if (rejectUpgrade) assert.equal(upgrades.length, 1); // Connect failure pins this session to HTTP.
+        else assert.ok(calls.some((call) => call.toolOutput && typeof call.previous === "string"));
+      } else {
+        assert.equal(upgrades.length, 0);
+        assert.ok(calls.every((call) => call.transport === "http"));
+      }
+      console.log(JSON.stringify({ provider, rejected_upgrade: rejectUpgrade, upgrades: upgrades.length, calls,
+        same_session: true, callbacks: notifications.length }));
     } finally {
       if (handle) await runtime.close({ handle, reason: "published fixture cleanup" }).catch(() => {});
-      await runtime.shutdown();
+      await shutdown();
+      for (const ws of sockets.clients) ws.terminate();
+      sockets.close();
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
       for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
