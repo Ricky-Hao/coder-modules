@@ -30,6 +30,8 @@ Use [fork-local manual validation](CONTRIBUTING.md#fork-local-validation) before
   [Launch environment](opencode/README.md#launch-environment)。
   有界任务列表、状态/结果和离线安装自检见 [只读入口](opencode/TASKS.md#回执错误与查询)。
   `doctor` 默认完整校验；`doctor --quick` 只做静态日常核对，明确跳过二进制内容/哈希。
+  每个公共入口先做[中心规则/通用 Skill 同步](opencode/README.md#中心个人规则与通用-skill)，
+  查询只更新全局配置，不改写或重派业务 task。
   Agent 可通过现有 Workspace Bash 调用 [`launch`](opencode/TASKS.md#高层-launch-入口)，
    用私密 JSON 一次准备 Git worktree 并尝试派发；可选 origin 分支 `base`，默认 main。
    续接保留原 SHA、session 和选择。

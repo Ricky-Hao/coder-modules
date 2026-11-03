@@ -48,16 +48,19 @@ test("query reads no original input; canonical and callback output are independe
   assert.equal(result.output, "late canonical"); assert.equal(result.callback_output, "outcome unknown"); assert.equal(result.outcome_unknown, false);
   assert.deepEqual(snapshot(store.root), before); assert.equal(JSON.stringify(result).includes("private.invalid"), false);
 });
-test("installed pure help/query never create stores, locks, config or read Provider credentials", (t) => {
+test("after shared config sync, help/query never create business stores/locks/profiles or read Provider credentials", (t) => {
   const store = fixture(t), root = path.join(store.root, "toolset"), version = path.join(root, "version");
   for (const name of [version, path.join(root, "runtime/tasks"), path.join(root, "bin"), path.join(version, "node/bin")]) fs.mkdirSync(name, { recursive: true, mode: 0o700 });
   fs.copyFileSync(process.execPath, path.join(version, "node/bin/node"));
-  for (const name of ["runtime.py", "git_ssh.py", "profiles.py", "safety.py", "diagnostics.py", "task-cli.mjs", "task.mjs"])
+  for (const name of ["runtime.py", "agent_config.py", "git_ssh.py", "profiles.py", "safety.py", "diagnostics.py", "task-cli.mjs", "task.mjs"])
     fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(version, name));
   save(path.join(version, "settings.json"), { install_root: root, workspace_id: "readonly", runtime_profile: "env" });
+  const seed = spawnSync("python3", ["-B", new URL("./agent_config_fixture.py", import.meta.url).pathname, root, version, "readonly"], { encoding: "utf8" });
+  assert.equal(seed.status, 0, seed.stderr);
+  const configFixture = JSON.parse(seed.stdout);
   fs.writeFileSync(path.join(root, "runtime/tasks/old-private"), "preserve old namespace");
   const call = (...args) => spawnSync("python3", ["-B", path.join(version, "runtime.py"), "opencode-task", ...args],
-    { env: { PATH: "/usr/bin:/bin", OPENCODE_MODULE_CONFIG: "/DO-NOT-READ/config" }, encoding: "utf8", timeout: 5000 });
+    { env: { PATH: configFixture.path, OPENCODE_MODULE_CONFIG: "/DO-NOT-READ/config" }, encoding: "utf8", timeout: 5000 });
   let before = snapshot(root);
   for (const args of [[], ["--version"], ["--help"], ["launch", "--help"], ["recover", "-h"], ["status", "--help"], ["doctor", "--help"]]) {
     const response = call(...args); assert.equal(response.status, 0, response.stderr);
@@ -70,6 +73,18 @@ test("installed pure help/query never create stores, locks, config or read Provi
     assert.equal(response.stdout.includes("private fixture prompt"), false);
   }
   assert.deepEqual(snapshot(root), before);
+  const business = snapshot(tasks);
+  for (const args of [["list"], ["status", task.id], ["result", task.id]]) {
+    const text = `Rules updated by query ${args[0]}\n`;
+    fs.writeFileSync(path.join(configFixture.source, "AGENTS.md"), text);
+    for (const gitArgs of [["add", "."], ["commit", "-m", args[0]]]) {
+      const committed = spawnSync("git", ["-C", configFixture.source, ...gitArgs], { encoding: "utf8" });
+      assert.equal(committed.status, 0, committed.stderr);
+    }
+    assert.equal(call(...args).status, 0);
+    assert.equal(fs.readFileSync(path.join(root, "runtime/config/opencode/AGENTS.md"), "utf8"), text);
+    assert.deepEqual(snapshot(tasks), business);
+  }
   assert.deepEqual(fs.readdirSync(path.dirname(current.filename(task.id))), ["task.json"]);
   assert.equal(fs.existsSync(path.join(root, "runtime/module-profiles")), false);
   assert.equal(fs.readFileSync(path.join(root, "runtime/tasks/old-private"), "utf8"), "preserve old namespace");

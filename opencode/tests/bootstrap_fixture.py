@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+from agent_config_fixture import source as config_source
 
 SCRIPT_BUDGET = 65536
 BOOTSTRAP_MARKER = "<<'OPENCODE_BOOTSTRAP'\n"
@@ -55,6 +56,10 @@ def launch(script, home, fixture_dir, release, node, offline=False):
                         '    sys.exit(execute_fixture())\n'
                         'os.execv("/usr/bin/python3", ["/usr/bin/python3", *sys.argv[1:]])\n')
     launcher.chmod(0o700)
+    if not (fixture_dir / 'config-source').exists():
+        config_source(fixture_dir)
+    shutil.copyfile(fixture_dir / 'git-bin/git', shim / 'git')
+    (shim / 'git').chmod(0o700)
     config = fixture_dir / 'fixture.json'
     config.write_text(json.dumps({'release': str(release), 'node': str(node),
                                   'download_log': str(fixture_dir / 'downloads.jsonl'),
@@ -102,14 +107,20 @@ def verify_startup(script, fixture_dir):
     session.write_bytes(b'old session')
     cache = root / 'runtime/cache/cache-fixture'
     cache.write_bytes(b'old cache')
+    rule = root / 'runtime/config/opencode/AGENTS.md'
+    skill = root / 'runtime/config/opencode/skills/agent-config/example/references/guide.md'
+    center_state = (root / 'runtime/agent-config/state.json').read_bytes()
+    snapshot = os.readlink(root / 'runtime/agent-config/current')
     preserved = {path: (path.read_bytes(), path.stat().st_uid, path.stat().st_mode)
-                 for path in (task_state, session, cache)}
+                 for path in (task_state, session, cache, rule, skill)}
     repeated = launch(script, home, fixture_dir, release, node, offline=True)
     assert repeated.returncode == 0, repeated.stderr
     assert os.readlink(root / 'active') == active
     assert not (root / 'runtime/state/fixture-startup-recoveries').exists()
     assert json.loads((root / 'status.json').read_text())['state'] == 'ready'
     assert preserved == {path: (path.read_bytes(), path.stat().st_uid, path.stat().st_mode) for path in preserved}
+    assert (root / 'runtime/agent-config/state.json').read_bytes() == center_state
+    assert os.readlink(root / 'runtime/agent-config/current') == snapshot
     assert sibling_state == (sibling.stat().st_uid, sibling.stat().st_mode, (sibling / 'preserved').read_bytes())
     assert len((fixture_dir / 'downloads.jsonl').read_text().splitlines()) == 2
     for tool in ('opencode', 'acpx', 'opencode-task'):

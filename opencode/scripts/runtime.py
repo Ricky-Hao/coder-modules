@@ -13,6 +13,7 @@ sys.path.insert(0, str(VERSION))
 from safety import ancestors, directory, owner, regular, sync_directory
 import profiles
 import git_ssh
+import agent_config
 
 RESERVED = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
             'TMPDIR', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CONFIG_CONTENT',
@@ -160,6 +161,17 @@ def launch_selection(settings, request):
 def main():
     os.umask(0o077)
     tool, arguments = sys.argv[1], sys.argv[2:]
+    # Public entrypoints update only the shared rules, before any command routing.
+    # Selection/worker subprocesses belong to an already-entered public command.
+    if tool != 'opencode-task' or arguments[:1] not in (['_selection'], ['_run']):
+        try:
+            settings = json.loads((VERSION / 'settings.json').read_text())
+            caller_paths = {'HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'TMPDIR'}
+            agent_config.synchronize(Path(settings['install_root']), settings['workspace_id'],
+                                     filtered_environment(os.environ, caller_paths))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            agent_config.report(error)
+            return 1
     readonly = tool == 'opencode-task' and (arguments[:1] in (['list'], ['status'], ['result'], ['doctor'])
                                            or not arguments or arguments == ['help'] or profiles.harmless(arguments))
     if readonly:
@@ -170,6 +182,7 @@ def main():
             root = Path(settings['install_root'])
             if arguments in (['doctor'], ['doctor', '--quick']):
                 value = doctor(root, VERSION, quick=arguments == ['doctor', '--quick'])
+                value.update(read_only=False, agent_config_sync=True)
                 print(json.dumps(value, ensure_ascii=False))
                 return 0 if value['ok'] else 1
             if arguments[:1] == ['doctor'] and not profiles.harmless(arguments):
@@ -177,7 +190,7 @@ def main():
             if arguments[:1] in (['list'], ['status'], ['result']) and not profiles.harmless(arguments):
                 field = 'task_store'
                 task_root(root)
-            # 查询没有初始化、锁文件或 profile materialize；Node 只运行命令投影。
+            # 同步完成后的查询不初始化业务记录或 profile；Node 只运行命令投影。
             binary = VERSION / 'node/bin/node'
             field = 'installation'
             regular(binary)

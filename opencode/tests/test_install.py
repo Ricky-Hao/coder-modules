@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+from agent_config_fixture import source
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
 spec = importlib.util.spec_from_file_location('installer', SCRIPTS / 'install.py')
@@ -78,6 +79,7 @@ class InstallerTests(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.home = self.base / 'home'
         self.home.mkdir(mode=0o700)
+        self.config_repo, self.git_bin = source(self.base)
         self.root = self.base / 'tool root with spaces'
         self.tar = self.base / 'release.tar.gz'
         self.node = self.base / 'node.tar.gz'
@@ -101,7 +103,7 @@ class InstallerTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def fixtures(self):
-        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': '/usr/bin:/bin'}, clear=True), \
+        with patch.dict(os.environ, {'HOME': str(self.home), 'PATH': str(self.git_bin) + ':/usr/bin:/bin'}, clear=True), \
                 patch.object(installer, 'NODE_SHA256', installer.digest(self.node)), \
                 patch.object(installer.subprocess, 'run', side_effect=self.fixture_run):
             yield
