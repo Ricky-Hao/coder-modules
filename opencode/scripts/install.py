@@ -22,7 +22,7 @@ NODE_SHA256 = '1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce'
 NODE_URL = 'https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz'
 ACPX_VERSION = '0.21.1'
 TARGET = 'opencode-linux-x64-baseline'
-PAYLOAD_FILES = {'install.py', 'runtime.py', 'git_ssh.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-worker.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs',
+PAYLOAD_FILES = {'install.py', 'runtime.py', 'agent_config.py', 'git_ssh.py', 'diagnostics.py', 'safety.py', 'profiles.py', 'shell_path.py', 'task.mjs', 'task-worker.mjs', 'task-launch.mjs', 'task-cli.mjs', 'task-acp.mjs',
                  'profile-env.json', 'package.json', 'package-lock.json'}
 
 
@@ -59,7 +59,7 @@ def prerequisites():
         raise ValueError('Python 3.11+ required')
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'amd64') or platform.libc_ver()[0] != 'glibc':
         raise UnsupportedPlatform('Linux x64 glibc required')
-    for command in ('bash', 'curl', 'tar', 'xz'):
+    for command in ('bash', 'curl', 'tar', 'xz', 'git'):
         if shutil.which(command) is None:
             raise ValueError('missing prerequisite: ' + command)
 
@@ -286,6 +286,8 @@ def install(bundle):
             for name in ('home', 'config', 'data', 'cache', 'state', 'tmp'):
                 safety['directory'](root / 'runtime' / name, create=True)
             safety['git_trust'](root, config['workspace_id'])
+            subprocess.run([sys.executable, '-B', str(version / 'agent_config.py')], check=True,
+                           stdout=subprocess.DEVNULL)
             acpx = safety['directory'](root / 'runtime/home/.acpx', create=True)
             if not os.path.lexists(acpx / 'config.json'):
                 safety['write_json'](acpx / 'config.json', {

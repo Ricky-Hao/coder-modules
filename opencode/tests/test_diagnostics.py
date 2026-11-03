@@ -44,6 +44,8 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(response.returncode, 0, response.stderr + response.stdout)
         value = json.loads(response.stdout)
         self.assertTrue(value['ok'])
+        self.assertFalse(value['read_only'])
+        self.assertTrue(value['agent_config_sync'])
         self.assertEqual(value['runtime']['node'], '22.23.4')
         self.assertEqual(value['runtime']['acpx'], '0.21.1')
         self.assertFalse(value['runtime']['executed'])

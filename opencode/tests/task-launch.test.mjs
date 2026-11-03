@@ -19,7 +19,7 @@ function fixture(t) {
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
   const root = path.join(base, "toolset"), version = path.join(root, "version"), tasks = path.join(root, "runtime/tasks-v3");
   for (const dir of [version, tasks]) fs.mkdirSync(dir, { mode: 0o700, recursive: true });
-  for (const name of ["runtime.py", "git_ssh.py", "profiles.py", "profile-env.json", "safety.py"]) fs.copyFileSync(path.join(scripts, name), path.join(version, name));
+  for (const name of ["runtime.py", "agent_config.py", "git_ssh.py", "profiles.py", "profile-env.json", "safety.py"]) fs.copyFileSync(path.join(scripts, name), path.join(version, name));
   for (const name of ["home", "config", "data", "cache", "state", "tmp"]) fs.mkdirSync(path.join(root, "runtime", name), { mode: 0o700 });
   save(path.join(root, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "launch-fixture" });
   save(path.join(version, "settings.json"), { install_root: root, workspace_id: "launch-fixture", runtime_profile: "env" });

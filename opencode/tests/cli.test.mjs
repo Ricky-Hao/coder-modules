@@ -19,7 +19,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture");
     fs.mkdirSync(version, { recursive: true, mode: 0o700 });
-    for (const name of ["runtime.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
+    for (const name of ["runtime.py", "agent_config.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     const copiedCli = path.join(version, "task-cli.mjs");
     fs.writeFileSync(copiedCli, recordFixtureSpawns(fs.readFileSync(copiedCli, "utf8"), path.join(base, "drivers.ndjson")));
@@ -31,6 +31,9 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const write = (file, value) => fs.writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
     write(path.join(root, "owner.json"), { schema: 1, uid: process.getuid(), workspace_id: "cli-fixture" });
     write(path.join(version, "settings.json"), { install_root: root, workspace_id: "cli-fixture", runtime_profile: "env" });
+    const seed = spawnSync("python3", ["-B", fileURLToPath(new URL("./agent_config_fixture.py", import.meta.url)), root, version, "cli-fixture"], { encoding: "utf8" });
+    assert.equal(seed.status, 0, seed.stderr);
+    const configFixture = JSON.parse(seed.stdout);
     fs.symlinkSync("versions/fixture", path.join(root, "active"));
     for (const tool of ["opencode", "opencode-task"])
       fs.writeFileSync(path.join(root, "bin", tool), `#!/usr/bin/env bash\nexec python3 -B ${quote(path.join(root, "active/runtime.py"))} ${tool} "$@"\n`, { mode: 0o700 });
@@ -39,7 +42,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     write(path.join(root, "runtime/home/.acpx/config.json"), { defaultAgent: "opencode", defaultPermissions: "deny-all", nonInteractivePermissions: "deny", authPolicy: "skip",
       agents: { opencode: { argv: [path.join(root, "bin/opencode"), "acp"] } } });
     const progress = path.join(base, "progress-control"); fs.mkdirSync(progress, { mode: 0o700 });
-    const env = { PATH: process.env.PATH, HOME: base, CODEX_BASE_URL: "http://127.0.0.1:1/v1", CODEX_API_KEY: "synthetic-codex",
+    const env = { PATH: configFixture.path + ':' + process.env.PATH, HOME: base, CODEX_BASE_URL: "http://127.0.0.1:1/v1", CODEX_API_KEY: "synthetic-codex",
       COPILOT_BASE_URL: "http://127.0.0.1:1/v1", COPILOT_API_KEY: "synthetic-copilot",
       TASK_FIXTURE_LOG: path.join(base, "executions"), TASK_FIXTURE_PROCESS_LOG: path.join(base, "processes"),
       TASK_FIXTURE_EVENT_LOG: path.join(base, "events.ndjson"), TASK_FIXTURE_PROGRESS_CONTROL: progress,
@@ -104,7 +107,10 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const selected = JSON.parse(checked(["result", first.task_id]).output);
       assert.equal(selected.model, "codex/gpt-6.1-sol"); assert.equal(selected.effort, "max");
       assert.equal(selected.title.variant, "low");
+      fs.writeFileSync(path.join(configFixture.source, "AGENTS.md"), "Rules updated before duplicate launch\n");
+      git(configFixture.source, "add", "."); git(configFixture.source, "commit", "-m", "update rules");
       assert.equal(launch(firstInput).request_id, first.request_id);
+      assert.equal(fs.readFileSync(path.join(root, "runtime/config/opencode/AGENTS.md"), "utf8"), "Rules updated before duplicate launch\n");
       const follow = launch({ schema_version: 1, key: "follow", prompt: "continuity", callback: callback("b") }, first.task_id);
       assert.equal(follow.base, first.base); assert.equal(follow.base_sha, first.base_sha);
       await until(() => box(follow.task_id)?.state === "delivered", "trusted followup");

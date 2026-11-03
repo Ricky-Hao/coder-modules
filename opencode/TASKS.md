@@ -17,8 +17,10 @@ opencode-task recover TASK_ID
 opencode-task doctor --quick
 ```
 
-help/version、launch --help、status/result/list/doctor 只读，不创建目录、锁或配置，不读 Provider
-凭据。查询不恢复任务。`recover` 省略 ID 时只处理当前 namespace 中未完成或待投递的记录；
+所有公共入口先同步中心全局规则与通用 Skill，包括 help/version、launch --help、
+status/result/list/doctor。同步可创建/更新规则缓存、同步锁和全局加载链接，细节与失败策略见
+[中心同步](README.md#中心个人规则与通用-skill)。同步后这些查询不创建业务目录、锁或模型配置，
+不读 Provider 凭据，不恢复任务。`recover` 省略 ID 时只处理当前 namespace 中未完成或待投递的记录；
 preparing 留作人工核对。没有公开 submit、inspect 或自动恢复入口。
 
 ## 高层 launch 入口
@@ -175,8 +177,15 @@ render/首次/cache/nonroot/PVC 保留。测试不进 payload，不访问真实�
 npm --prefix opencode/scripts ci --ignore-scripts --no-audit --no-fund
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test --test-concurrency=1 opencode/tests/runtime.test.mjs opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs
 env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode node --test opencode/tests/published.test.mjs
+env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode AGENT_CONFIG_FIXTURE_SOURCE=/private/fixture/center-repo AGENT_CONFIG_EVIDENCE_DIR=/private/new-evidence node --test opencode/tests/agent-config-published.test.mjs
 ```
 
 OPENCODE_FIXTURE_BINARY 指向已发布的固定 OpenCode。原生 OpenSSH 回环 fixture 另需隔离的
 paramiko 3.5.1，用 PYTHONPATH 指向即可，不进 payload。Terraform 命令见
 [README](README.md#validation-and-publication-boundary)。
+
+中心加载 fixture 复制已校验中心快照到本地测试 Git repo，并附加合成标记；
+AGENT_CONFIG_FIXTURE_SOURCE 是包含 AGENTS.md、skills/ 的快照目录，不是认证配置。
+固定二进制通过模块公共入口读取规则，mock Responses 请求真实调用原生 skill 工具，
+再同步合成更新并在同一 ACP session 与新 session 发请求。只发 loopback，不调用真实推理/MCP；
+requests.jsonl 是 canonical 合成请求证据。设置 evidence 目录时保留现场，否则自动清理。

@@ -15,7 +15,8 @@ opencode-task cancel TASK_ID
 opencode-task recover [TASK_ID]
 opencode-task doctor [--quick]
 新 launch 默认 approve-all；continue 省略权限沿原保存值。本轮时限默认 900 秒。
-help/version/status/result/list/doctor 只读。恢复只用显式 recover，不重派原 request。
+所有公共入口先同步中心全局规则/Skill；help/version/status/result/list/doctor 不改业务记录。
+恢复只用显式 recover，不重派原 request。
 accepted 不等于 started；canonical success 不证明业务目标完成。详见 TASKS.md。`;
 const invalid = () => { throw new TaskError("INVALID_ARGUMENTS", { stage: "validate", field: "arguments", action: "fix_input" }); };
 function options(names) {

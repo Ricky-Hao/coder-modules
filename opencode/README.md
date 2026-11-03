@@ -121,7 +121,7 @@ python3 -B opencode/build_bundle.py --check
 
 ## 固定工具与输入
 
-需要 Linux x86-64 glibc、Bash、Python 3.11+、curl、tar 和 xz。不编译源码或安装系统前置包。
+需要 Linux x86-64 glibc、Bash、Python 3.11+、Git、curl、tar 和 xz。不编译源码或安装系统前置包。
 首次安装需网络下载经过校验的发行包；核验后的缓存可离线使用。npm 禁用 lifecycle scripts。
 
 | 输入 | 默认值 |
@@ -168,6 +168,61 @@ Sol/low。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择
 `agents.title.model = { providerID, model: "gpt-6.1-sol", variant: "low" }`；主请求仍为 max。
 title 失败可能按主模型重试。压缩使用 session model/agent；普通生成和继承选择的子任务
 不受 title 低档位影响。无需第三模型、全局 small-model 选项或 fork 修改。
+
+## 中心个人规则与通用 Skill
+
+安装、普通 `opencode`/`acpx` 启动及 **每个 `opencode-task` 公共入口**（含 help/version、
+list/status/result/doctor）先同步私有中心
+`ssh://git@git.rickyhao.com:2222/RickyHao/agent-config.git` 的 `main`，随后执行原命令。
+查询更新全局规则是有意的副作用；同步不创建业务 task/session、不操作业务 Git repo，
+不恢复任务、不重放请求。任务模型 profile 与权限仍按原快照固定。
+
+同步复用 Git、启动者的受控认证环境和现有 Git SSH hook；不复制凭据或输出 Git stderr。
+网络操作总计最多 6 秒，合作写入锁最多等待 8 秒。先比较远端 revision，变化时取得完整
+原始 Git 对象，校验内容及执行权限后发布到 `runtime/agent-config/snapshots/<tree>/repo`。
+不应用 `export-ignore`、`export-subst` 或 checkout filter，以免漏掉或改写引用文件。
+共享 `current` 链接原子切换；旧完整快照保留。相同内容不替换加载链接。
+网络失败且已有完整副本时简短提示沿用旧版；首次无副本时返回
+`AGENT_CONFIG_SYNC_FAILED`，不执行原命令。目标冲突或已修改缓存拒绝覆盖。
+
+OpenCode 实际加载位置为 `<install_root>/runtime/config/opencode/AGENTS.md`，
+它是快照正文的托管 hardlink，以临时文件加 atomic replace 发布，保持原生 watcher 使用的
+全局路径。完整通用包位于该配置目录的 `skills/agent-config/`，链接到同一共享快照。
+引用文件、脚本与 license 随完整仓库保留。固定 fork 原生发现配置目录的 `skill/skills`；
+本模块不依赖 `.agents/skills` 的原生发现。项目 `.agents/skills` 按通用正文约定按需读取，
+不是可执行 hook。已有 unmanaged AGENTS 或 `skills/agent-config` 会报冲突，须由用户先整理；
+其他 Skill、旧任务、session 和 cache 保留。
+
+全局文件与 Skill 入口分别原子替换。同步成功返回前两处均完成；普通发布错误回退旧版。
+这不是跨路径事务：并发读取或进程在两次替换间中断时，可观察到两个不同但完整的版本；
+下一公共入口在同步锁内校正中断状态。固定 fork 会缓存全局文件的 canonical 路径，
+因此不能用单个 generation 软链同时提供跨路径原子切换和已有会话热更新。
+锁等待超时时明确报 `busy`，保留缓存并停止原命令。
+
+第三方 Skill 只消费中心审阅的版本，不在启动时另追 upstream。全局正文对所有会话共用，
+不做每个 task 的规则快照。固定 fork 的 instruction/skill watcher 会重载配置；
+隔离固定二进制已验证：同一 ACP session 的下一请求收到新全局正文及新增 Skill，
+新 session 同样读取新版。Skill 正文与引用文件通过原生工具实际加载。
+验证使用中心完整包、本地测试 Git 更新、合成标记与 loopback Responses；
+不代表真实 Provider/MCP 健康，也不保证正在执行中的请求中途换规则。
+
+普通 Codex 可显式执行同一同步器，接入同一正文及完整 Skill，不安装或运行 Codex：
+
+```sh
+python3 -B /mnt/opencode/toolset/active/agent_config.py --codex-home "${CODEX_HOME:-$HOME/.codex}"
+```
+
+HOME 安装时将脚本路径改为 `"$HOME/.coder-opencode/active/agent_config.py"`。
+Codex 的全局规则为 `$CODEX_HOME/AGENTS.md`，默认 `~/.codex/AGENTS.md`；
+`AGENTS.override.md` 会优先覆盖它，命令在该文件存在时拒绝接入。
+本命令使用仍受支持的 `$CODEX_HOME/skills`（默认 `~/.codex/skills`）兼容路径。
+当前 Codex 新推荐的用户路径是 `~/.agents/skills`，也支持目录 symlink；
+此处显式选择 CODEX_HOME 下的路径，避免同时向两处安装重复 Skill。
+命令只创建托管链接，保留现有规则文件和其他 Skill；冲突时失败，不自动合并。
+路径核定见 [Codex 官方源码](https://github.com/openai/codex/tree/main/codex-rs/ext/skills/src)。
+更新后为 Codex 新开会话；这里不承诺已有 Codex 会话热更新。
+需要每次启动检查时，可在自己的启动命令中先执行上述命令，成功后再执行原有 Codex 命令。
+LibreChat 仅消费同一通用正文；其专属 Skill、角色与平台流程留在平台，此模块不改平台源码。
 
 <a id="launch-environment"></a>
 ## 启动环境
@@ -227,7 +282,9 @@ StrictHostKeyChecking 保留；这些文件只读，本次 key 由 hook 另存�
 其他 Git SSH variant、未知 wrapper 参数、shell 控制操作符或需 shell 展开的复杂身份命令明确拒绝。
 主机证书由 hook 成功返回空内容，沿 OpenSSH 既有 known_hosts/CA 与原生回退规则；模块不自动信任或保存证书。
 hook 的代码位置和信任路径经环境传给 Python，不经 OpenSSH 再展开；支持字面量 `${HOME}`、空格、引号和 `%`。
-首次/缓存初始化保留已记 key；不扫描旧任务、不递归 chown 旧卷。doctor 只核必要信任目录，无重复 owner 或全库扫描，不联系远端。
+首次/缓存初始化保留已记 key；不扫描旧任务、不递归 chown 旧卷。
+doctor 的安装自检只核必要信任目录，不扫描整个 trust store；公共入口仍先联系中心同步规则。
+因此公共 doctor 返回 `read_only: false, agent_config_sync: true`；自检本身不恢复或改写业务任务。
 
 <a id="validation-and-publication-boundary"></a>
 ## 验证与交付边界

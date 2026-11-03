@@ -54,7 +54,7 @@ def main(work, node, pvc):
                                       capture_output=True, text=True, timeout=10)
             assert response.returncode == (0 if ok else 1), response.stdout + response.stderr
             assert 'PRIVATE-' not in response.stdout + response.stderr
-            return json.loads(response.stdout if response.stdout else response.stderr)
+            return json.loads(response.stdout if response.stdout else response.stderr.splitlines()[-1])
 
         for args in (('doctor',), ('doctor', '--quick')):
             before = snapshot(root)
