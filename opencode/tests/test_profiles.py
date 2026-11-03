@@ -72,7 +72,8 @@ class ProfileTests(unittest.TestCase):
         provider = cfg['providers']['codex']
         self.assertEqual(provider['package'], '@opencode/ai/providers/openai/responses')
         self.assertEqual(provider['env'], ['CODEX_API_KEY'])
-        self.assertEqual(provider['settings'], {'baseURL': '{env:CODEX_BASE_URL}', 'apiKey': '{env:CODEX_API_KEY}'})
+        self.assertEqual(provider['settings'], {'baseURL': '{env:CODEX_BASE_URL}', 'apiKey': '{env:CODEX_API_KEY}',
+                                                'transport': 'websocket'})
         # Compare every behavioral field, including all metadata, to prevent Provider drift.
         self.assertEqual({k: v for k, v in provider.items() if k not in ('name', 'env', 'settings')},
                          {k: v for k, v in cfg['providers']['copilot'].items() if k not in ('name', 'env', 'settings')})
@@ -111,6 +112,27 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(variants[cfg['agents']['title']['model']['variant']], {'reasoningEffort': 'low'})
         self.assertEqual(variants[cfg['model']['variant']], {'reasoningEffort': 'max'})
         self.assertEqual(sol['settings'], {'reasoningEffort': 'max'})
+
+    def test_saved_http_task_profile_does_not_adopt_new_websocket_default(self):
+        import runtime
+        self.fixture.install()
+        config = profiles.configuration(self.env, fixtures.SCRIPTS)
+        config['providers']['codex']['settings'].pop('transport')
+        path = profiles.materialize(self.root, 'test-workspace', config)
+        saved = {'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
+                 'modelConfig': str(path), 'modelProfile': 'env'}
+        before = path.read_bytes()
+        with patch.dict(os.environ, self.env, clear=True):
+            continued = runtime.launch_selection(self.fixture.bundle['config'], {'saved': saved})
+            fresh = runtime.launch_selection(self.fixture.bundle['config'], {})
+        self.assertEqual(continued, saved)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertNotEqual(fresh['modelConfig'], saved['modelConfig'])
+        current = json.loads(Path(fresh['modelConfig']).read_text())
+        self.assertEqual(current['providers']['codex']['settings']['transport'], 'websocket')
+        self.assertNotIn('transport', current['providers']['copilot']['settings'])
+        self.assertEqual(continued['model'], fresh['model'])
+        self.assertEqual(config['agents'], current['agents'])
 
     def test_default_profile_launch_and_idempotent_private_config(self):
         self.fixture.install()

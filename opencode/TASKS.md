@@ -176,13 +176,18 @@ render/首次/cache/nonroot/PVC 保留。测试不进 payload，不访问真实�
 ```sh
 npm --prefix opencode/scripts ci --ignore-scripts --no-audit --no-fund
 env -i PATH=/usr/local/bin:/usr/bin:/bin node --test --test-concurrency=1 opencode/tests/runtime.test.mjs opencode/tests/cli-fixture.test.mjs opencode/tests/cli.test.mjs
-env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode node --test opencode/tests/published.test.mjs
+env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode OPENCODE_FIXTURE_WS=/private/fixture/node_modules/ws node --test opencode/tests/published.test.mjs
 env -i PATH=/usr/local/bin:/usr/bin:/bin OPENCODE_FIXTURE_BINARY=/private/fixture/opencode AGENT_CONFIG_FIXTURE_SOURCE=/private/fixture/center-repo AGENT_CONFIG_EVIDENCE_DIR=/private/new-evidence node --test opencode/tests/agent-config-published.test.mjs
 ```
 
 OPENCODE_FIXTURE_BINARY 指向已发布的固定 OpenCode。原生 OpenSSH 回环 fixture 另需隔离的
 paramiko 3.5.1，用 PYTHONPATH 指向即可，不进 payload。Terraform 命令见
 [README](README.md#validation-and-publication-boundary)。
+
+published fixture 的 WebSocket server 另需已有测试依赖 `ws`；OPENCODE_FIXTURE_WS 指向该模块目录，
+未设置时沿 Node 的普通模块解析。依赖只用于测试，不进入安装 payload。
+它保留候选 provider transport，分别核 codex WebSocket、copilot HTTP 和拒绝升级后的原生 HTTP fallback，
+并检查主模型/max、title/low、工具调用续接、同 session、失败与回调。
 
 中心加载 fixture 复制已校验中心快照到本地测试 Git repo，并附加合成标记；
 AGENT_CONFIG_FIXTURE_SOURCE 是包含 AGENTS.md、skills/ 的快照目录，不是认证配置。
