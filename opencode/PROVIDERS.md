@@ -11,7 +11,22 @@ Responses WebSocket；copilot 保持未指定 transport，主请求沿 HTTP/SSE�
 WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑，不改模型或权限选择。
 原生实现会在连接/升级失败时回退 HTTP，并将该 session 保持在 HTTP；
 请求可能已发送后的中断仍按原生错误语义处理，不把任意中断说成透明回退。
-已有 task 的不可变 profile 保留原传输；新 task 才采用更新默认值。
+已有 task/session 沿保存的不可变 profile 保留原传输与压缩策略，不迁移或回写；
+新 task 才采用更新默认值。
+
+codex 默认设置 `providers.codex.settings.compaction = {"type":"native"}`，复用固定 fork
+原生远程压缩：上游返回不透明的加密 checkpoint，后续上下文使用该 checkpoint 和保留的近期
+用户消息。普通 summary 则由 OpenCode 调用 session 模型生成文本摘要；copilot 保持此默认策略。
+两者沿用现有自动压缩阈值，native 始终使用 session 模型，title/low 路由不变。
+
+固定版本优先在 `/responses` 发送末尾带 `compaction_trigger` 的请求，并接收含非空
+`encrypted_content` 的 `compaction` 输出。HTTP 使用完整 input；WebSocket 可沿原生续接优化
+使用 `previous_response_id` 和增量 input。协议能力还包含独立的 `/responses/compact` 路径，
+但默认 Responses route 优先使用 trigger。
+上游模型和代理须支持并透传该协议及后续 checkpoint；仅兼容普通 Responses 或 WebSocket
+不足以证明支持 native。HTTP fallback 只改变传输，不取消 native 策略；不支持时沿原生错误
+语义处理，模块不自动切回 summary。需要普通摘要时，在外部完整配置中显式设置
+`settings.compaction = {"type":"summary"}`；模型级设置优先于 Provider 级设置。
 
 固定 `v2.2.0-ricky.1` 已用候选配置通过 loopback WebSocket、工具续接和同 session 下一轮验证，
 另用既有 CODEX 环境完成一次隔离真实请求：观测到 WebSocket `response.create` 和
@@ -59,7 +74,8 @@ status 显示 model/variant；续接只允许相同选择，省略时沿保存�
 
 ## 外部配置
 
-非空 OPENCODE_MODULE_CONFIG 优先于内置 profile。任务可用完整当前 OpenCode 配置中的
+非空 OPENCODE_MODULE_CONFIG 优先于内置 profile，不补入内置 transport/compaction 默认。
+任务可用完整当前 OpenCode 配置中的
 model 默认值及其 env 引用；参数在私有快照覆盖主模型，并将 title 固定到选中 Provider 的
 原标题模型/low（无该模型时用主模型/low），不修改原文件。模型须完整定义、支持请求 variant
 和 low title，否则失败。配置的原生 model 字符串/对象语法沿 pinned OpenCode；不是旧记录迁移。

@@ -187,7 +187,10 @@ paramiko 3.5.1，用 PYTHONPATH 指向即可，不进 payload。Terraform 命令
 published fixture 的 WebSocket server 另需已有测试依赖 `ws`；OPENCODE_FIXTURE_WS 指向该模块目录，
 未设置时沿 Node 的普通模块解析。依赖只用于测试，不进入安装 payload。
 它保留候选 provider transport，分别核 codex WebSocket、copilot HTTP 和拒绝升级后的原生 HTTP fallback，
-并检查主模型/max、title/low、工具调用续接、同 session、失败与回调。
+并检查主模型/max、title/low、工具调用续接、同 session、失败与回调。codex 用合成 usage
+触发 native compaction，核对 trigger 请求（WebSocket 续接或 HTTP 完整 input）、加密 checkpoint 接收、后续上下文与同 session
+下一轮；copilot 不发送 native 请求。可设置 `OPENCODE_EVIDENCE_DIR` 为已存在的私有目录，
+保留各场景的合成 `requests.jsonl`、`responses.jsonl` 和隔离现场；否则自动清理。
 
 中心加载 fixture 复制已校验中心快照到本地测试 Git repo，并附加合成标记；
 AGENT_CONFIG_FIXTURE_SOURCE 是包含 AGENTS.md、skills/ 的快照目录，不是认证配置。

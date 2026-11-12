@@ -29,7 +29,7 @@
       "name": "Codex",
       "env": ["CODEX_API_KEY"],
       "package": "@opencode/ai/providers/openai/responses",
-      "settings": {"baseURL": "{env:CODEX_BASE_URL}", "apiKey": "{env:CODEX_API_KEY}", "transport": "websocket"},
+      "settings": {"baseURL": "{env:CODEX_BASE_URL}", "apiKey": "{env:CODEX_API_KEY}", "transport": "websocket", "compaction": {"type": "native"}},
       "models": {
         "gpt-6-astra": {
           "name": "GPT-6 Astra",
