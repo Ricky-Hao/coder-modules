@@ -12,7 +12,7 @@ import { TaskStore } from "../scripts/task.mjs";
 import { TaskWorker } from "../scripts/task-worker.mjs";
 import { readyTask } from "./task-fixture.mjs";
 
-for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], ["codex", true]]) test(`published OpenCode ${provider}${rejectUpgrade ? " fallback" : ""}: transport, native compaction, failure and same session`,
+for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], ["codex", true], ["copilot", true]]) test(`published OpenCode ${provider}${rejectUpgrade ? " fallback" : ""}: transport, native compaction, failure and same session`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
     const base = fs.mkdtempSync(path.join(process.env.OPENCODE_EVIDENCE_DIR || os.tmpdir(), `published-${provider}-`));
     fs.chmodSync(base, 0o700);
@@ -46,7 +46,6 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
       }
       const id = `resp_${randomUUID()}`;
       if (compact) {
-        assert.equal(provider, "codex");
         assert.equal(body.input.at(-1).type, "compaction_trigger");
         assert.ok(calls.at(-1).toolOutput);
         assert.equal(typeof toolResponse, "string");
@@ -89,7 +88,7 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
       }
       event({ type: "response.output_item.done", output_index: 0, item });
       // A measured full input window makes the pinned runner compact automatically before its next step.
-      const inputTokens = tool && provider === "codex" ? 258400 : 10;
+      const inputTokens = tool ? 258400 : 10;
       event({ type: "response.completed", response: { id, object: "response", status: "completed", output: [item],
         usage: { input_tokens: inputTokens, output_tokens: 4, total_tokens: inputTokens + 4 } } });
     };
@@ -178,24 +177,18 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
       assert.ok(calls.filter((call) => call.effort === "low").every((call) => call.transport === "http"));
       assert.ok(calls.filter((call) => call.effort === "low").every((call) => !call.compact && !call.checkpoint));
       assert.ok(calls.some((call) => call.toolOutput));
-      if (provider === "codex") {
-        assert.ok(upgrades.length > 0);
-        assert.ok(upgrades.every((upgrade) => upgrade.path === "/v1/responses" && upgrade.beta === "responses_websockets=2026-02-06"));
-        assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
-        const compactions = calls.filter((call) => call.compact);
-        assert.equal(compactions.length, 1, JSON.stringify(calls));
-        assert.equal(compactions[0].transport, rejectUpgrade ? "http" : "websocket");
-        const after = calls.slice(calls.indexOf(compactions[0]) + 1).filter((call) => call.effort === "max");
-        assert.ok(after.length >= 2);
-        assert.ok(after[0].checkpoint, JSON.stringify(calls));
-        assert.ok(after.every((call) => !call.oldToolCall && !call.toolOutput));
-        if (rejectUpgrade) assert.equal(upgrades.length, 1); // Connect failure pins this session to HTTP.
-        else assert.ok(after.some((call) => typeof call.previous === "string"));
-      } else {
-        assert.equal(upgrades.length, 0);
-        assert.ok(calls.every((call) => call.transport === "http"));
-        assert.ok(calls.every((call) => !call.compact && !call.checkpoint));
-      }
+      assert.ok(upgrades.length > 0);
+      assert.ok(upgrades.every((upgrade) => upgrade.path === "/v1/responses" && upgrade.beta === "responses_websockets=2026-02-06"));
+      assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
+      const compactions = calls.filter((call) => call.compact);
+      assert.equal(compactions.length, 1, JSON.stringify(calls));
+      assert.equal(compactions[0].transport, rejectUpgrade ? "http" : "websocket");
+      const after = calls.slice(calls.indexOf(compactions[0]) + 1).filter((call) => call.effort === "max");
+      assert.ok(after.length >= 2);
+      assert.ok(after[0].checkpoint, JSON.stringify(calls));
+      assert.ok(after.every((call) => !call.oldToolCall && !call.toolOutput));
+      if (rejectUpgrade) assert.equal(upgrades.length, 1); // Connect failure pins this session to HTTP.
+      else assert.ok(after.some((call) => typeof call.previous === "string"));
       console.log(JSON.stringify({ provider, rejected_upgrade: rejectUpgrade, upgrades: upgrades.length, calls,
         same_session: true, callbacks: notifications.length }));
     } finally {
