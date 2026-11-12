@@ -151,8 +151,10 @@ tag 源码为 `9291b46db483415e1c9bdaa72f8e48637e3f7b49`，基于 upstream v2.2.
 内置 `env` profile 恰好包含 **copilot、codex**，两者模型定义完整相同，使用 OpenAI Responses，
 不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.1-sol / max**，title 为同 Provider
 Sol/low。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择及外部配置见
-[PROVIDERS.md](PROVIDERS.md)。codex session 主请求默认使用原生 Responses WebSocket，
-连接失败沿原生 HTTP fallback；copilot 与 title/low 保持 HTTP/SSE。catalog 不证明服务访问权、价格或可用性。
+[PROVIDERS.md](PROVIDERS.md)。两个 Provider 的 session 主请求默认使用原生 Responses WebSocket，
+连接失败沿原生 HTTP fallback，并默认启用 native 远程压缩；上游须支持 compaction trigger
+及加密 checkpoint。独立的同 Provider title/low 请求仍使用 HTTP/SSE。
+已有 task/session 沿保存的 profile 保留原策略，新任务采用新默认。catalog 不证明服务访问权、价格或可用性。
 
 | 模型 | context | input | output | 默认 reasoning |
 | --- | ---: | ---: | ---: | --- |

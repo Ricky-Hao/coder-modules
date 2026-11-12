@@ -12,9 +12,9 @@ import { TaskStore } from "../scripts/task.mjs";
 import { TaskWorker } from "../scripts/task-worker.mjs";
 import { readyTask } from "./task-fixture.mjs";
 
-for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], ["codex", true]]) test(`published OpenCode ${provider}${rejectUpgrade ? " fallback" : ""}: transport, failure, tool continuation and same session`,
+for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], ["codex", true], ["copilot", true]]) test(`published OpenCode ${provider}${rejectUpgrade ? " fallback" : ""}: transport, native compaction, failure and same session`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "published-acp-"));
+    const base = fs.mkdtempSync(path.join(process.env.OPENCODE_EVIDENCE_DIR || os.tmpdir(), `published-${provider}-`));
     fs.chmodSync(base, 0o700);
     const prior = { ...process.env };
     let failing = true;
@@ -23,23 +23,53 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
     const notifications = [];
     const journalEvents = [];
     let toolSent = false;
+    let toolResponse;
     const reference = path.join(base, "reference.txt");
+    const checkpoint = "synthetic-encrypted-checkpoint";
     fs.writeFileSync(reference, "Synthetic WebSocket tool continuation\n", { mode: 0o600 });
-    const respond = (body, transport, event) => {
+    const respond = (body, transport, send) => {
       assert.equal(JSON.stringify(body).includes("tcb_"), false);
+      if (process.env.OPENCODE_EVIDENCE_DIR)
+        fs.appendFileSync(path.join(base, "requests.jsonl"), JSON.stringify({ transport, body }) + "\n", { mode: 0o600 });
+      const event = (value) => {
+        if (process.env.OPENCODE_EVIDENCE_DIR)
+          fs.appendFileSync(path.join(base, "responses.jsonl"), JSON.stringify({ transport, event: value }) + "\n", { mode: 0o600 });
+        send(value);
+      };
+      const compact = body.input?.some((item) => item.type === "compaction_trigger");
       calls.push({ model: body.model, effort: body.reasoning?.effort, transport, type: body.type, previous: body.previous_response_id,
+        compact, checkpoint: body.input?.some((item) => item.type === "compaction" && item.encrypted_content === checkpoint),
+        oldToolCall: body.input?.some((item) => item.type === "function_call" && item.call_id === "call_read"),
         toolOutput: body.input?.some((item) => item.type === "function_call_output" && item.output.includes("Synthetic WebSocket tool continuation")) });
       if (transport === "websocket") {
         assert.equal(body.type, "response.create"); assert.equal(body.stream, undefined);
       }
       const id = `resp_${randomUUID()}`;
+      if (compact) {
+        assert.equal(body.input.at(-1).type, "compaction_trigger");
+        assert.ok(calls.at(-1).toolOutput);
+        assert.equal(typeof toolResponse, "string");
+        // The native WebSocket channel can reference the completed tool response; HTTP replays the full window.
+        if (transport === "websocket") assert.equal(body.previous_response_id, toolResponse);
+        else {
+          assert.equal(body.previous_response_id, undefined);
+          assert.ok(calls.at(-1).oldToolCall);
+          assert.ok(body.input.some((item) => item.role === "user"));
+        }
+        const item = { type: "compaction", id: "cmp_fixture", encrypted_content: checkpoint };
+        event({ type: "response.created", response: { id, object: "response", status: "in_progress", output: [] } });
+        event({ type: "response.output_item.done", output_index: 0, item });
+        event({ type: "response.completed", response: { id, object: "response", status: "completed", output: [item],
+          usage: { input_tokens: 258400, output_tokens: 4, total_tokens: 258404 } } });
+        return;
+      }
       if (failing && body.reasoning?.effort !== "low") {
         event({ type: "response.failed", response: { id, object: "response", status: "failed",
           error: { type: "invalid_request_error", code: "invalid_request", message: "Synthetic response stream failure" } } });
         return;
       }
       const tool = !toolSent && body.reasoning?.effort !== "low";
-      if (tool) toolSent = true;
+      if (tool) { toolSent = true; toolResponse = id; }
       const item = tool ? { id: "fc_fixture", type: "function_call", call_id: "call_read", name: "read",
         arguments: JSON.stringify({ path: reference }), status: "completed" } :
         { id: "msg_fixture", type: "message", role: "assistant", status: "completed",
@@ -57,8 +87,10 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
         event({ type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text: "Published loopback result" });
       }
       event({ type: "response.output_item.done", output_index: 0, item });
+      // A measured full input window makes the pinned runner compact automatically before its next step.
+      const inputTokens = tool ? 258400 : 10;
       event({ type: "response.completed", response: { id, object: "response", status: "completed", output: [item],
-        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } });
+        usage: { input_tokens: inputTokens, output_tokens: 4, total_tokens: inputTokens + 4 } } });
     };
     const server = http.createServer((request, response) => {
       let input = "";
@@ -134,22 +166,29 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
       assert.equal(store.summary(success).result_status, "success", JSON.stringify({ calls, journalEvents }));
       assert.equal(store.summary(success, { output: true }).output, "Published loopback result");
       assert.equal(success.handle.acpxRecordId, handle.acpxRecordId);
-      assert.equal(notifications.length, 2);
+      const resumed = submit("after-compaction", "r");
+      await worker().run(resumed);
+      assert.equal(store.summary(resumed).result_status, "success");
+      assert.equal(resumed.handle.acpxRecordId, handle.acpxRecordId);
+      assert.equal(notifications.length, 3);
       assert.ok(calls.some((call) => call.effort === "max"));
       assert.ok(calls.some((call) => call.effort === "low"));
       assert.ok(calls.every((call) => call.model === "gpt-6.1-sol"));
       assert.ok(calls.filter((call) => call.effort === "low").every((call) => call.transport === "http"));
+      assert.ok(calls.filter((call) => call.effort === "low").every((call) => !call.compact && !call.checkpoint));
       assert.ok(calls.some((call) => call.toolOutput));
-      if (provider === "codex") {
-        assert.ok(upgrades.length > 0);
-        assert.ok(upgrades.every((upgrade) => upgrade.path === "/v1/responses" && upgrade.beta === "responses_websockets=2026-02-06"));
-        assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
-        if (rejectUpgrade) assert.equal(upgrades.length, 1); // Connect failure pins this session to HTTP.
-        else assert.ok(calls.some((call) => call.toolOutput && typeof call.previous === "string"));
-      } else {
-        assert.equal(upgrades.length, 0);
-        assert.ok(calls.every((call) => call.transport === "http"));
-      }
+      assert.ok(upgrades.length > 0);
+      assert.ok(upgrades.every((upgrade) => upgrade.path === "/v1/responses" && upgrade.beta === "responses_websockets=2026-02-06"));
+      assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
+      const compactions = calls.filter((call) => call.compact);
+      assert.equal(compactions.length, 1, JSON.stringify(calls));
+      assert.equal(compactions[0].transport, rejectUpgrade ? "http" : "websocket");
+      const after = calls.slice(calls.indexOf(compactions[0]) + 1).filter((call) => call.effort === "max");
+      assert.ok(after.length >= 2);
+      assert.ok(after[0].checkpoint, JSON.stringify(calls));
+      assert.ok(after.every((call) => !call.oldToolCall && !call.toolOutput));
+      if (rejectUpgrade) assert.equal(upgrades.length, 1); // Connect failure pins this session to HTTP.
+      else assert.ok(after.some((call) => typeof call.previous === "string"));
       console.log(JSON.stringify({ provider, rejected_upgrade: rejectUpgrade, upgrades: upgrades.length, calls,
         same_session: true, callbacks: notifications.length }));
     } finally {
@@ -161,6 +200,6 @@ for (const [provider, rejectUpgrade] of [["codex", false], ["copilot", false], [
       await new Promise((resolve) => server.close(resolve));
       for (const key of Object.keys(process.env)) if (!(key in prior)) delete process.env[key];
       Object.assign(process.env, prior);
-      fs.rmSync(base, { recursive: true, force: true });
+      if (!process.env.OPENCODE_EVIDENCE_DIR) fs.rmSync(base, { recursive: true, force: true });
     }
   });

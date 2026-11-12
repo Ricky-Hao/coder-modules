@@ -5,18 +5,36 @@
 不启用官方登录；其余 Provider 保持禁用。默认主模型 **codex/gpt-6.1-sol / max**，
 title 为同 Provider Sol/low。完整元数据一致性、context/input/output 和 variants 回归保留。
 
-codex 默认设置 `providers.codex.settings.transport = "websocket"`，使用固定 fork 原生
-Responses WebSocket；copilot 保持未指定 transport，主请求沿 HTTP/SSE。
+copilot、codex 的 Provider `settings` 均默认设置 `transport = "websocket"`，使用固定 fork 原生
+Responses WebSocket；各自独立的 env 引用不变。
 固定 fork 的 session 主请求消费此设置；独立的 title/low 请求仍走 HTTP/SSE。
 WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑，不改模型或权限选择。
 原生实现会在连接/升级失败时回退 HTTP，并将该 session 保持在 HTTP；
 请求可能已发送后的中断仍按原生错误语义处理，不把任意中断说成透明回退。
-已有 task 的不可变 profile 保留原传输；新 task 才采用更新默认值。
+已有 task/session 沿保存的不可变 profile 保留原传输与压缩策略，不迁移或回写；
+新 task 才采用更新默认值。
 
-固定 `v2.2.0-ricky.1` 已用候选配置通过 loopback WebSocket、工具续接和同 session 下一轮验证，
-另用既有 CODEX 环境完成一次隔离真实请求：观测到 WebSocket `response.create` 和
-`response.completed`，返回 `OK`，未发生主请求 HTTP POST。真实验收只证明该次端点请求；
-不包含持续运行、所有模型或所有代理链路。脚本和配置只保存合成信息及 env 引用。
+两个 Provider 的 `settings` 均默认设置 `compaction = {"type":"native"}`，复用固定 fork
+原生远程压缩：上游返回不透明的加密 checkpoint，后续上下文使用该 checkpoint 和保留的近期
+用户消息。普通 summary 则由 OpenCode 调用 session 模型生成文本摘要。
+两者沿用现有自动压缩阈值，native 始终使用 session 模型，title/low 路由不变。
+
+固定版本优先在 `/responses` 发送末尾带 `compaction_trigger` 的请求，并接收含非空
+`encrypted_content` 的 `compaction` 输出。HTTP 使用完整 input；WebSocket 可沿原生续接优化
+使用 `previous_response_id` 和增量 input。协议能力还包含独立的 `/responses/compact` 路径，
+但默认 Responses route 优先使用 trigger。
+上游模型和代理须支持并透传该协议及后续 checkpoint；仅兼容普通 Responses 或 WebSocket
+不足以证明支持 native。HTTP fallback 只改变传输，不取消 native 策略；不支持时沿原生错误
+语义处理，模块不自动切回 summary。需要普通摘要时，在外部完整配置中显式设置
+`settings.compaction = {"type":"summary"}`；模型级设置优先于 Provider 级设置。
+
+固定 `v2.2.0-ricky.1` 的候选配置通过双 Provider 的 loopback WebSocket、HTTP fallback、
+native 压缩、工具续接和同 session 下一轮验证。2026-11-12，负责人另以两组既有 New API 链路
+对 Sol/low 完成单次直接 API 验证：WebSocket `/v1/responses` trigger 均返回恰一个非空加密
+compaction，新连接完整回送压缩输出后均正确回忆随机标记；HTTP `/responses` trigger 也均通过。
+独立 `/responses/compact` 两组均返回 404；`context_management` 自动压缩仅 COPILOT 返回压缩，
+CODEX 返回 200 但无压缩，它们与本模块使用的 trigger 是不同协议。
+直接 API 验证不代表候选已安装或持续健康。脚本和配置只保存合成信息及 env 引用。
 
 ## 环境变量
 
@@ -59,7 +77,8 @@ status 显示 model/variant；续接只允许相同选择，省略时沿保存�
 
 ## 外部配置
 
-非空 OPENCODE_MODULE_CONFIG 优先于内置 profile。任务可用完整当前 OpenCode 配置中的
+非空 OPENCODE_MODULE_CONFIG 优先于内置 profile，不补入内置 transport/compaction 默认。
+任务可用完整当前 OpenCode 配置中的
 model 默认值及其 env 引用；参数在私有快照覆盖主模型，并将 title 固定到选中 Provider 的
 原标题模型/low（无该模型时用主模型/low），不修改原文件。模型须完整定义、支持请求 variant
 和 low title，否则失败。配置的原生 model 字符串/对象语法沿 pinned OpenCode；不是旧记录迁移。
@@ -67,5 +86,5 @@ runtime_profile=none 无外部完整配置时，直接 ACP 保留显式 readines
 不支持不完整模型定义。`opencode --module-profile-info` 不读凭据或联系端点。
 
 本地 fixture 使用 pinned acpx、合成 ACP 和隔离正式 OpenCode/Responses/callback；
-真实服务的端点、访问权与持续健康由使用方核实；上面的单次 CODEX WebSocket 请求是显式授权的
-隔离验收，其他 fixture 仅使用合成凭据、loopback，不联系真实 Provider/MCP。
+真实服务的端点、访问权与持续健康由使用方核实；上述单次直接 API 验证由负责人完成，
+模块 fixture 仅使用合成凭据、loopback，不联系真实 Provider/MCP。
