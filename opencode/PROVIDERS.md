@@ -2,12 +2,14 @@
 
 内置 env profile 恰好提供 copilot、codex，均使用
 `@opencode/ai/providers/openai/responses`，完整模型定义相同。它们是本地别名，
-不启用官方登录；其余 Provider 保持禁用。默认主模型 **codex/gpt-6.1-sol / max**，
-title 为同 Provider Sol/low。完整元数据一致性、context/input/output 和 variants 回归保留。
+不启用官方登录；其余 Provider 保持禁用。模型为 **gpt-6.2-astra、gpt-6.2-sol**，
+默认主模型 **codex/gpt-6.2-sol / xhigh**，title、explore 为同 Provider Sol/medium。
+不保留旧模型别名。完整元数据一致性、context/input/output 和 variants 回归保留；
+价格、上下文和输出元数据沿原配置保留，不视为新模型的上游承诺。
 
 copilot、codex 的 Provider `settings` 均默认设置 `transport = "websocket"`，使用固定 fork 原生
 Responses WebSocket；各自独立的 env 引用不变。
-固定 fork 的 session 主请求消费此设置；独立的 title/low 请求仍走 HTTP/SSE。
+固定 fork 的 session 主请求消费此设置；独立的 title/medium 请求仍走 HTTP/SSE。
 WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑，不改模型或权限选择。
 原生实现会在连接/升级失败时回退 HTTP，并将该 session 保持在 HTTP；
 请求可能已发送后的中断仍按原生错误语义处理，不把任意中断说成透明回退。
@@ -17,7 +19,7 @@ WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑�
 两个 Provider 的 `settings` 均默认设置 `compaction = {"type":"native"}`，复用固定 fork
 原生远程压缩：上游返回不透明的加密 checkpoint，后续上下文使用该 checkpoint 和保留的近期
 用户消息。普通 summary 则由 OpenCode 调用 session 模型生成文本摘要。
-两者沿用现有自动压缩阈值，native 始终使用 session 模型，title/low 路由不变。
+两者沿用现有自动压缩阈值，native 始终使用 session 模型，title/medium 路由不变。
 
 固定版本优先在 `/responses` 发送末尾带 `compaction_trigger` 的请求，并接收含非空
 `encrypted_content` 的 `compaction` 输出。HTTP 使用完整 input；WebSocket 可沿原生续接优化
@@ -28,7 +30,7 @@ WebSocket 使用 `/responses`、`response.create` 和原生连接/续接逻辑�
 语义处理，模块不自动切回 summary。需要普通摘要时，在外部完整配置中显式设置
 `settings.compaction = {"type":"summary"}`；模型级设置优先于 Provider 级设置。
 
-固定 `v2.2.0-ricky.1` 的候选配置通过双 Provider 的 loopback WebSocket、HTTP fallback、
+历史证据（旧模型 catalog）：固定 `v2.2.0-ricky.1` 的当时配置通过双 Provider 的 loopback WebSocket、HTTP fallback、
 native 压缩、工具续接和同 session 下一轮验证。2026-11-12，负责人另以两组既有 New API 链路
 对 Sol/low 完成单次直接 API 验证：WebSocket `/v1/responses` trigger 均返回恰一个非空加密
 compaction，新连接完整回送压缩输出后均正确回忆随机标记；HTTP `/responses` trigger 也均通过。
@@ -56,19 +58,19 @@ CODEX 返回 200 但无压缩，它们与本模块使用的 trigger 是不同协
 
 完整私有文件 schema 见 [TASKS.md](TASKS.md#高层-launch-入口)。在该 JSON 中选择：
 
-| JSON 可选字段 | 主请求 | title |
+| JSON 可选字段 | 主请求 | title / explore |
 | --- | --- | --- |
-| 全部省略 | codex/Sol/max | codex/Sol/low |
-| `"provider":"copilot"` | copilot/Sol/max | copilot/Sol/low |
-| `"model":"gpt-6-astra","variant":"high"` | codex/Astra/high | codex/Sol/low |
-| `"variant":"low"` | 默认模型/low | 同 Provider Sol/low |
+| 全部省略 | codex/Sol/xhigh | codex/Sol/medium |
+| `"provider":"copilot"` | copilot/Sol/xhigh | copilot/Sol/medium |
+| `"model":"gpt-6.2-astra","variant":"high"` | codex/Astra/high | codex/Sol/medium |
+| `"variant":"medium"`（独立简单任务） | 默认 Sol/medium | 同 Provider Sol/medium |
 
 provider/model 分别填 ID，不拼成一个字段；variant 独立，不靠自然语言或 readiness 环境选模型。
-新任务显式 provider/model 但省略 variant 时，Sol 默认 max、Astra 默认 medium。
+新任务显式 provider/model 但省略 variant 时，Sol 默认 xhigh、Astra 默认 medium。
 两个模型均保留 context=400000、input=272000、output=128000，buffer=13600 和完整
 cost/capabilities/settings；均支持 low/medium/high/xhigh/max。
 
-launch 在接受前生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider title/low。
+launch 在接受前生成不可变、0600、仅含 env 引用的任务配置，固定主模型和同 Provider title/explore medium。
 task.json 只引用该不可变快照；同 key 按原输入摘要去重，续接复用保存选择；恢复不重新解释默认值。
 首次 ACP 初始化选择模型并在 prompt 前核对 model/effort 确认；明确失败或超过统一无进展时限
 沿原 outbox 报明确派发前失败，不发 prompt。task 不复制 prompt/完整注册；原私密输入须保留到通知封存。
@@ -79,12 +81,28 @@ status 显示 model/variant；续接只允许相同选择，省略时沿保存�
 
 非空 OPENCODE_MODULE_CONFIG 优先于内置 profile，不补入内置 transport/compaction 默认。
 任务可用完整当前 OpenCode 配置中的
-model 默认值及其 env 引用；参数在私有快照覆盖主模型，并将 title 固定到选中 Provider 的
-原标题模型/low（无该模型时用主模型/low），不修改原文件。模型须完整定义、支持请求 variant
-和 low title，否则失败。配置的原生 model 字符串/对象语法沿 pinned OpenCode；不是旧记录迁移。
+model 默认值及其 env 引用；参数在私有快照覆盖主模型。外部配置的 agents 按原文保留，
+不注入内置 title/explore 路由，不修改原文件。模型须完整定义、支持请求 variant，否则失败。
+配置的原生 model 字符串/对象语法沿 pinned OpenCode；不是旧记录迁移。
 runtime_profile=none 无外部完整配置时，直接 ACP 保留显式 readiness 契约，任务 launch
 不支持不完整模型定义。`opencode --module-profile-info` 不读凭据或联系端点。
 
 本地 fixture 使用 pinned acpx、合成 ACP 和隔离正式 OpenCode/Responses/callback；
 真实服务的端点、访问权与持续健康由使用方核实；上述单次直接 API 验证由负责人完成，
 模块 fixture 仅使用合成凭据、loopback，不联系真实 Provider/MCP。
+
+## 原生 agent 路由
+
+固定源码 `9291b46db483415e1c9bdaa72f8e48637e3f7b49` 的
+[`config/plugin/agent.ts`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/config/plugin/agent.ts)
+加载 `agents.<name>.model` 的 providerID/model/variant；
+[`tool/plugin/subagent.ts`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/tool/plugin/subagent.ts)
+新建子任务按显式 model、agent.model、parent.model 的顺序选择。
+因此简单探索/调研使用现有 explore，默认 Sol/medium；general 继承父 session，普通主任务默认 xhigh。
+显式子任务模型仍优先；同一个子 session 的续接保留已选模型，不因 agent 默认变化切换。
+独立简单任务用 launch 的 `"variant":"medium"`，不增加难度识别或 task schema 字段。
+
+[`session/context.ts`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/session/context.ts)
+的 selectTitle 使用 title.model 的显式 variant，失败可能退回主模型。
+compaction 保持 session model/agent。内置路由只在新 env 任务快照中跟随所选 Provider；
+外部完整配置和已有快照保留各自 agent 选择。

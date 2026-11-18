@@ -92,7 +92,7 @@ def main(work, node, pvc):
             record.write_text(json.dumps({'version': 3, 'id': task_id, 'requestId': 'fixture-request',
                 'cwd': str(work), 'inputFile': str(work / 'unread-private-input'), 'inputHash': 'a' * 64, 'sessionKey': 'fixture-session',
                 'git': {'repo': str(work), 'worktree': str(work), 'branch': 'fixture', 'base': 'main', 'baseSha': 'a' * 40},
-                'model': {'id': 'codex/gpt-6.1-sol', 'variant': 'max'},
+                'model': {'id': 'codex/gpt-6.2-sol', 'variant': 'xhigh'},
                 'modelConfig': str(root / 'runtime/fixture-config.json'), 'modelProfile': 'env',
                 'permissions': {'mode': 'deny-all', 'policy': {}}, 'createdAt': 1000,
                 'progress': {'at': 1000, 'tick': 0, 'boot': None}, 'noProgressMs': 900000,

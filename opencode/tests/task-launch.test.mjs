@@ -53,7 +53,7 @@ test("fresh origin base, preserved dirty checkout, original input only and read-
   assert.equal(result.accepted, true); assert.equal(result.base_sha, f.latest); assert.equal(result.worktree, path.join(f.base, "work-first"));
   assert.equal(git(result.worktree, "rev-parse", "HEAD"), f.latest); assert.equal(git(f.repo, "rev-parse", "HEAD"), f.old);
   assert.equal(fs.readFileSync(path.join(f.repo, "dirty"), "utf8"), "keep unrelated work");
-  assert.equal(result.permissions.mode, "approve-all"); assert.equal(result.selection.variant, "max");
+  assert.equal(result.permissions.mode, "approve-all"); assert.equal(result.selection.variant, "xhigh");
   const task = f.store.load(result.task_id), before = fs.readFileSync(f.store.filename(task.id));
   assert.equal(JSON.stringify(task).includes(f.input.prompt), false); assert.equal(JSON.stringify(task).includes("tcb_"), false);
   assert.equal(task.inputFile, path.join(f.base, "first.json"));
@@ -73,6 +73,17 @@ test("same key before first ACK only reads; first control owns all later task wr
   assert.equal(reused.reused, true); assert.equal(reused.accepted, false); assert.equal(reused.phase, "ready");
   release(); const result = await running;
   assert.equal(result.dispatch_state, "attempted"); assert.equal(f.store.load(result.task_id).output.text, "worker wrote this");
+});
+test("simple launch explicitly selects Sol medium and continue preserves its snapshot", async (t) => {
+  const f = fixture(t), first = await f.launch({ ...f.input, variant: "medium" });
+  assert.equal(first.selection.provider, "codex"); assert.equal(first.selection.model, "gpt-6.2-sol");
+  assert.equal(first.selection.variant, "medium");
+  const original = f.terminal(first.task_id), bytes = fs.readFileSync(original.modelConfig);
+  const next = { schema_version: 1, key: "simple-next", prompt: "next simple task", callback: f.input.callback };
+  const result = await f.launch(next, { "--continue-from": first.task_id });
+  assert.equal(result.accepted, true); assert.deepEqual(result.selection, first.selection);
+  assert.equal(f.store.load(result.task_id).modelConfig, original.modelConfig);
+  assert.deepEqual(fs.readFileSync(original.modelConfig), bytes);
 });
 test("same key concurrent preparation has one Git prepare and one worker", async (t) => {
   const f = fixture(t), results = await Promise.all([f.launch(), f.launch()]);

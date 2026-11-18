@@ -120,8 +120,8 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => box(first.task_id)?.state === "delivered", "explicit outbox recover");
       assert.equal(box(first.task_id).body, exact);
       const selected = JSON.parse(checked(["result", first.task_id]).output);
-      assert.equal(selected.model, "codex/gpt-6.1-sol"); assert.equal(selected.effort, "max");
-      assert.equal(selected.title.variant, "low");
+      assert.equal(selected.model, "codex/gpt-6.2-sol"); assert.equal(selected.effort, "xhigh");
+      assert.equal(selected.title.variant, "medium");
       fs.writeFileSync(path.join(configFixture.source, "AGENTS.md"), "Rules updated before duplicate launch\n");
       git(configFixture.source, "add", "."); git(configFixture.source, "commit", "-m", "update rules");
       assert.equal(launch(firstInput).request_id, first.request_id);
