@@ -158,6 +158,7 @@ export class TaskStore {
       no_progress_timeout_seconds: task.noProgressMs / 1000, created_at: task.createdAt, last_progress_at: task.progress.at,
       result_status: result?.status ?? null, terminal_source: result?.source ?? null,
       execution_error: task.error ?? null, observation_error: task.observationError ?? null,
+      coder_activity: task.coderActivity ?? null,
       cancel_requested: fs.existsSync(this.filename(task.id, "cancel.request")),
       callback_state: box?.state ?? null, callback_kind: box?.kind ?? null, delivery_error: box?.error ?? null, receipt: box?.receipt ?? null,
       query: { status: `${command} status ${task.id}`, result: `${command} result ${task.id}`, task_directory: path.dirname(this.filename(task.id)) },

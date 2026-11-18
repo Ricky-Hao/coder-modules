@@ -24,6 +24,58 @@ async function until(predicate) {
 }
 const text = (value, messageId = "answer") => ({ type: "message", message: { params: { update: {
   sessionUpdate: "agent_message_chunk", messageId, content: { type: "text", text: value } } } } });
+
+for (const status of ["completed", "failed", "cancelled"]) test(`Coder activity starts immediately, renews without output and stops at canonical ${status}`, async (t) => {
+  const calls = [];
+  const f = fixture(t, { activityMs: 20, activity: async () => {
+    const state = f.task.result ? "idle" : "working"; calls.push(state); return { state };
+  } });
+  const running = f.run(); await until(() => calls.length >= 2);
+  assert.equal(f.task.startedAt, undefined); // No output/progress is required for activity.
+  assert.deepEqual(calls, calls.map(() => "working"));
+  f.runtime.push({ type: "turn_result", result: { status } }); await running;
+  assert.equal(calls.at(-1), "idle"); assert.equal(calls.filter((s) => s === "idle").length, 1);
+  const count = calls.length; await delay(35); assert.equal(calls.length, count);
+  assert.equal(f.result().coder_activity.reported_state, "idle");
+});
+test("unknown notification, observation error and cancel intent retain activity until a trusted result", async (t) => {
+  let calls = 0;
+  const f = fixture(t, { activityMs: 15, task: { noProgressMs: 1000 }, activity: async () => { calls++; return { state: f.task.result ? "idle" : "working" }; } });
+  const running = f.run(); await until(() => f.runtime.starts); f.advance(1000);
+  await until(() => f.result().callback_state === "delivered");
+  f.runtime.result.resolve({ status: "failed", error: { detailCode: "WATCH_OUTCOME_UNKNOWN" } });
+  save(f.store.filename(f.task.id, "cancel.request"), { requested: true });
+  const count = calls; await until(() => calls > count + 1);
+  assert.equal(f.result().coder_activity.reported_state, "working"); assert.equal(f.task.result, undefined);
+  f.runtime.push({ type: "turn_result", result: { status: "cancelled" } }); await running;
+  assert.equal(f.result().coder_activity.reported_state, "idle"); assert.equal(f.result().callback_kind, "no_progress");
+});
+test("one activity request in flight; terminal waits for final report and preserves sanitized errors", async (t) => {
+  const pending = deferred(); let calls = 0;
+  const f = fixture(t, { activityMs: 1, activity: () => ++calls === 1 ? pending.promise : { state: "idle" } });
+  const running = f.run(); await until(() => calls === 1); await delay(20); assert.equal(calls, 1);
+  f.runtime.push({ type: "turn_result", result: { status: "completed" } });
+  await until(() => f.task.result); assert.equal(calls, 1);
+  pending.resolve({ error: "timeout", secret: "SYNTHETIC-SECRET" }); await running;
+  const result = f.result(); assert.equal(result.result_status, "success"); assert.equal(result.callback_state, "delivered");
+  assert.equal(result.coder_activity.last_error.reason, "timeout"); assert.equal(result.coder_activity.reported_state, "idle");
+  assert.equal(JSON.stringify(result).includes("SYNTHETIC-SECRET"), false); assert.equal(calls, 2);
+});
+test("setup failure, ready recovery and terminal outbox recovery never report activity", async (t) => {
+  for (const recover of [false, true]) {
+    const f = fixture(t, { activity: () => assert.fail("no execution"), connect: () => { throw new Error("setup"); } });
+    await f.run({ recover }); assert.equal(f.runtime.starts, 0); assert.equal(f.task.coderActivity, undefined);
+    const box = f.store.outbox(f.task); box.state = "pending"; save(f.store.filename(f.task.id, "outbox.json"), box);
+    const worker = new TaskWorker(f.store, { activity: () => assert.fail("outbox only"), fetcher: accepted, pollMs: 5 });
+    await worker.run(f.task, { recover: true }); assert.equal(f.task.coderActivity, undefined);
+  }
+});
+test("worker exit stops renewals without inventing idle or a terminal result", async (t) => {
+  const calls = [];
+  const f = fixture(t, { activityMs: 10, activity: async () => { calls.push("working"); return { state: "working" }; } });
+  const running = f.run(); await until(() => calls.length >= 2); f.stop.abort(); await running;
+  const count = calls.length; await delay(25); assert.equal(calls.length, count); assert.equal(f.task.result, undefined);
+});
 test("single dispatch, closed side stream, one journal output, cursor coalesced and canonical result", async (t) => {
   const f = fixture(t), running = f.run(); await until(() => f.runtime.starts);
   assert.equal(f.store.load(f.task.id).phase, "dispatched");

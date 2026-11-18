@@ -131,6 +131,7 @@ python3 -B opencode/build_bundle.py --check
 | `dedicated_volume` | null，显式启用专用卷 root-init 输出 |
 | `release` | null，使用下列固定发行包 |
 | `runtime_profile` | `env`，可选 `none` |
+| `task_activity` | `true`，注册隐藏任务状态 app 并在执行时上报 Coder 活动 |
 | `start_blocks_login` | `true` |
 | `install_timeout` | 1200 秒 |
 
@@ -145,6 +146,33 @@ tag 源码为 `9291b46db483415e1c9bdaa72f8e48637e3f7b49`，基于 upstream v2.2.
 覆盖 OpenCode 须提供完整 `release = { tag, asset, sha256 }` 并先审阅发行物。
 安装核 tag/asset、摘要、metadata、属主和缓存 inventory；不覆盖 Node/acpx 的 pin。
 接口按上述当前版本维护，覆盖发行物不意味着旧协议受支持。
+
+<a id="coder-task-activity"></a>
+## Coder 任务活动
+
+`task_activity = true` 注册当前 `agent_id` 的隐藏 `opencode-tasks` app。它不提供业务 URL、
+端口或健康检查；同一 Agent 只接一个使用该 slug 的模块实例，任务共用一个安装根。
+安装 settings 只传 Coder access URL 和 app slug。实际执行的 worker 立即上报 working，
+执行期间约每 120 秒续报，最后一个真实任务结束后上报 idle；详细生命周期及诊断见
+[TASKS.md](TASKS.md#coder-活动与-autostop)。
+
+使用 Coder 已有 Agent 身份 `CODER_AGENT_TOKEN`（HTTP 头 `Coder-Session-Token`），不新增
+凭据输入或落盘。启动 detached worker 的环境须保留该变量，access URL 须为可达且证书
+受信任的 HTTPS origin；仅 loopback 测试允许 HTTP。未配置 activity 的旧 settings 和
+`task_activity = false` 不上报。非 Coder 场景应关闭；已配置但缺少身份/app 时会显示独立
+活动诊断，业务任务仍按原契约执行，此时没有 autostop 保护。
+
+调用官方 `PATCH /api/v2/workspaceagents/me/app-status`，JSON 为 `app_slug/state/message`。
+已按 Coder **v2.39.2 / 9981ea8c8da66dd313b8e126cb44dcc0c73f2104**
+的 [Agent SDK](https://github.com/coder/coder/blob/9981ea8c8da66dd313b8e126cb44dcc0c73f2104/codersdk/agentsdk/agentsdk.go)
+和 [UpdateAppStatus](https://github.com/coder/coder/blob/9981ea8c8da66dd313b8e126cb44dcc0c73f2104/coderd/agentapi/apps.go)
+核实字段、认证与重复 working 的 activity bump；不依赖 workspace-usage。
+该 HTTP route 已标 deprecated，但该版仍支持；其他版本须确认对应接口。hidden app 需要
+Coder 2.16+ 及支持 `hidden` 的 Coder Terraform Provider；这不等于其余旧版本已验收。
+
+源码接入须随模板更新注册 app 并安装新 runtime，单独合并源码不会线上生效。模块不修改
+TTL、deadline 或模板 activity bump。实际续期还取决于 Coder 的 autostop 策略；无 deadline
+的 Workspace 无法证明续期，开发 fixture 也不代替真实带 TTL 环境的部署验收。
 
 ## Provider、模型和 MCP
 

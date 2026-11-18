@@ -19,7 +19,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "module-cli-"));
     const root = path.join(base, "toolset"), version = path.join(root, "versions/fixture");
     fs.mkdirSync(version, { recursive: true, mode: 0o700 });
-    for (const name of ["runtime.py", "agent_config.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs"])
+    for (const name of ["runtime.py", "agent_config.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs", "task_activity.py"])
       fs.copyFileSync(path.join(scripts, name), path.join(version, name));
     const copiedCli = path.join(version, "task-cli.mjs");
     fs.writeFileSync(copiedCli, recordFixtureSpawns(fs.readFileSync(copiedCli, "utf8"), path.join(base, "drivers.ndjson")));
@@ -43,7 +43,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       agents: { opencode: { argv: [path.join(root, "bin/opencode"), "acp"] } } });
     const progress = path.join(base, "progress-control"); fs.mkdirSync(progress, { mode: 0o700 });
     const env = { PATH: configFixture.path + ':' + process.env.PATH, HOME: base, CODEX_BASE_URL: "http://127.0.0.1:1/v1", CODEX_API_KEY: "synthetic-codex",
-      COPILOT_BASE_URL: "http://127.0.0.1:1/v1", COPILOT_API_KEY: "synthetic-copilot",
+      COPILOT_BASE_URL: "http://127.0.0.1:1/v1", COPILOT_API_KEY: "synthetic-copilot", CODER_AGENT_TOKEN: "synthetic-agent-identity",
       TASK_FIXTURE_LOG: path.join(base, "executions"), TASK_FIXTURE_PROCESS_LOG: path.join(base, "processes"),
       TASK_FIXTURE_EVENT_LOG: path.join(base, "events.ndjson"), TASK_FIXTURE_PROGRESS_CONTROL: progress,
       LC_TASK_CALLBACK_URL: "private-protocol-field", UNLISTED_CALLBACK_BEARER: `tcb_${"e".repeat(43)}` };
@@ -54,9 +54,15 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const end = performance.now() + ms;
       while (!predicate()) { if (performance.now() > end) throw new Error(`fixture timeout: ${label}; root=${base}`); await pause(30); }
     };
-    const seen = [], receipts = new Map(); let drop = true;
+    const seen = [], activity = [], receipts = new Map(); let drop = true;
     const webhook = http.createServer((req, res) => {
       let body = ""; req.on("data", (data) => { body += data; }); req.on("end", () => {
+        if (req.method === "PATCH") {
+          assert.equal(req.url, "/api/v2/workspaceagents/me/app-status");
+          assert.equal(req.headers["coder-session-token"], env.CODER_AGENT_TOKEN);
+          const value = JSON.parse(body); assert.equal(value.app_slug, "opencode-tasks");
+          activity.push(value.state); res.writeHead(200); res.end(); return;
+        }
         seen.push(body); const id = JSON.parse(body).callback_id;
         if (!receipts.has(id)) receipts.set(id, body);
         assert.equal(body, receipts.get(id));
@@ -65,6 +71,8 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       });
     });
     await new Promise((resolve) => webhook.listen(0, "127.0.0.1", resolve));
+    write(path.join(version, "settings.json"), { install_root: root, workspace_id: "cli-fixture", runtime_profile: "env",
+      task_activity: { url: `http://127.0.0.1:${webhook.address().port}`, app_slug: "opencode-tasks" } });
     const git = (cwd, ...args) => {
       const result = spawnSync("git", ["-C", cwd, ...args], { env, encoding: "utf8" }); assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
     };
@@ -95,11 +103,18 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
     };
     let primaryError;
     try {
+      assert.equal(JSON.parse(cli(["list"]).stderr).error.code, "TASK_STORE_MISSING");
+      // This partial mock installation has no installed inventory for doctor.
+      assert.equal(cli(["doctor"]).status, 1); await pause(250);
+      assert.deepEqual(activity, []);
       const firstInput = input("first", "model selection", "a", { base: "rickyhao/stable" }), first = launch(firstInput);
       assert.equal(first.base_sha, baseSha); assert.equal(first.accepted, true);
       assert.equal(first.base, "rickyhao/stable");
       await until(() => box(first.task_id)?.attempts === 1, "lost receipt persisted");
+      await until(() => load(first.task_id).coderActivity?.reported_state === "idle", "first final activity");
+      assert.deepEqual(activity, ["working", "idle"]);
       const exact = box(first.task_id).body; await killControl(first.task_id);
+      const activityCount = activity.length;
       const attempts = seen.length; await pause(300); assert.equal(seen.length, attempts);
       checked(["recover", first.task_id]);
       await until(() => box(first.task_id)?.state === "delivered", "explicit outbox recover");
@@ -110,6 +125,8 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       fs.writeFileSync(path.join(configFixture.source, "AGENTS.md"), "Rules updated before duplicate launch\n");
       git(configFixture.source, "add", "."); git(configFixture.source, "commit", "-m", "update rules");
       assert.equal(launch(firstInput).request_id, first.request_id);
+      checked(["status", first.task_id]); checked(["list"]); assert.equal(cli(["doctor"]).status, 1);
+      await pause(250); assert.equal(activity.length, activityCount);
       assert.equal(fs.readFileSync(path.join(root, "runtime/config/opencode/AGENTS.md"), "utf8"), "Rules updated before duplicate launch\n");
       const follow = launch({ schema_version: 1, key: "follow", prompt: "continuity", callback: callback("b") }, first.task_id);
       assert.equal(follow.base, first.base); assert.equal(follow.base_sha, first.base_sha);
@@ -133,6 +150,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
 
       const waiting = launch(input("waiting", "wait for cancellation", "c", { no_progress_timeout_seconds: 10 }));
       await until(() => load(waiting.task_id).startedAt, "waiting started");
+      await until(() => load(waiting.task_id).coderActivity?.reported_state === "working", "running activity");
       await until(() => lines(env.TASK_FIXTURE_EVENT_LOG).some((event) => event.type === "prompt_received" &&
         event.sessionId === load(waiting.task_id).handle.backendSessionId), "original prompt received");
       assert.equal(controls(waiting.task_id).length, 1);
@@ -159,6 +177,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const sessionId = load(late.task_id).handle.backendSessionId;
       fs.writeFileSync(path.join(progress, sessionId + ".stall"), "stall");
       await until(() => box(late.task_id)?.state === "delivered", "one unknown callback");
+      await until(() => load(late.task_id).coderActivity?.reported_state === "working", "unknown stays working");
       const body = box(late.task_id).body, posts = seen.length;
       assert.equal(checked(["status", late.task_id]).result_status, null);
       const busy = cli(["launch", "--input-file", inputFile({ schema_version: 1, key: "busy", prompt: "next", callback: callback("f") }), "--continue-from", late.task_id]);
@@ -167,6 +186,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       await until(() => load(late.task_id).result?.status === "success", "late canonical");
       assert.equal(checked(["result", late.task_id]).output, "Controlled result");
       assert.equal(box(late.task_id).body, body); assert.equal(seen.length, posts);
+      await until(() => load(late.task_id).coderActivity?.reported_state === "idle", "late final activity");
 
       // 同一 session 的请求级 queued cancel；另一条 queued 请求继续执行。
       const source = load(late.task_id);
@@ -183,14 +203,19 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
         return child;
       };
       runInternal(active); await until(() => load(active).startedAt, "active original");
+      await until(() => load(active).coderActivity?.reported_state === "working", "concurrent active activity");
+      const concurrentActivity = activity.length;
       const cancelled = internal("queued-cancel", "continuity", "h"), survivor = internal("queued-survivor", "continuity", "i");
       runInternal(cancelled); runInternal(survivor);
       await until(() => load(cancelled).dispatchedAt && load(survivor).dispatchedAt, "two requests queued");
       cancel(cancelled);
       await until(() => load(cancelled).result?.status === "cancelled", "queued canonical cancel");
+      await until(() => load(cancelled).coderActivity?.reported_state === "working", "other tasks still working");
       assert.equal(load(active).result, undefined); assert.equal(load(survivor).result, undefined);
+      assert.equal(activity.slice(concurrentActivity).includes("idle"), false);
       cancel(active);
       await until(() => load(survivor).result?.status === "success", "other queued survived");
+      await until(() => activity.at(-1) === "idle", "last concurrent task idle");
 
       // 两个公开 launch 竞争同一 key；整个准备/提交链只有一个提交者。
       const concurrent = input("concurrent", "continuity", "j", { base: "rickyhao/stable" }), file = inputFile(concurrent);
@@ -208,6 +233,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       const accepted = results.find((result) => !result.error);
       assert.equal(launch(concurrent).request_id, accepted.request_id);
       await until(() => load(accepted.task_id).result, "concurrent completed");
+      await until(() => load(accepted.task_id).coderActivity?.reported_state === "idle", "final task activity");
       assert.equal(lines(env.TASK_FIXTURE_EVENT_LOG).filter((event) => event.type === "prompt_received" &&
         event.sessionId === load(accepted.task_id).handle.backendSessionId).length, 1);
       for (const command of ["submit", "resolve", "inspect"]) assert.equal(cli([command]).status, 1);
@@ -217,7 +243,7 @@ test("real wrapper/CLI: one control, durable launch, explicit recover, exact out
       checked(["recover"]); // 旧 namespace 不扫描，也不生成兼容报告。
       assert.deepEqual(fs.readFileSync(path.join(unknown, "task.json")), old);
       t.diagnostic(JSON.stringify({ launches: results.length, stable_custom_controls_per_task: 1, callbacks: receipts.size,
-        late_callback_body_unchanged: true, recover_replayed_prompts: 0, cancel_queued_isolated: true }));
+        late_callback_body_unchanged: true, recover_replayed_prompts: 0, cancel_queued_isolated: true, activity_requests: activity.length }));
     } catch (error) { primaryError = error; t.diagnostic(`retained fixture: ${base}`); }
     await finishFixture(primaryError, async () => {
       await stopFixtureProcesses(base, version); webhook.closeAllConnections(); await new Promise((resolve) => webhook.close(resolve));

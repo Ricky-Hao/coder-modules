@@ -170,8 +170,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_runtime_argv_cwd_path_env_and_no_credential_serialization(self):
         sentinel = 'NOT-A-REAL-CREDENTIAL-DO-NOT-PERSIST'
+        activity = {'url': 'https://coder.example.invalid', 'app_slug': 'opencode-tasks'}
+        self.bundle['config']['task_activity'] = activity
         with patch.dict(os.environ, {'CODER_AGENT_TOKEN': sentinel, 'GITHUB_TOKEN': sentinel, 'TEST_PROVIDER_KEY': sentinel}):
             self.install()
+        self.assertEqual(json.loads((self.root / 'active/settings.json').read_text())['task_activity'], activity)
+        self.assertTrue((self.root / 'active/task_activity.py').is_file())
+        self.assertFalse((self.root / 'runtime/tasks-v3/.activity.lock').exists())
         project = self.base / 'project space'
         project.mkdir()
         config = project / 'selected.json'
