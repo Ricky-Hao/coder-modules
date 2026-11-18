@@ -1,7 +1,8 @@
 mock_provider "coder" {
   mock_data "coder_workspace" {
     defaults = {
-      id = "11111111-1111-4111-8111-111111111111"
+      id         = "11111111-1111-4111-8111-111111111111"
+      access_url = "https://coder.example.invalid"
     }
   }
 }
@@ -22,6 +23,10 @@ run "agent_only" {
   assert {
     condition     = local.bundle_config.workspace_id == data.coder_workspace.me.id
     error_message = "Workspace identity must be derived internally."
+  }
+  assert {
+    condition     = coder_app.task_activity[0].agent_id == var.agent_id && coder_app.task_activity[0].hidden && coder_app.task_activity[0].slug == "opencode-tasks" && coder_app.task_activity[0].url == null && local.bundle_config.task_activity.url == data.coder_workspace.me.access_url && local.bundle_config.task_activity.app_slug == coder_app.task_activity[0].slug
+    error_message = "Detached task activity requires its own hidden app without a business URL, using the workspace access URL."
   }
   assert {
     condition = var.runtime_profile == "env" && local.release == {
@@ -55,6 +60,18 @@ run "dedicated_mount" {
   assert {
     condition     = output.opencode_task_command == "'/mnt/opencode/toolset'/bin/opencode-task"
     error_message = "Detached task command must follow the persistent root."
+  }
+}
+
+run "activity_disabled" {
+  command = plan
+  variables {
+    agent_id      = "22222222-2222-4222-8222-222222222222"
+    task_activity = false
+  }
+  assert {
+    condition     = length(coder_app.task_activity) == 0 && local.bundle_config.task_activity == null
+    error_message = "Opting out must omit both app registration and runtime activity configuration."
   }
 }
 

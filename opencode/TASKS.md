@@ -101,6 +101,8 @@ task 尚未完整写入时也保留现场，不接管。输入路径可以不同
 没有 .launches、.sessions、origin/tail、launch proof、task owner、副本输入、报告或恢复账本。
 profile 只用现有内容寻址、原子排他发布，无目录锁或重复 owner。安装根的信任边界保留。
 task 源码分 CLI、launch、store、worker、固定 ACP adapter 五职责，无通用 backend/兼容框架。
+`task_activity.py` 是 worker 调用的短命 Coder HTTP helper；共用 `tasks-v3/.activity.lock`
+串行聚合与上报，不保存另一份活动任务清单。
 
 普通 JSON 有读取上限，坏 JSON 报错，不冒充缺失或自动补齐。无读锁、反复 inode/属主/祖先
 检查、cookie/cursor 分页或跨文件快照。关键写入用 temp+atomic replace、文件/目录 fsync；
@@ -117,7 +119,9 @@ launch 不再写 task，也不为了 null backend 字段追加查询。ACK 未�
 launch/status 共用固定摘要：key/task/request、accepted/reused/phase/step、dispatch_state 与
 outcome_unknown，实际 repo/branch/worktree/base/full SHA，session/backend/acpx 已知句柄，
 continue_from、实际 model/variant、固定白名单权限摘要、时限、直接 status/result 命令及
-task_directory。未创建 worktree 为 null；没有旧 proof 或计划产物存在性的额外扫描。
+task_directory。`coder_activity` 给出最近上报时间、成功的 `reported_state` 及保留的
+`last_error`，没有启用或尚未上报时为 null。未创建 worktree 为 null；没有旧 proof 或计划
+产物存在性的额外扫描。
 
 result 另外给 canonical output、callback_output、output_truncated/output_incomplete。
 晚到 canonical 与已封存 callback 分开。成功只说明程序观察到 canonical success。
@@ -155,6 +159,35 @@ daemon、租约、接管或健康探针。已 finished 且有 outbox 的 recover
 cancel 先保存 cancel.request，再尝试原 request 的 cancel_prompt。无 worker 时意图保留。
 保留固定 socket 路径、UID、generation 和响应身份校验，不 session-wide cancel；RPC 确认不等于
 canonical cancelled，发送失败报 CANCEL_UNCONFIRMED。显式 recover 可观察原请求并处理意图。
+
+## Coder 活动与 autostop
+
+模块默认注册当前 Agent 的隐藏 `opencode-tasks` app，无 URL、端口或服务。worker 保存
+dispatched 后立即异步上报 working，此后每次请求完成约 120 秒后续报；推理、工具、编译和
+等待外部结果都包含在内，不依赖输出。可信 success/failed/cancelled 后停止该任务续报并
+再汇总一次：同安装根还有持有 control.lock、已派发且无真实 result 的任务时仍报 working，
+最后一个结束才报 idle。保留的 session、未持锁的 stale dispatched 不产生保活。
+
+聚合扫描只读现有 task.json 和内核 worker 锁；跨任务锁覆盖状态判断和整次 HTTP 请求，
+让旧 idle 在新 working 之前完成。每个 worker 最多一个上报在途，没有积压或独立常驻进程。
+初始化/派发前失败不声明活动。幂等 launch、查询、只补投终态 outbox 均不调用上报。
+
+900 秒 no-progress、unknown 通知投递、通信错误、cancel 意图/RPC 确认均不证明执行结束，
+原 worker 继续 passive 观察和续报；晚到可信终态才停止。显式 recover 在继续观察已派发原
+请求时恢复续报，不重放 prompt。worker 异常退出、Workspace 停止/重建后续报自然停止，
+没有跨崩溃保护或自动恢复；单次 working 不会永久保活。
+
+HTTP 使用继承的 `CODER_AGENT_TOKEN`，只从进程环境读取，发送到配置的 Coder origin，
+不写 task/profile/settings/argv。目标取自 Terraform `coder_workspace.access_url`；只接受
+HTTPS（测试允许 loopback HTTP），不跟随 redirect，不记录响应正文或底层异常。
+锁最多等 2 秒，网络超时 5 秒，helper 总期限 7 秒，worker 在 8 秒强制结束失控 helper。
+上报异步进行，失败不改任务结果或 outbox。`status`/`result`/`list` 的
+`coder_activity.last_error` 保留安全的 `CODER_ACTIVITY_FAILED` 诊断与可用的 HTTP 状态码；
+401/403 核对继承身份，404 核对同 Agent 的 app 与服务端 API，timeout/network 核对网络。
+运行中按下一周期再试；终态只做一次有界汇总尝试，失败后不为 idle 另起续报。
+
+接入条件及服务端版本边界见 [README](README.md#coder-task-activity)。这些 fixture 仅证明
+本地请求与生命周期契约，不能证明真实 Workspace deadline 已续期。
 
 ## 持久 outbox
 

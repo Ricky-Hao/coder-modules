@@ -66,6 +66,12 @@ variable "start_blocks_login" {
   default     = true
 }
 
+variable "task_activity" {
+  description = "Register a hidden opencode-tasks app and report detached execution activity using the inherited Coder agent token. Requires the Coder app-status API; disable for deployments without it."
+  type        = bool
+  default     = true
+}
+
 variable "install_timeout" {
   description = "Startup script timeout in seconds."
   type        = number

@@ -14,8 +14,12 @@ locals {
     release_asset   = local.release.asset
     release_sha256  = local.release.sha256
     runtime_profile = var.runtime_profile
+    task_activity = var.task_activity ? {
+      app_slug = coder_app.task_activity[0].slug
+      url      = data.coder_workspace.me.access_url
+    } : null
   }
-  bundle_files = { for name in ["install.py", "runtime.py", "agent_config.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs", "package.json", "package-lock.json"] :
+  bundle_files = { for name in ["install.py", "runtime.py", "agent_config.py", "git_ssh.py", "diagnostics.py", "safety.py", "profiles.py", "profile-env.json", "shell_path.py", "task.mjs", "task-worker.mjs", "task-launch.mjs", "task-cli.mjs", "task-acp.mjs", "task_activity.py", "package.json", "package-lock.json"] :
     name => file("${path.module}/scripts/${name}")
   }
   # 生成包只包含原始源码；动态设置单独传入，不要求安装者生成文件。
@@ -41,6 +45,13 @@ locals {
       workspace_id = var.dedicated_volume.workspace_id
     }))}'))))",
   ])
+}
+
+resource "coder_app" "task_activity" {
+  count    = var.task_activity ? 1 : 0
+  agent_id = var.agent_id
+  slug     = "opencode-tasks"
+  hidden   = true
 }
 
 resource "coder_script" "opencode" {

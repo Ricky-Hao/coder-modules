@@ -46,7 +46,7 @@ async function spawnControl(id, recover = false) {
 async function main() {
   if (!command || ["help", "--help", "-h"].includes(command) || args.length === 1 && ["--help", "-h"].includes(args[0])) { console.log(help); return; }
   if (command === "--version") { console.log("opencode-task 3"); return; }
-  const root = readJson(path.join(version, "settings.json")).install_root;
+  const settings = readJson(path.join(version, "settings.json")), root = settings.install_root;
   const store = new TaskStore(path.join(root, "runtime/tasks-v3"));
   if (command === "launch") {
     const { launchTask } = await import("./task-launch.mjs");
@@ -87,8 +87,8 @@ async function main() {
   const task = store.load(id);
   task.workerStartedAt ??= store.now(); store.write(task);
   if (args.includes("--ready")) fs.writeSync(3, JSON.stringify(store.summary(task)) + "\n");
-  const { TaskWorker } = await import("./task-worker.mjs");
-  const worker = new TaskWorker(store, { connect: async (record) => {
+  const { TaskWorker, coderActivity } = await import("./task-worker.mjs");
+  const worker = new TaskWorker(store, { activity: settings.task_activity ? coderActivity(version) : undefined, connect: async (record) => {
     const { createTaskRuntime } = await import("./task-acp.mjs"); return createTaskRuntime(root, record);
   } });
   await worker.run(task, { recover: args.includes("--recover") });

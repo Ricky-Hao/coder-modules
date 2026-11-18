@@ -66,6 +66,8 @@ run "executable_dedicated_startup" {
     for key in ('script', 'agent_id', 'display_name'):
         assert attrs[key]['required'] and attrs[key]['type'] == 'string'
     assert attrs['start_blocks_login']['type'] == 'bool'
+    app = coder['resource_schemas']['coder_app']['block']['attributes']
+    assert app['hidden']['type'] == 'bool' and app['url']['optional']
     assert coder['data_source_schemas']['coder_workspace']['block']['attributes']['id']['type'] == 'string'
     output = run('mock-tests', 'test', '-no-color', '-json', '-verbose')
     plans = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
@@ -120,7 +122,7 @@ run "executable_dedicated_startup" {
         configs.append(bundle['config'])
         assert set(bundle['files']) == {'install.py', 'runtime.py', 'agent_config.py', 'git_ssh.py', 'safety.py', 'profiles.py',
                                         'profile-env.json', 'shell_path.py', 'task.mjs', 'task-worker.mjs', 'task-launch.mjs', 'diagnostics.py', 'task-cli.mjs', 'task-acp.mjs',
-                                        'package.json', 'package-lock.json'}
+                                        'task_activity.py', 'package.json', 'package-lock.json'}
         for name, text in bundle['files'].items():
             assert text.encode() == (module / 'scripts' / name).read_bytes()
             if name.endswith('.py'):
@@ -132,7 +134,7 @@ run "executable_dedicated_startup" {
         compile(body, '<bootstrap>', 'exec')
         config = bundle['config']
         if config['install_root'] == '':
-            result = verify_startup(script, scratch / 'execution-home')
+            result = verify_startup(script, scratch / ('execution-home-' + str(number)))
             execution.append({'mode': 'home', **result})
         elif config['install_root'] == fixture_root:
             result = verify_startup(script, execution_dir)

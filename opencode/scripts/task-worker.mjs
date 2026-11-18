@@ -1,6 +1,16 @@
 /** 一个持 control.lock 的 worker：一次派发、journal 观察、持久 outbox。 */
 import fs from "node:fs";
+import { execFile } from "node:child_process";
+import path from "node:path";
 import { callback, bounded, delay, diagnostic, runtimeError, save, TaskError, within } from "./task.mjs";
+
+export const coderActivity = (version) => () => new Promise((resolve) => {
+  execFile("python3", ["-B", path.join(version, "task_activity.py")],
+    { timeout: 8000, killSignal: "SIGKILL", maxBuffer: 4096 }, (error, stdout) => {
+      if (error) return resolve({ error: error.killed ? "timeout" : "local" });
+      try { resolve(JSON.parse(stdout)); } catch { resolve({ error: "local" }); }
+    });
+});
 
 export function retryDelay(attempt, retryAfter, now) {
   const supplied = /^\d+$/.test(retryAfter ?? "") ? Number(retryAfter) * 1000 : Date.parse(retryAfter ?? "") - now;
@@ -23,10 +33,25 @@ async function receipt(response) {
   } catch { throw fail(); } finally { await reader.cancel().catch(() => {}); }
 }
 export class TaskWorker {
-  constructor(store, { connect, runtime, fetcher = fetch, pollMs = 200, ioMs = 3000 } = {}) {
+  constructor(store, { connect, runtime, fetcher = fetch, pollMs = 200, ioMs = 3000, activity, activityMs = 120000 } = {}) {
     this.store = store; this.connect = connect ?? (() => runtime); this.fetcher = fetcher;
     this.pollMs = pollMs; this.ioMs = ioMs;
+    this.activity = activity; this.activityMs = activityMs;
   }
+  updateActivity() {
+    if (!this.activity || this.activityPending || this.activityFinal || !this.activityStarted) return;
+    if (!this.task.result && performance.now() < (this.activityDue ?? 0)) return;
+    this.activityFinal = Boolean(this.task.result);
+    this.activityPending = Promise.resolve().then(this.activity).catch(() => ({ error: "local" })).then((value) => {
+      const reason = ["configuration", "identity_missing", "lock_timeout", "http", "redirect", "timeout", "network", "local"].includes(value?.error) ? value.error : "local";
+      const state = ["working", "idle"].includes(value?.state) ? value.state : null;
+      const error = state ? null : { code: "CODER_ACTIVITY_FAILED", stage: "activity", field: "coder_app", reason, action: "check_activity_configuration",
+        ...(Number.isInteger(value?.http_status) && value.http_status >= 100 && value.http_status < 600 ? { http_status: value.http_status } : {}) };
+      this.task.coderActivity = { at: this.store.now(), reported_state: state,
+        last_error: error ? { at: this.store.now(), ...error } : this.task.coderActivity?.last_error ?? null }; this.dirty = true;
+    }).finally(() => { this.activityDue = performance.now() + this.activityMs; this.activityPending = undefined; });
+  }
+  startActivity() { this.activityStarted = true; this.updateActivity(); }
   write() { this.store.write(this.task); this.dirty = false; }
   progress() {
     this.timeout();
@@ -81,6 +106,7 @@ export class TaskWorker {
       if (this.cancelRequested()) { this.beforeDispatch("CANCELLED", true); return; }
       if (this.store.remaining(task) <= 0) { this.timeout(); return; }
       task.phase = "dispatched"; task.dispatchedAt = this.store.now(); this.write();
+      this.startActivity();
       let turn;
       try { turn = this.runtime.startTurn({ handle, text: input.prompt, mode: "prompt", requestId: task.requestId }); }
       catch (error) { this.observation(error); return; }
@@ -165,10 +191,12 @@ export class TaskWorker {
         else if (recover) this.beforeDispatch("RECOVERED_BEFORE_DISPATCH");
         else setup = this.start().catch((error) => { this.failure = error; });
       }
+      if (task.dispatchedAt && !task.result) this.startActivity();
       while (!controller.signal.aborted) {
         if (this.failure) throw this.failure;
         if (task.phase === "ready" && this.cancelRequested()) this.beforeDispatch("CANCELLED", true);
         this.timeout();
+        this.updateActivity();
         if (task.dispatchedAt && !this.runtime && !setup && !task.result) {
           setup = Promise.resolve().then(() => this.connect(task)).then((runtime) => { this.runtime = runtime; }, (error) => {
             this.observation(error, "session"); setup = undefined;
@@ -191,11 +219,13 @@ export class TaskWorker {
             .catch(() => {}).finally(() => { cancellation = undefined; });
         }
         if (this.dirty) this.write();
-        if (drained && this.box && (!deliver || this.box.state !== "pending") && !delivery) return;
+        if (drained && this.box && (!deliver || this.box.state !== "pending") && !delivery &&
+            (!this.activity || !this.activityStarted || this.activityFinal && !this.activityPending)) return;
         await delay(this.pollMs);
       }
     } finally {
       this.alive = false; stop(); signal.removeEventListener("abort", stop);
+      await this.activityPending;
       if (this.dirty) this.write();
       if (this.runtime) await within(this.runtime.shutdown(), this.ioMs).catch(() => {});
     }
