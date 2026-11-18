@@ -74,6 +74,17 @@ test("same key before first ACK only reads; first control owns all later task wr
   release(); const result = await running;
   assert.equal(result.dispatch_state, "attempted"); assert.equal(f.store.load(result.task_id).output.text, "worker wrote this");
 });
+test("simple launch explicitly selects Sol medium and continue preserves its snapshot", async (t) => {
+  const f = fixture(t), first = await f.launch({ ...f.input, variant: "medium" });
+  assert.equal(first.selection.provider, "codex"); assert.equal(first.selection.model, "gpt-6.2-sol");
+  assert.equal(first.selection.variant, "medium");
+  const original = f.terminal(first.task_id), bytes = fs.readFileSync(original.modelConfig);
+  const next = { schema_version: 1, key: "simple-next", prompt: "next simple task", callback: f.input.callback };
+  const result = await f.launch(next, { "--continue-from": first.task_id });
+  assert.equal(result.accepted, true); assert.deepEqual(result.selection, first.selection);
+  assert.equal(f.store.load(result.task_id).modelConfig, original.modelConfig);
+  assert.deepEqual(fs.readFileSync(original.modelConfig), bytes);
+});
 test("same key concurrent preparation has one Git prepare and one worker", async (t) => {
   const f = fixture(t), results = await Promise.all([f.launch(), f.launch()]);
   assert.equal(f.starts(), 1); assert.equal(results.filter((value) => value.accepted).length >= 1, true);

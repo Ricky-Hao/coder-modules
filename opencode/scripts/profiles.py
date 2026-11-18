@@ -110,8 +110,8 @@ def selection(model, variant=None):
     return {'id': model, **({'variant': variant} if variant is not None else {})}
 
 
-def task_configuration(config, model=None, variant=None):
-    """Snapshot nonsecret task defaults, including title routing, before acceptance."""
+def task_configuration(config, model=None, variant=None, *, route_agents=False):
+    """Select the primary model; route built-in simple agents only for fresh env tasks."""
     if model is not None and (not isinstance(model, str) or '#' in model):
         raise ValueError('INVALID_MODEL')
     selected = selection(model if model is not None else config.get('model'))
@@ -124,14 +124,9 @@ def task_configuration(config, model=None, variant=None):
     if effort is not None and effort not in [item['id'] for item in definition.get('variants', [])]:
         raise ValueError('INVALID_VARIANT')
     config['model'] = {'providerID': provider, 'model': model_id, **({'variant': effort} if effort else {})}
-    title = config.setdefault('agents', {}).setdefault('title', {})
-    title_model = title.get('model', {}).get('model', model_id) if isinstance(title.get('model'), dict) else model_id
-    title_definition = config['providers'][provider]['models'].get(title_model, definition)
-    if title_model not in config['providers'][provider]['models']:
-        title_model = model_id
-    if 'low' not in [item['id'] for item in title_definition.get('variants', [])]:
-        raise ValueError('TASK_TITLE_LOW_UNAVAILABLE')
-    title['model'] = {'providerID': provider, 'model': title_model, 'variant': 'low'}
+    if route_agents:
+        for name in ('title', 'explore'):
+            config['agents'][name]['model']['providerID'] = provider
     return selected
 
 

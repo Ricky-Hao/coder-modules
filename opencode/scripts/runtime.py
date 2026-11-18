@@ -109,7 +109,7 @@ def selection_diagnostic(error):
         return {'code': 'LAUNCH_ENVIRONMENT_INVALID', 'stage': 'selection', 'field': 'environment',
                 'reason': error.reason, 'environment_names': error.names}
     fields = {'INVALID_MODEL': 'model', 'INVALID_VARIANT': 'variant',
-              'TASK_MODEL_CONFIG_REQUIRED': 'model_config', 'TASK_TITLE_LOW_UNAVAILABLE': 'model_config'}
+              'TASK_MODEL_CONFIG_REQUIRED': 'model_config'}
     code = str(error) if isinstance(error, ValueError) and str(error) in fields else 'LAUNCH_SELECTION_INVALID'
     return {'code': code, 'stage': 'selection', 'field': fields.get(code, 'selection') if not isinstance(error, SelectionError) else error.field,
             'reason': error.reason if isinstance(error, SelectionError) else 'unknown'}
@@ -147,7 +147,8 @@ def launch_selection(settings, request):
         current = profiles.configuration(source, VERSION, target.split('/', 1)[0])
         if not saved:
             config = current
-    model = profiles.task_configuration(config, target if changed or saved else None, variant)
+    model = profiles.task_configuration(config, target if changed or saved else None, variant,
+                                        route_agents=profile == 'env' and not saved)
     failed = False
     try:
         snapshot = profiles.materialize(Path(settings['install_root']), settings['workspace_id'], config)

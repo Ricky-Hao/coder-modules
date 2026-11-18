@@ -16,7 +16,8 @@
   查询先同步中心全局规则/Skill，但不恢复、重派或改写业务记录。
 - 保留 Coder 注入的 Git SSH 身份和 PATH。仅模块 Git 通过现有 hook 接受新/变化 hostkey；
   不改设备 SSH、用户 `.ssh` 或全局 SSH 设置。
-- 内置 env profile 恰好为 copilot、codex，默认 codex/Sol/max、title/low。
+- 内置 env profile 恰好为 copilot、codex，模型为 gpt-6.2-astra、gpt-6.2-sol；默认
+  codex/Sol/max，title/explore 跟随所选 Provider 使用 Sol/medium；简单独立任务显式选 medium。
   保留模型完整一致性、四环境变量独立校验与单任务 ACP 选择。
   Named session 固定选择，running/queued 时不切换。全局规则不做 per-task 冻结。
 - 源码交付、main 合并、模板接入、运行环境激活各有边界；只向用户指定 owner/ref 推送。

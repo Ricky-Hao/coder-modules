@@ -82,21 +82,29 @@ class ProfileTests(unittest.TestCase):
                           'transport': 'websocket', 'compaction': {'type': 'native'}})
         self.assertEqual(cfg['providers']['copilot']['env'], ['COPILOT_API_KEY'])
         models = provider['models']
-        self.assertEqual(set(models), {'gpt-6.1-sol', 'gpt-6-astra'})
-        self.assertEqual(hashlib.sha256(json.dumps(models, sort_keys=True).encode()).hexdigest(),
+        self.assertEqual(set(models), {'gpt-6.2-sol', 'gpt-6.2-astra'})
+        self.assertEqual(models['gpt-6.2-sol']['name'], 'GPT-6.2 Sol')
+        self.assertEqual(models['gpt-6.2-astra']['name'], 'GPT-6.2 Astra')
+        # Only IDs and display names change from the reviewed pre-6.2 catalog.
+        original = copy.deepcopy(models)
+        original['gpt-6.1-sol'] = original.pop('gpt-6.2-sol')
+        original['gpt-6-astra'] = original.pop('gpt-6.2-astra')
+        original['gpt-6.1-sol']['name'] = 'GPT-6.1 Sol'
+        original['gpt-6-astra']['name'] = 'GPT-6 Astra'
+        self.assertEqual(hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest(),
                          '6c8d5e4c904137afa2d806ebebd32ea33dd4b9f84052c63ff551db4c1daf159c')
-        self.assertEqual(cfg['model'], {'providerID': 'codex', 'model': 'gpt-6.1-sol', 'variant': 'max'})
+        self.assertEqual(cfg['model'], {'providerID': 'codex', 'model': 'gpt-6.2-sol', 'variant': 'max'})
         for name, model in models.items():
             with self.subTest(model=name):
                 self.assertEqual(model['limit'], {'context': 400000, 'input': 272000, 'output': 128000})
                 self.assertEqual(model['capabilities'], {'tools': True, 'input': ['text', 'image'], 'output': ['text']})
                 self.assertEqual(model['variants'], [{'id': level, 'settings': {'reasoningEffort': level}}
                                                     for level in ('low', 'medium', 'high', 'xhigh', 'max')])
-        self.assertEqual(models['gpt-6.1-sol']['settings'], {'reasoningEffort': 'max'})
-        self.assertEqual(models['gpt-6-astra']['settings'], {'reasoningEffort': 'medium'})
+        self.assertEqual(models['gpt-6.2-sol']['settings'], {'reasoningEffort': 'max'})
+        self.assertEqual(models['gpt-6.2-astra']['settings'], {'reasoningEffort': 'medium'})
         self.assertEqual(cfg['compaction'], {'buffer': 13600})
         # The pinned fork subtracts buffer from input, not output from context.
-        sol = models['gpt-6.1-sol']['limit']
+        sol = models['gpt-6.2-sol']['limit']
         self.assertEqual(sol['input'] + sol['output'], sol['context'])
         self.assertEqual(sol['input'] - cfg['compaction']['buffer'], 258400)
         self.assertEqual(cfg['experimental']['policies'], [
@@ -104,14 +112,14 @@ class ProfileTests(unittest.TestCase):
             {'action': 'provider.use', 'resource': 'copilot', 'effect': 'allow'},
             {'action': 'provider.use', 'resource': 'codex', 'effect': 'allow'}])
 
-    def test_title_model_reasoning_is_separate_from_primary(self):
+    def test_simple_agents_reasoning_is_separate_from_primary(self):
         cfg = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
-        self.assertEqual(cfg['agents'], {'title': {'model': {
-            'providerID': 'codex', 'model': 'gpt-6.1-sol', 'variant': 'low'}}})
+        self.assertEqual(cfg['agents'], {name: {'model': {
+            'providerID': 'codex', 'model': 'gpt-6.2-sol', 'variant': 'medium'}} for name in ('title', 'explore')})
         self.assertNotIn('small_model', cfg)  # Legacy spelling only migrates to the title agent.
-        sol = cfg['providers']['copilot']['models']['gpt-6.1-sol']
+        sol = cfg['providers']['copilot']['models']['gpt-6.2-sol']
         variants = {variant['id']: variant['settings'] for variant in sol['variants']}
-        self.assertEqual(variants[cfg['agents']['title']['model']['variant']], {'reasoningEffort': 'low'})
+        self.assertEqual(variants[cfg['agents']['title']['model']['variant']], {'reasoningEffort': 'medium'})
         self.assertEqual(variants[cfg['model']['variant']], {'reasoningEffort': 'max'})
         self.assertEqual(sol['settings'], {'reasoningEffort': 'max'})
 
@@ -124,6 +132,12 @@ class ProfileTests(unittest.TestCase):
                                             ('copilot', 'websocket', False)):
             with self.subTest(provider=provider, transport=transport, native=native):
                 config = profiles.configuration(self.env, fixtures.SCRIPTS, provider)
+                # Historical task: old model/max and title/low, no explore override.
+                for definition in config['providers'].values():
+                    definition['models']['gpt-6.1-sol'] = definition['models'].pop('gpt-6.2-sol')
+                    definition['models']['gpt-6.1-sol']['settings']['reasoningEffort'] = 'max'
+                config['agents'] = {'title': {'model': {
+                    'providerID': provider, 'model': 'gpt-6.1-sol', 'variant': 'low'}}}
                 model = profiles.task_configuration(config, provider + '/gpt-6.1-sol', 'max')
                 for definition in config['providers'].values():
                     definition['settings'].pop('compaction')
@@ -146,8 +160,10 @@ class ProfileTests(unittest.TestCase):
                 for definition in current['providers'].values():
                     self.assertEqual(definition['settings']['transport'], 'websocket')
                     self.assertEqual(definition['settings']['compaction'], {'type': 'native'})
-                self.assertEqual(continued['model'], fresh['model'])
-                self.assertEqual(config['agents'], current['agents'])
+                self.assertEqual(continued['model'], {'id': provider + '/gpt-6.1-sol', 'variant': 'max'})
+                self.assertEqual(fresh['model'], {'id': provider + '/gpt-6.2-sol', 'variant': 'max'})
+                self.assertEqual(current['agents'], {name: {'model': {
+                    'providerID': provider, 'model': 'gpt-6.2-sol', 'variant': 'medium'}} for name in ('title', 'explore')})
 
     def test_default_profile_launch_and_idempotent_private_config(self):
         self.fixture.install()
@@ -162,7 +178,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(actual['cwd'], str(self.base))
         self.assertEqual(child['PATH'], self.env['PATH'])
         self.assertEqual(child['CODEX_API_KEY'], self.env['CODEX_API_KEY'])
-        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'codex/gpt-6.1-sol')
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'codex/gpt-6.2-sol')
         self.assertEqual(child['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertEqual(child['OPENCODE_ACP_CATALOG_TIMEOUT_MS'], '30000')
         for name in self.env.keys() - {'OPENCODE_CONFIG_CONTENT'}:
@@ -390,7 +406,7 @@ class ProfileTests(unittest.TestCase):
             return subprocess.run([str(self.root / 'bin/opencode-task'), '_selection'], input=json.dumps(request),
                                   env=self.env, cwd=self.base, capture_output=True, text=True)
         def run_profile(path):
-            return self.call(args=['--module-task', str(path), 'codex/gpt-6.1-sol', 'max', 'env', 'acp'])
+            return self.call(args=['--module-task', str(path), 'codex/gpt-6.2-sol', 'max', 'env', 'acp'])
         try:
             publisher.start()
             self.assertTrue(created.wait(10), 'publisher did not reach link/unlink window')
@@ -445,7 +461,7 @@ elif sys.argv[1].endswith('task-cli.mjs'):
     assert sys.argv[2:] == ['recover']
 else:
     assert sys.argv[2:5] == ['--approve-all','--non-interactive-permissions','deny']
-    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.1-sol'
+    assert os.environ['OPENCODE_ACP_REQUIRED_MODEL'] == 'codex/gpt-6.2-sol'
     assert os.environ['OPENCODE_ACP_REQUIRED_VARIANT'] == 'max'
     for name in ('CONTEXT7_MCP_API_KEY', 'FIRECRAWL_MCP_API_KEY', 'UNLISTED_SERVICE_AUTH', 'HTTPS_PROXY'):
         assert name in os.environ
@@ -520,18 +536,19 @@ else:
             task = runtime.launch_selection(settings, {'provider': 'copilot'})
         selected = task['model']
         child = runtime.environment(copilot, self.root, 'env', 'test-workspace', ['acp'], task)
-        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertEqual(child['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.2-sol')
         self.assertNotIn('CODEX_API_KEY', child)
-        self.assertEqual(selected, {'id': 'copilot/gpt-6.1-sol', 'variant': 'max'})
+        self.assertEqual(selected, {'id': 'copilot/gpt-6.2-sol', 'variant': 'max'})
         cfg = json.loads(Path(child['OPENCODE_CONFIG']).read_text())
-        self.assertEqual(cfg['agents']['title']['model'], {'providerID': 'copilot', 'model': 'gpt-6.1-sol', 'variant': 'low'})
+        self.assertEqual(cfg['agents'], {name: {'model': {
+            'providerID': 'copilot', 'model': 'gpt-6.2-sol', 'variant': 'medium'}} for name in ('title', 'explore')})
         second = runtime.environment(child, self.root, 'env', 'test-workspace', ['acp'], task)
         self.assertEqual(second['COPILOT_API_KEY'], copilot['COPILOT_API_KEY'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_MODEL'], selected['id'])
         self.assertEqual(second['OPENCODE_ACP_REQUIRED_VARIANT'], 'max')
         self.assertNotIn('CODEX_API_KEY', second)
         with patch.dict(os.environ, copilot, clear=True):
-            astra = runtime.launch_selection(settings, {'provider': 'copilot', 'model': 'gpt-6-astra'})
+            astra = runtime.launch_selection(settings, {'provider': 'copilot', 'model': 'gpt-6.2-astra'})
         self.assertEqual(astra['model']['variant'], 'medium')
         for pair in (copilot, {'LLM_BASE_URL': 'https://old.example.invalid', 'LLM_API_KEY': 'SECRET-OLD'}):
             with self.assertRaisesRegex(profiles.ProfileError, 'CODEX_API_KEY.*CODEX_BASE_URL'):
@@ -546,7 +563,8 @@ else:
             with self.assertRaisesRegex(profiles.ProfileError, name) as error:
                 profiles.configuration({**self.env, **copilot, name: bad}, fixtures.SCRIPTS)
             self.assertNotIn('SECRET', str(error.exception))
-        for model, variant in [('copilot/missing', None), ('copilot/gpt-6-astra', 'missing')]:
+        for model, variant in [('copilot/missing', None), ('copilot/gpt-6.2-astra', 'missing'),
+                               ('codex/gpt-6.1-sol', None), ('copilot/gpt-6-astra', None)]:
             with self.assertRaises(ValueError):
                 profiles.task_configuration(json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text()), model, variant)
 
@@ -555,6 +573,9 @@ else:
         self.fixture.install()
         source = self.base / 'external.json'
         config = json.loads((fixtures.SCRIPTS / 'profile-env.json').read_text())
+        config['agents'] = {
+            'title': {'model': 'codex/gpt-6.2-astra#high'},
+            'explore': {'model': {'providerID': 'codex', 'model': 'gpt-6.2-sol', 'variant': 'low'}}}
         for definition in config['providers'].values():
             definition['settings'].pop('compaction')
             definition['settings'].pop('transport')
@@ -573,12 +594,34 @@ else:
         for name, value in env.items():
             self.assertEqual(restored[name], value, name)
         self.assertNotIn('CODEX_API_KEY', restored)
-        self.assertEqual(restored['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.1-sol')
+        self.assertEqual(restored['OPENCODE_ACP_REQUIRED_MODEL'], 'copilot/gpt-6.2-sol')
         snapshot = json.loads(Path(restored['OPENCODE_CONFIG']).read_text())
+        self.assertEqual(snapshot['agents'], config['agents'])
         for definition in snapshot['providers'].values():
             self.assertNotIn('compaction', definition['settings'])
             self.assertNotIn('transport', definition['settings'])
         self.assertEqual(source.read_bytes(), before)
+
+    def test_fresh_env_simple_routes_follow_provider_even_with_astra_or_explicit_effort(self):
+        import runtime
+        self.fixture.install()
+        settings = self.fixture.bundle['config']
+        for provider in ('codex', 'copilot'):
+            env = {'PATH': '/usr/bin:/bin', provider.upper() + '_BASE_URL': 'https://fixture.example.invalid/v1',
+                   provider.upper() + '_API_KEY': 'SYNTHETIC'}
+            for model, variant in (('gpt-6.2-sol', None), ('gpt-6.2-astra', None),
+                                   ('gpt-6.2-sol', 'medium'), ('gpt-6.2-sol', 'xhigh'), ('gpt-6.2-astra', 'high')):
+                with self.subTest(provider=provider, model=model, variant=variant), patch.dict(os.environ, env, clear=True):
+                    request = {'provider': provider, 'model': model, **({'variant': variant} if variant else {})}
+                    task = runtime.launch_selection(settings, request)
+                    self.assertEqual(task['model'], {'id': provider + '/' + model,
+                        'variant': variant or ('max' if model == 'gpt-6.2-sol' else 'medium')})
+                    config = json.loads(Path(task['modelConfig']).read_text())
+                    self.assertEqual(config['agents'], {name: {'model': {
+                        'providerID': provider, 'model': 'gpt-6.2-sol', 'variant': 'medium'}} for name in ('title', 'explore')})
+                    before = Path(task['modelConfig']).read_bytes()
+                    self.assertEqual(runtime.launch_selection(settings, {'saved': task}), task)
+                    self.assertEqual(Path(task['modelConfig']).read_bytes(), before)
 
     def test_selection_diagnostics_use_only_fixed_fields_and_environment_names(self):
         import runtime

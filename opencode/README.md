@@ -177,17 +177,17 @@ TTL、deadline 或模板 activity bump。实际续期还取决于 Coder 的 auto
 ## Provider、模型和 MCP
 
 内置 `env` profile 恰好包含 **copilot、codex**，两者模型定义完整相同，使用 OpenAI Responses，
-不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.1-sol / max**，title 为同 Provider
-Sol/low。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择及外部配置见
+不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.2-sol / max**，title、explore 为同 Provider
+Sol/medium。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择及外部配置见
 [PROVIDERS.md](PROVIDERS.md)。两个 Provider 的 session 主请求默认使用原生 Responses WebSocket，
 连接失败沿原生 HTTP fallback，并默认启用 native 远程压缩；上游须支持 compaction trigger
-及加密 checkpoint。独立的同 Provider title/low 请求仍使用 HTTP/SSE。
+及加密 checkpoint。独立的同 Provider title/medium 请求仍使用 HTTP/SSE。
 已有 task/session 沿保存的 profile 保留原策略，新任务采用新默认。catalog 不证明服务访问权、价格或可用性。
 
 | 模型 | context | input | output | 默认 reasoning |
 | --- | ---: | ---: | ---: | --- |
-| `gpt-6.1-sol` | 400000 | 272000 | 128000 | max |
-| `gpt-6-astra` | 400000 | 272000 | 128000 | medium |
+| `gpt-6.2-sol` | 400000 | 272000 | 128000 | max |
+| `gpt-6.2-astra` | 400000 | 272000 | 128000 | medium |
 
 保留完整 cost/capabilities/settings 和 low/medium/high/xhigh/max variants。
 固定 fork 的 `SessionCompaction.calculateCeiling` 在显式 buffer 下取 input-buffer，
@@ -195,10 +195,12 @@ Sol/low。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择
 上下文留 141600=128000+13600 tokens。`SessionModelRequest.outputLimit` 另按剩余上下文
 和未测 input 的 15% 余量拟合 output。这是预算阈值，不能保证大 turn 或估算误差不会溢出。
 
-此 pin 的自动 small-model 消费者是 title。使用原生
-`agents.title.model = { providerID, model: "gpt-6.1-sol", variant: "low" }`；主请求仍为 max。
-title 失败可能按主模型重试。压缩使用 session model/agent；普通生成和继承选择的子任务
-不受 title 低档位影响。无需第三模型、全局 small-model 选项或 fork 修改。
+此 pin 支持原生 `agents.title.model` 和 `agents.explore.model`，均设置为
+`{ providerID, model: "gpt-6.2-sol", variant: "medium" }`。简单探索/调研使用已有 explore 子任务；
+独立简单任务在 launch JSON 显式设置 `"variant":"medium"`。不按自然语言自动判断难度。
+主任务默认 max，仍可显式选择 xhigh；general 未配置模型，继承父 session 选择。压缩沿 session model/agent，
+不统一降为 medium。显式子任务模型优先于 agent 配置；title 失败可能按主模型重试。
+源码依据见 [PROVIDERS.md](PROVIDERS.md#原生-agent-路由)。不保留旧模型别名，不改已有快照。
 
 ## 中心个人规则与通用 Skill
 
