@@ -16,10 +16,11 @@ import { readyTask } from "./task-fixture.mjs";
 
 const scenarios = [
   ...["codex", "copilot"].flatMap((provider) => [false, true].map((rejectUpgrade) =>
-    ({ provider, rejectUpgrade, model: "gpt-6.2-sol", variant: "xhigh", routing: false }))),
+    ({ provider, rejectUpgrade, model: "gpt-6.2-sol", variant: "max", routing: false }))),
   ...["codex", "copilot"].flatMap((provider) => ["gpt-6.2-sol", "gpt-6.2-astra"].map((model) =>
     ({ provider, rejectUpgrade: false, model, variant: "xhigh", routing: true }))),
   { provider: "codex", rejectUpgrade: false, model: "gpt-6.2-sol", variant: "medium", routing: true },
+  { provider: "codex", rejectUpgrade: false, model: "gpt-6.2-sol", variant: "max", routing: true },
 ];
 for (const { provider, rejectUpgrade, model, variant, routing } of scenarios) test(`published OpenCode ${provider}/${model}/${variant}${rejectUpgrade ? " fallback" : ""}: ${routing ? "native agent routing" : "transport, native compaction, failure and same session"}`,
   { skip: !process.env.OPENCODE_FIXTURE_BINARY, timeout: 150000 }, async () => {
@@ -225,7 +226,7 @@ print(json.dumps(runtime.launch_selection({'install_root':sys.argv[1],'workspace
       assert.equal(store.summary(resumed).result_status, "success");
       assert.equal(resumed.handle.acpxRecordId, handle.acpxRecordId);
       assert.equal(notifications.length, 3);
-      assert.ok(calls.some((call) => call.effort === "xhigh"));
+      assert.ok(calls.some((call) => call.effort === "max"));
       assert.ok(calls.some((call) => call.role === "title" && call.effort === "medium"));
       assert.ok(calls.every((call) => call.model === "gpt-6.2-sol" && call.provider === provider));
       assert.ok(calls.filter((call) => call.role === "title").every((call) => call.transport === "http"));
@@ -233,11 +234,11 @@ print(json.dumps(runtime.launch_selection({'install_root':sys.argv[1],'workspace
       assert.ok(calls.some((call) => call.toolOutput));
       assert.ok(upgrades.length > 0);
       assert.ok(upgrades.every((upgrade) => upgrade.path === `/${provider}/v1/responses` && upgrade.beta === "responses_websockets=2026-02-06"));
-      assert.ok(calls.filter((call) => call.effort === "xhigh").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
+      assert.ok(calls.filter((call) => call.effort === "max").every((call) => call.transport === (rejectUpgrade ? "http" : "websocket")));
       const compactions = calls.filter((call) => call.compact);
       assert.equal(compactions.length, 1, JSON.stringify(calls));
       assert.equal(compactions[0].transport, rejectUpgrade ? "http" : "websocket");
-      const after = calls.slice(calls.indexOf(compactions[0]) + 1).filter((call) => call.effort === "xhigh");
+      const after = calls.slice(calls.indexOf(compactions[0]) + 1).filter((call) => call.effort === "max");
       assert.ok(after.length >= 2);
       assert.ok(after[0].checkpoint, JSON.stringify(calls));
       assert.ok(after.every((call) => !call.oldToolCall && !call.toolOutput));

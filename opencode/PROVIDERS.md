@@ -3,7 +3,7 @@
 内置 env profile 恰好提供 copilot、codex，均使用
 `@opencode/ai/providers/openai/responses`，完整模型定义相同。它们是本地别名，
 不启用官方登录；其余 Provider 保持禁用。模型为 **gpt-6.2-astra、gpt-6.2-sol**，
-默认主模型 **codex/gpt-6.2-sol / xhigh**，title、explore 为同 Provider Sol/medium。
+默认主模型 **codex/gpt-6.2-sol / max**，title、explore 为同 Provider Sol/medium。
 不保留旧模型别名。完整元数据一致性、context/input/output 和 variants 回归保留；
 价格、上下文和输出元数据沿原配置保留，不视为新模型的上游承诺。
 
@@ -60,13 +60,14 @@ CODEX 返回 200 但无压缩，它们与本模块使用的 trigger 是不同协
 
 | JSON 可选字段 | 主请求 | title / explore |
 | --- | --- | --- |
-| 全部省略 | codex/Sol/xhigh | codex/Sol/medium |
-| `"provider":"copilot"` | copilot/Sol/xhigh | copilot/Sol/medium |
+| 全部省略 | codex/Sol/max | codex/Sol/medium |
+| `"provider":"copilot"` | copilot/Sol/max | copilot/Sol/medium |
 | `"model":"gpt-6.2-astra","variant":"high"` | codex/Astra/high | codex/Sol/medium |
 | `"variant":"medium"`（独立简单任务） | 默认 Sol/medium | 同 Provider Sol/medium |
+| `"variant":"xhigh"` | 默认 Sol/xhigh | 同 Provider Sol/medium |
 
 provider/model 分别填 ID，不拼成一个字段；variant 独立，不靠自然语言或 readiness 环境选模型。
-新任务显式 provider/model 但省略 variant 时，Sol 默认 xhigh、Astra 默认 medium。
+新任务显式 provider/model 但省略 variant 时，Sol 默认 max、Astra 默认 medium。
 两个模型均保留 context=400000、input=272000、output=128000，buffer=13600 和完整
 cost/capabilities/settings；均支持 low/medium/high/xhigh/max。
 
@@ -98,7 +99,7 @@ runtime_profile=none 无外部完整配置时，直接 ACP 保留显式 readines
 加载 `agents.<name>.model` 的 providerID/model/variant；
 [`tool/plugin/subagent.ts`](https://github.com/Ricky-Hao/opencode/blob/9291b46db483415e1c9bdaa72f8e48637e3f7b49/packages/core/src/tool/plugin/subagent.ts)
 新建子任务按显式 model、agent.model、parent.model 的顺序选择。
-因此简单探索/调研使用现有 explore，默认 Sol/medium；general 继承父 session，普通主任务默认 xhigh。
+因此简单探索/调研使用现有 explore，默认 Sol/medium；general 继承父 session，普通主任务默认 max。
 显式子任务模型仍优先；同一个子 session 的续接保留已选模型，不因 agent 默认变化切换。
 独立简单任务用 launch 的 `"variant":"medium"`，不增加难度识别或 task schema 字段。
 

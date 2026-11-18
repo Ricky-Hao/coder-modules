@@ -177,7 +177,7 @@ TTL、deadline 或模板 activity bump。实际续期还取决于 Coder 的 auto
 ## Provider、模型和 MCP
 
 内置 `env` profile 恰好包含 **copilot、codex**，两者模型定义完整相同，使用 OpenAI Responses，
-不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.2-sol / xhigh**，title、explore 为同 Provider
+不启用官方 Copilot/Codex 登录。默认主模型为 **codex/gpt-6.2-sol / max**，title、explore 为同 Provider
 Sol/medium。其他 Provider 保持禁用。四个独立变量、任务 JSON 选择及外部配置见
 [PROVIDERS.md](PROVIDERS.md)。两个 Provider 的 session 主请求默认使用原生 Responses WebSocket，
 连接失败沿原生 HTTP fallback，并默认启用 native 远程压缩；上游须支持 compaction trigger
@@ -186,7 +186,7 @@ Sol/medium。其他 Provider 保持禁用。四个独立变量、任务 JSON 选
 
 | 模型 | context | input | output | 默认 reasoning |
 | --- | ---: | ---: | ---: | --- |
-| `gpt-6.2-sol` | 400000 | 272000 | 128000 | xhigh |
+| `gpt-6.2-sol` | 400000 | 272000 | 128000 | max |
 | `gpt-6.2-astra` | 400000 | 272000 | 128000 | medium |
 
 保留完整 cost/capabilities/settings 和 low/medium/high/xhigh/max variants。
@@ -198,7 +198,7 @@ Sol/medium。其他 Provider 保持禁用。四个独立变量、任务 JSON 选
 此 pin 支持原生 `agents.title.model` 和 `agents.explore.model`，均设置为
 `{ providerID, model: "gpt-6.2-sol", variant: "medium" }`。简单探索/调研使用已有 explore 子任务；
 独立简单任务在 launch JSON 显式设置 `"variant":"medium"`。不按自然语言自动判断难度。
-主任务默认 xhigh；general 未配置模型，继承父 session 选择。压缩沿 session model/agent，
+主任务默认 max，仍可显式选择 xhigh；general 未配置模型，继承父 session 选择。压缩沿 session model/agent，
 不统一降为 medium。显式子任务模型优先于 agent 配置；title 失败可能按主模型重试。
 源码依据见 [PROVIDERS.md](PROVIDERS.md#原生-agent-路由)。不保留旧模型别名，不改已有快照。
 

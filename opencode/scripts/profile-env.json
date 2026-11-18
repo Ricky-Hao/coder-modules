@@ -1,5 +1,5 @@
 {
-  "model": {"providerID": "codex", "model": "gpt-6.2-sol", "variant": "xhigh"},
+  "model": {"providerID": "codex", "model": "gpt-6.2-sol", "variant": "max"},
   "providers": {
     "copilot": {
       "name": "Copilot",
@@ -17,7 +17,7 @@
         },
         "gpt-6.2-sol": {
           "name": "GPT-6.2 Sol",
-          "settings": {"reasoningEffort": "xhigh"},
+          "settings": {"reasoningEffort": "max"},
           "cost": [{"input": 2, "output": 10, "cache": {"read": 0.1, "write": 2.5}}, {"tier": {"type": "context", "size": 272000}, "input": 4, "output": 15, "cache": {"read": 0.2, "write": 5}}],
           "limit": {"context": 400000, "input": 272000, "output": 128000},
           "capabilities": {"tools": true, "input": ["text", "image"], "output": ["text"]},
@@ -41,7 +41,7 @@
         },
         "gpt-6.2-sol": {
           "name": "GPT-6.2 Sol",
-          "settings": {"reasoningEffort": "xhigh"},
+          "settings": {"reasoningEffort": "max"},
           "cost": [{"input": 2, "output": 10, "cache": {"read": 0.1, "write": 2.5}}, {"tier": {"type": "context", "size": 272000}, "input": 4, "output": 15, "cache": {"read": 0.2, "write": 5}}],
           "limit": {"context": 400000, "input": 272000, "output": 128000},
           "capabilities": {"tools": true, "input": ["text", "image"], "output": ["text"]},

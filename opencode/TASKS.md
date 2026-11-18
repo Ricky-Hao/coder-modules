@@ -43,7 +43,7 @@ preparing 留作人工核对。没有公开 submit、inspect 或自动恢复入�
   },
   "provider": "codex",
   "model": "gpt-6.2-sol",
-  "variant": "xhigh",
+  "variant": "max",
   "no_progress_timeout_seconds": 900
 }
 ```
@@ -70,7 +70,7 @@ launch 校验输入和完整模型配置，排他 mkdir 领取 key，保存 prep
 
 新 launch 权限缺省 **approve-all**。可显式 deny-all/approve-reads 和原生 policy；policy 各类
 规则最多 32 条，每条最多 256 字符，原生明确拒绝和非交互 escalation 拒绝保留。
-简单独立任务显式选择 `"variant":"medium"`；普通任务默认 Sol/xhigh。
+简单独立任务显式选择 `"variant":"medium"`；普通任务默认 Sol/max，仍可显式选择 xhigh。
 title、explore 的 Sol/medium 路由及外部配置契约见 [PROVIDERS.md](PROVIDERS.md)。
 
 ## 续接与去重
@@ -221,10 +221,10 @@ paramiko 3.5.1，用 PYTHONPATH 指向即可，不进 payload。Terraform 命令
 published fixture 的 WebSocket server 另需已有测试依赖 `ws`；OPENCODE_FIXTURE_WS 指向该模块目录，
 未设置时沿 Node 的普通模块解析。依赖只用于测试，不进入安装 payload。
 它保留候选 provider transport，分别核 codex、copilot 的 WebSocket 和拒绝升级后的原生 HTTP fallback，
-并检查主模型/xhigh、同 Provider title/medium 仍走 HTTP、工具调用续接、同 session、失败与回调。两者均用合成 usage
+并检查主模型/max、同 Provider title/medium 仍走 HTTP、工具调用续接、同 session、失败与回调。两者均用合成 usage
 触发 native compaction，核对 trigger 请求（WebSocket 续接或 HTTP 完整 input）、加密 checkpoint 接收、后续上下文与同 session
 下一轮。另以两个 Provider 的 Sol/Astra 主模型检查 title/explore 的 Sol/medium 实际请求、general 继承和显式子任务覆盖，
-并验证独立简单任务的 Sol/medium。fixture 沿模块相同的 acpx 初次 session 选择与 model/effort 确认步骤。
+并验证主任务 Sol/max 与显式 xhigh、独立简单任务的 Sol/medium。fixture 沿模块相同的 acpx 初次 session 选择与 model/effort 确认步骤。
 可设置 `OPENCODE_EVIDENCE_DIR` 为已存在的私有目录，
 保留各场景的合成 `requests.jsonl`、`responses.jsonl` 和隔离现场；否则自动清理。
 

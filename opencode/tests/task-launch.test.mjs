@@ -53,7 +53,7 @@ test("fresh origin base, preserved dirty checkout, original input only and read-
   assert.equal(result.accepted, true); assert.equal(result.base_sha, f.latest); assert.equal(result.worktree, path.join(f.base, "work-first"));
   assert.equal(git(result.worktree, "rev-parse", "HEAD"), f.latest); assert.equal(git(f.repo, "rev-parse", "HEAD"), f.old);
   assert.equal(fs.readFileSync(path.join(f.repo, "dirty"), "utf8"), "keep unrelated work");
-  assert.equal(result.permissions.mode, "approve-all"); assert.equal(result.selection.variant, "xhigh");
+  assert.equal(result.permissions.mode, "approve-all"); assert.equal(result.selection.variant, "max");
   const task = f.store.load(result.task_id), before = fs.readFileSync(f.store.filename(task.id));
   assert.equal(JSON.stringify(task).includes(f.input.prompt), false); assert.equal(JSON.stringify(task).includes("tcb_"), false);
   assert.equal(task.inputFile, path.join(f.base, "first.json"));
